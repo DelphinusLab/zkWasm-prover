@@ -3,27 +3,23 @@ use std::alloc::Allocator;
 use std::alloc::Layout;
 use std::marker::PhantomData;
 use std::mem;
+use std::os::raw::c_void;
 use std::ptr::{self, NonNull};
 
-use cuda_driver_sys::cuCtxCreate_v2;
-use cuda_driver_sys::cuDeviceGet;
-use cuda_driver_sys::CUdevice;
-use cuda_driver_sys::CUdeviceptr;
-
 pub struct DeviceBuffer<T> {
-    dptr: *mut CUdeviceptr,
+    dptr: *mut c_void,
     phantom: PhantomData<T>,
 }
 
 impl<T> DeviceBuffer<T> {
-    pub fn new(dptr: *mut CUdeviceptr) -> Self{
+    pub fn new(dptr: *mut c_void) -> Self {
         Self {
             dptr,
-            phantom:PhantomData,
+            phantom: PhantomData,
         }
     }
 }
-
+/*
 pub struct CudaHostAllocator {}
 
 impl CudaHostAllocator {
@@ -65,3 +61,4 @@ unsafe impl Allocator for CudaHostAllocator {
         }
     }
 }
+ */

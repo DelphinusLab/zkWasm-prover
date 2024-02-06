@@ -2,18 +2,22 @@
 name = "zkwasm-prover"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 halo2_proofs = { git = "https://github.com/DelphinusLab/halo2-gpu-specific", default-features = true }
-cuda-driver-sys = "0.3.0"
+cuda-runtime-sys = "0.3.0-alpha.1"
 ark-std = { version = "0.4.0", features = ["print-trace"] }
 lazy_static = "1.4.0"
 thread_local = "*"
 
 [build-dependencies]
 cc = "*"
+
+[lib]
+crate-type = ["staticlib"]
 
 [patch."https://github.com/DelphinusLab/halo2-gpu-specific"]
 halo2_proofs = { path = "../halo2-gpu-specific/halo2_proofs", default-features = true }

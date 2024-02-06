@@ -165,6 +165,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuda-runtime-sys"
+version = "0.3.0-alpha.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d070b301187fee3c611e75a425cf12247b7c75c09729dbdef95cb9cb64e8c39"
+dependencies = [
+ "cuda-config",
+]
+
+[[package]]
 name = "either"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -659,7 +668,7 @@ version = "0.1.0"
 dependencies = [
  "ark-std",
  "cc",
- "cuda-driver-sys",
+ "cuda-runtime-sys",
  "halo2_proofs",
  "lazy_static",
  "thread_local",

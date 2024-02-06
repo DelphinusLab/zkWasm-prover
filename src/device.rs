@@ -10,7 +10,7 @@ pub enum Error {
 type DeviceResult<T> = Result<T, Error>;
 
 pub struct DeviceBuf<T, H: Sized> {
-    handler: H,
+    pub handler: H,
     phantom: PhantomData<T>,
 }
 
@@ -30,4 +30,6 @@ pub trait Device<H>: Sized {
     fn copy_from_host_to_device<T>(&self, dst: &DeviceBuf<T, H>, src: &[T]) -> DeviceResult<()>;
     fn copy_from_device_to_host<T>(&self, dst: &mut [T], dst: &DeviceBuf<T, H>)
         -> DeviceResult<()>;
+
+    fn synchronize(&self) -> DeviceResult<()>;
 }
