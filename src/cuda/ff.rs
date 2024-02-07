@@ -13,6 +13,14 @@ mod cuda_raw {
             res: *mut c_void,
             array_len: i32,
         );
+        pub fn test_bn254_field_mul(
+            blocks: i32,
+            threads: i32,
+            bn254_field_array_a: *mut c_void,
+            bn254_field_array_b: *mut c_void,
+            bn254_field_array_c: *mut c_void,
+            array_len: i32,
+        ) -> cudaError;
         pub fn test_bn254_field_add(
             blocks: i32,
             threads: i32,
@@ -20,7 +28,7 @@ mod cuda_raw {
             bn254_field_array_b: *mut c_void,
             bn254_field_array_c: *mut c_void,
             array_len: i32,
-        );
+        ) -> cudaError;
         pub fn test_bn254_field_sub(
             blocks: i32,
             threads: i32,
@@ -198,6 +206,52 @@ mod test {
         let timer = start_timer!(|| "gpu add");
         unsafe {
             test_bn254_field_add(
+                (len / 32) as i32,
+                32,
+                a_buf.handler,
+                b_buf.handler,
+                a_buf.handler,
+                len as i32,
+            );
+        }
+        end_timer!(timer);
+
+        let timer = start_timer!(|| "gpu copy");
+        device.copy_from_device_to_host(&mut a[..], &a_buf).unwrap();
+        end_timer!(timer);
+
+        assert_eq!(a, c_expect);
+    }
+
+    
+    #[test]
+    fn test_bn254_field_mul_cuda() {
+        let device = CudaDevice::get_device(0).unwrap();
+        let mut a = vec![];
+        let mut b = vec![];
+        let mut c_expect = vec![];
+        let len = 32;
+
+        for _ in 0..len {
+            let x = Fr::rand();
+            let y = Fr::rand();
+
+            a.push(x);
+            b.push(y);
+        }
+
+        let timer = start_timer!(|| "cpu add");
+        for i in 0..len {
+            c_expect.push(a[i] * b[i]);
+        }
+        end_timer!(timer);
+
+        let a_buf = device.alloc_device_buffer_from_slice(&a[..]).unwrap();
+        let b_buf = device.alloc_device_buffer_from_slice(&b[..]).unwrap();
+
+        let timer = start_timer!(|| "gpu add");
+        unsafe {
+            test_bn254_field_mul(
                 (len / 32) as i32,
                 32,
                 a_buf.handler,
