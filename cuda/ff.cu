@@ -15,7 +15,7 @@ __device__ const ulong Bn254FrR2[4] = {
     0x1bb8e645ae216da7ul,
     0x53fe3ab1e35c59e3ul,
     0x8c49833d53bb8085ul,
-    0x8c49833d53bb8085ul,
+    0x0216d0b17f4e44a5ul,
 };
 
 __device__ const ulong Bn254FrInv = 0xc2e1f593effffffful;
@@ -90,6 +90,7 @@ __global__ void _test_bn254_field_mont(Bn254FrField *a, int n)
 
     for (int i = start; i < end; i++)
     {
+        Bn254FrField::unmont(&a[i]);
         Bn254FrField::mont(&a[i]);
     }
 }

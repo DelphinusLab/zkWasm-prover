@@ -87,15 +87,41 @@ mod test {
                 )
                 .unwrap();
         }
-
-        for i in 0..4 {
-            println!(
-                "c{} is {}",
-                i,
-                u64::from_le_bytes(c[0][i * 8..i * 8 + 8].try_into().unwrap())
-            );
-        }
         assert_eq!(c, b);
+    }
+
+    
+    #[test]
+    fn test_bn254_field_mont_cuda() {
+        let device = CudaDevice::get_device(0).unwrap();
+        let len = 1;
+        let threads = if len >= 32 { 32 } else { len };
+        let mut a = vec![];
+        let mut b = vec![];
+
+        for _ in 0..len {
+            let x = Fr::rand();
+            a.push(x);
+            b.push(x);
+        }
+
+        let a_buf = device.alloc_device_buffer_from_slice(&a[..]).unwrap();
+        unsafe {
+            let err = test_bn254_field_mont(
+                len as i32 / threads as i32,
+                threads as i32,
+                a_buf.handler,
+                len as i32,
+            );
+            println!("error is {:?}", err);
+            device
+                .copy_from_device_to_host(
+                    &mut b[..],
+                    &*(&a_buf as *const DeviceBuf<Fr, *mut c_void> as *const _),
+                )
+                .unwrap();
+        }
+        assert_eq!(a, b);
     }
 
     #[test]
