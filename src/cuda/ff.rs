@@ -1,6 +1,6 @@
 mod cuda_raw {
-    use std::ffi::c_void;
     use cuda_runtime_sys::cudaError;
+    use std::ffi::c_void;
 
     #[link(name = "zkwasm_prover_kernel", kind = "static")]
     extern "C" {
@@ -29,17 +29,74 @@ mod cuda_raw {
             bn254_field_array_c: *mut c_void,
             array_len: i32,
         ) -> cudaError;
+        pub fn test_bn254_field_mont(
+            blocks: i32,
+            threads: i32,
+            bn254_field_array_a: *mut c_void,
+            array_len: i32,
+        ) -> cudaError;
+        pub fn test_bn254_field_unmont(
+            blocks: i32,
+            threads: i32,
+            bn254_field_array_a: *mut c_void,
+            array_len: i32,
+        ) -> cudaError;
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::ffi::c_void;
+
     use crate::cuda::ff::cuda_raw::*;
     use crate::device::cuda::CudaDevice;
-    use crate::device::Device;
+    use crate::device::{Device, DeviceBuf};
     use ark_std::{end_timer, start_timer};
     use halo2_proofs::arithmetic::BaseExt;
     use halo2_proofs::pairing::bn256::Fr;
+    use halo2_proofs::pairing::group::ff::PrimeField;
+
+    #[test]
+    fn test_bn254_field_unmont_cuda() {
+        let device = CudaDevice::get_device(0).unwrap();
+        let len = 1024;
+        let threads = if len >= 32 { 32 } else { len };
+        let mut a = vec![];
+        let mut b: Vec<[u8; 32]> = vec![];
+        let mut c: Vec<[u8; 32]> = vec![[0u8; 32]; len];
+
+        for _ in 0..len {
+            let x = Fr::rand();
+            a.push(x);
+            b.push(x.to_repr());
+        }
+
+        let a_buf = device.alloc_device_buffer_from_slice(&a[..]).unwrap();
+        unsafe {
+            let err = test_bn254_field_unmont(
+                len as i32 / threads as i32,
+                threads as i32,
+                a_buf.handler,
+                len as i32,
+            );
+            println!("error is {:?}", err);
+            device
+                .copy_from_device_to_host(
+                    &mut c[..],
+                    &*(&a_buf as *const DeviceBuf<Fr, *mut c_void> as *const _),
+                )
+                .unwrap();
+        }
+
+        for i in 0..4 {
+            println!(
+                "c{} is {}",
+                i,
+                u64::from_le_bytes(c[0][i * 8..i * 8 + 8].try_into().unwrap())
+            );
+        }
+        assert_eq!(c, b);
+    }
 
     #[test]
     fn test_bn254_field_sub_cuda() {
