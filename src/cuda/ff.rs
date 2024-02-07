@@ -1,19 +1,26 @@
-mod cuda_raw {
-    use cuda_runtime_sys::cudaError;
+#[cfg(test)]
+mod test {
     use std::ffi::c_void;
+
+    use crate::device::cuda::CudaDevice;
+    use crate::device::{Device, DeviceBuf};
+    use ark_std::{end_timer, start_timer};
+    use cuda_runtime_sys::cudaError;
+    use halo2_proofs::arithmetic::BaseExt;
+    use halo2_proofs::pairing::bn256::Fr;
+    use halo2_proofs::pairing::group::ff::PrimeField;
 
     #[link(name = "zkwasm_prover_kernel", kind = "static")]
     extern "C" {
-        pub fn test_int_add(blocks: i32, threads: i32, array: *mut c_void, array_len: i32);
-        pub fn test_bn254_field_compare(
+        pub fn test_bn254_fr_field_compare(
             blocks: i32,
             threads: i32,
             bn254_field_array_a: *mut c_void,
             bn254_field_array_b: *mut c_void,
             res: *mut c_void,
             array_len: i32,
-        );
-        pub fn test_bn254_field_mul(
+        ) -> cudaError;
+        pub fn test_bn254_fr_field_mul(
             blocks: i32,
             threads: i32,
             bn254_field_array_a: *mut c_void,
@@ -21,7 +28,7 @@ mod cuda_raw {
             bn254_field_array_c: *mut c_void,
             array_len: i32,
         ) -> cudaError;
-        pub fn test_bn254_field_add(
+        pub fn test_bn254_fr_field_add(
             blocks: i32,
             threads: i32,
             bn254_field_array_a: *mut c_void,
@@ -29,7 +36,7 @@ mod cuda_raw {
             bn254_field_array_c: *mut c_void,
             array_len: i32,
         ) -> cudaError;
-        pub fn test_bn254_field_sub(
+        pub fn test_bn254_fr_field_sub(
             blocks: i32,
             threads: i32,
             bn254_field_array_a: *mut c_void,
@@ -37,35 +44,22 @@ mod cuda_raw {
             bn254_field_array_c: *mut c_void,
             array_len: i32,
         ) -> cudaError;
-        pub fn test_bn254_field_mont(
+        pub fn test_bn254_fr_field_mont(
             blocks: i32,
             threads: i32,
             bn254_field_array_a: *mut c_void,
             array_len: i32,
         ) -> cudaError;
-        pub fn test_bn254_field_unmont(
+        pub fn test_bn254_fr_field_unmont(
             blocks: i32,
             threads: i32,
             bn254_field_array_a: *mut c_void,
             array_len: i32,
         ) -> cudaError;
     }
-}
-
-#[cfg(test)]
-mod test {
-    use std::ffi::c_void;
-
-    use crate::cuda::ff::cuda_raw::*;
-    use crate::device::cuda::CudaDevice;
-    use crate::device::{Device, DeviceBuf};
-    use ark_std::{end_timer, start_timer};
-    use halo2_proofs::arithmetic::BaseExt;
-    use halo2_proofs::pairing::bn256::Fr;
-    use halo2_proofs::pairing::group::ff::PrimeField;
 
     #[test]
-    fn test_bn254_field_unmont_cuda() {
+    fn test_bn254_fr_field_unmont_cuda() {
         let device = CudaDevice::get_device(0).unwrap();
         let len = 1024;
         let threads = if len >= 32 { 32 } else { len };
@@ -81,7 +75,7 @@ mod test {
 
         let a_buf = device.alloc_device_buffer_from_slice(&a[..]).unwrap();
         unsafe {
-            let err = test_bn254_field_unmont(
+            let err = test_bn254_fr_field_unmont(
                 len as i32 / threads as i32,
                 threads as i32,
                 a_buf.handler,
@@ -98,9 +92,8 @@ mod test {
         assert_eq!(c, b);
     }
 
-    
     #[test]
-    fn test_bn254_field_mont_cuda() {
+    fn test_bn254_fr_field_mont_cuda() {
         let device = CudaDevice::get_device(0).unwrap();
         let len = 1;
         let threads = if len >= 32 { 32 } else { len };
@@ -115,7 +108,7 @@ mod test {
 
         let a_buf = device.alloc_device_buffer_from_slice(&a[..]).unwrap();
         unsafe {
-            let err = test_bn254_field_mont(
+            let err = test_bn254_fr_field_mont(
                 len as i32 / threads as i32,
                 threads as i32,
                 a_buf.handler,
@@ -133,7 +126,7 @@ mod test {
     }
 
     #[test]
-    fn test_bn254_field_sub_cuda() {
+    fn test_bn254_fr_field_sub_cuda() {
         let device = CudaDevice::get_device(0).unwrap();
         let mut a = vec![];
         let mut b = vec![];
@@ -159,7 +152,7 @@ mod test {
 
         let timer = start_timer!(|| "gpu sub");
         let res = unsafe {
-            test_bn254_field_sub(
+            test_bn254_fr_field_sub(
                 (len / 16) as i32,
                 16,
                 a_buf.handler,
@@ -179,7 +172,7 @@ mod test {
     }
 
     #[test]
-    fn test_bn254_field_add_cuda() {
+    fn test_bn254_fr_field_add_cuda() {
         let device = CudaDevice::get_device(0).unwrap();
         let mut a = vec![];
         let mut b = vec![];
@@ -205,7 +198,7 @@ mod test {
 
         let timer = start_timer!(|| "gpu add");
         unsafe {
-            test_bn254_field_add(
+            test_bn254_fr_field_add(
                 (len / 32) as i32,
                 32,
                 a_buf.handler,
@@ -223,9 +216,8 @@ mod test {
         assert_eq!(a, c_expect);
     }
 
-    
     #[test]
-    fn test_bn254_field_mul_cuda() {
+    fn test_bn254_fr_field_mul_cuda() {
         let device = CudaDevice::get_device(0).unwrap();
         let mut a = vec![];
         let mut b = vec![];
@@ -251,7 +243,7 @@ mod test {
 
         let timer = start_timer!(|| "gpu add");
         unsafe {
-            test_bn254_field_mul(
+            test_bn254_fr_field_mul(
                 (len / 32) as i32,
                 32,
                 a_buf.handler,
@@ -270,7 +262,7 @@ mod test {
     }
 
     #[test]
-    fn test_bn254_field_compare_cuda() {
+    fn test_bn254_fr_field_compare_cuda() {
         let device = CudaDevice::get_device(0).unwrap();
         let mut a = vec![];
         let mut b = vec![];
@@ -315,7 +307,7 @@ mod test {
         let b_buf = device.alloc_device_buffer_from_slice(&b[..]).unwrap();
 
         unsafe {
-            test_bn254_field_compare(
+            test_bn254_fr_field_compare(
                 1,
                 len as i32,
                 a_buf.handler,
@@ -326,25 +318,5 @@ mod test {
         }
         device.copy_from_device_to_host(&mut c[..], &c_buf).unwrap();
         assert_eq!(c, c_expect);
-    }
-
-    #[test]
-    fn test_int_add_cuda() {
-        let device = CudaDevice::get_device(0).unwrap();
-        let a = vec![1, 2, 3];
-        let c = vec![2, 3, 4];
-        let mut b = vec![0, 0, 0];
-        let buf = device.alloc_device_buffer_from_slice(&a[..]).unwrap();
-        device.copy_from_device_to_host(&mut b, &buf).unwrap();
-        assert_eq!(a, b);
-
-        unsafe {
-            let res = test_int_add(1, b.len() as i32, buf.handler, b.len() as i32);
-            println!("res is {:?}", res);
-            device.synchronize().unwrap();
-        }
-
-        device.copy_from_device_to_host(&mut b, &buf).unwrap();
-        assert_eq!(c, b);
     }
 }

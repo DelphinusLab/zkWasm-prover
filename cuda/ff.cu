@@ -22,23 +22,9 @@ __device__ const ulong Bn254FrInv = 0xc2e1f593effffffful;
 
 typedef Field<4, Bn254FrModulus, Bn254FrR2, Bn254FrInv> Bn254FrField;
 
-__global__ void _test_int_add(int *a, int n)
-{
-    int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    int worker = blockDim.x * gridDim.x;
-    int size_per_worker = n / worker;
-    int start = gid * size_per_worker;
-    int end = start + size_per_worker;
+// Tests
 
-    printf("Hello from block %d, thread %d\n", blockIdx.x, threadIdx.x);
-    for (int i = start; i < end; i++)
-    {
-        a[i] += 1;
-    }
-    printf("do add %p\n", a);
-}
-
-__global__ void _test_bn254_field_compare(Bn254FrField *a, Bn254FrField *b, bool *c, int n)
+__global__ void _test_bn254_fr_field_compare(Bn254FrField *a, Bn254FrField *b, bool *c, int n)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int worker = blockDim.x * gridDim.x;
@@ -52,7 +38,7 @@ __global__ void _test_bn254_field_compare(Bn254FrField *a, Bn254FrField *b, bool
     }
 }
 
-__global__ void _test_bn254_field_add(Bn254FrField *a, Bn254FrField *b, Bn254FrField *c, int n)
+__global__ void _test_bn254_fr_field_add(Bn254FrField *a, Bn254FrField *b, Bn254FrField *c, int n)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int worker = blockDim.x * gridDim.x;
@@ -66,7 +52,7 @@ __global__ void _test_bn254_field_add(Bn254FrField *a, Bn254FrField *b, Bn254FrF
     }
 }
 
-__global__ void _test_bn254_field_sub(Bn254FrField *a, Bn254FrField *b, Bn254FrField *c, int n)
+__global__ void _test_bn254_fr_field_sub(Bn254FrField *a, Bn254FrField *b, Bn254FrField *c, int n)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int worker = blockDim.x * gridDim.x;
@@ -80,7 +66,7 @@ __global__ void _test_bn254_field_sub(Bn254FrField *a, Bn254FrField *b, Bn254FrF
     }
 }
 
-__global__ void _test_bn254_field_mul(Bn254FrField *a, Bn254FrField *b, Bn254FrField *c, int n)
+__global__ void _test_bn254_fr_field_mul(Bn254FrField *a, Bn254FrField *b, Bn254FrField *c, int n)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int worker = blockDim.x * gridDim.x;
@@ -94,7 +80,7 @@ __global__ void _test_bn254_field_mul(Bn254FrField *a, Bn254FrField *b, Bn254FrF
     }
 }
 
-__global__ void _test_bn254_field_mont(Bn254FrField *a, int n)
+__global__ void _test_bn254_fr_field_mont(Bn254FrField *a, int n)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int worker = blockDim.x * gridDim.x;
@@ -109,7 +95,7 @@ __global__ void _test_bn254_field_mont(Bn254FrField *a, int n)
     }
 }
 
-__global__ void _test_bn254_field_unmont(Bn254FrField *a, int n)
+__global__ void _test_bn254_fr_field_unmont(Bn254FrField *a, int n)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int worker = blockDim.x * gridDim.x;
@@ -125,45 +111,39 @@ __global__ void _test_bn254_field_unmont(Bn254FrField *a, int n)
 
 extern "C"
 {
-    cudaError_t test_int_add(int blocks, int threads, int *a, int n)
+    cudaError_t test_bn254_fr_field_compare(int blocks, int threads, Bn254FrField *a, Bn254FrField *b, bool *c, int n)
     {
-        _test_int_add<<<blocks, threads>>>(a, n);
+        _test_bn254_fr_field_compare<<<blocks, threads>>>(a, b, c, n);
         return cudaGetLastError();
     }
 
-    cudaError_t test_bn254_field_compare(int blocks, int threads, Bn254FrField *a, Bn254FrField *b, bool *c, int n)
+    cudaError_t test_bn254_fr_field_add(int blocks, int threads, Bn254FrField *a, Bn254FrField *b, Bn254FrField *c, int n)
     {
-        _test_bn254_field_compare<<<blocks, threads>>>(a, b, c, n);
+        _test_bn254_fr_field_add<<<blocks, threads>>>(a, b, c, n);
         return cudaGetLastError();
     }
 
-    cudaError_t test_bn254_field_add(int blocks, int threads, Bn254FrField *a, Bn254FrField *b, Bn254FrField *c, int n)
+    cudaError_t test_bn254_fr_field_sub(int blocks, int threads, Bn254FrField *a, Bn254FrField *b, Bn254FrField *c, int n)
     {
-        _test_bn254_field_add<<<blocks, threads>>>(a, b, c, n);
+        _test_bn254_fr_field_sub<<<blocks, threads>>>(a, b, c, n);
         return cudaGetLastError();
     }
 
-    cudaError_t test_bn254_field_sub(int blocks, int threads, Bn254FrField *a, Bn254FrField *b, Bn254FrField *c, int n)
+    cudaError_t test_bn254_fr_field_mul(int blocks, int threads, Bn254FrField *a, Bn254FrField *b, Bn254FrField *c, int n)
     {
-        _test_bn254_field_sub<<<blocks, threads>>>(a, b, c, n);
+        _test_bn254_fr_field_mul<<<blocks, threads>>>(a, b, c, n);
         return cudaGetLastError();
     }
 
-    cudaError_t test_bn254_field_mul(int blocks, int threads, Bn254FrField *a, Bn254FrField *b, Bn254FrField *c, int n)
+    cudaError_t test_bn254_fr_field_mont(int blocks, int threads, Bn254FrField *a, int n)
     {
-        _test_bn254_field_mul<<<blocks, threads>>>(a, b, c, n);
+        _test_bn254_fr_field_mont<<<blocks, threads>>>(a, n);
         return cudaGetLastError();
     }
 
-    cudaError_t test_bn254_field_mont(int blocks, int threads, Bn254FrField *a, int n)
+    cudaError_t test_bn254_fr_field_unmont(int blocks, int threads, Bn254FrField *a, int n)
     {
-        _test_bn254_field_mont<<<blocks, threads>>>(a, n);
-        return cudaGetLastError();
-    }
-
-    cudaError_t test_bn254_field_unmont(int blocks, int threads, Bn254FrField *a, int n)
-    {
-        _test_bn254_field_unmont<<<blocks, threads>>>(a, n);
+        _test_bn254_fr_field_unmont<<<blocks, threads>>>(a, n);
         return cudaGetLastError();
     }
 }
