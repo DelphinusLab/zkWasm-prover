@@ -3,42 +3,28 @@
 use ark_std::end_timer;
 use ark_std::start_timer;
 use halo2_proofs::arithmetic::CurveAffine;
+use halo2_proofs::arithmetic::Field;
 use halo2_proofs::plonk::ProvingKey;
 use halo2_proofs::poly::commitment::Params;
 use halo2_proofs::transcript::EncodedChallenge;
 use halo2_proofs::transcript::TranscriptWrite;
 use std::alloc::Allocator;
-use std::mem::size_of;
 
-pub mod cuda_allocator;
-pub mod device;
 pub mod cuda;
+pub mod device;
 
 #[macro_use]
 extern crate lazy_static;
 
-lazy_static! {
-    //static ref CUDA_ALLOCATOR: CudaHostAllocator = CudaHostAllocator::new(0);
-}
-
 pub fn prepare_advice_buffer<C: CurveAffine>(pk: &ProvingKey<C>) -> Vec<Vec<C::Scalar>> {
-    unimplemented!();
-    /*
+    let rows = 1 << pk.get_vk().domain.k();
+    let columns = pk.get_vk().cs.num_advice_columns;
+    let zero = C::Scalar::zero();
     let mut advices = vec![];
-    let size = 1 << pk.get_vk().domain.k();
-    for _ in 0..pk.get_vk().cs.num_advice_columns {
-        let mut buf: Vec<_, &CudaHostAllocator> = Vec::new_in(&CUDA_ALLOCATOR);
-        buf.reserve_exact(size);
-        // set len
-        unsafe {
-            let end = size_of::<Vec<C::Scalar, &CudaHostAllocator>>() / size_of::<usize>();
-            *(&mut buf as *mut _ as *mut usize).offset(end as isize - 1) = size;
-        }
-        println!("buf len is {}", buf.len());
-        advices.push(buf)
+    for _ in 0..columns {
+        advices.push(vec![zero; rows]);
     }
     advices
-    */
 }
 
 pub enum Error {}

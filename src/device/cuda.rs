@@ -4,21 +4,8 @@ use std::ffi::c_void;
 
 use cuda_runtime_sys::cudaError;
 
-use crate::device::DeviceResult;
-
 use super::{Device, DeviceBuf, Error};
-
-lazy_static! {
-    static ref CUDA_INIT: () = {
-        /*
-        let res = unsafe { cuda_runtime_sys::cuInit(0) };
-
-        if res != cudaError::cudaSuccess {
-            panic!("cuda init failed.")
-        }
-         */
-    };
-}
+use crate::device::DeviceResult;
 
 thread_local! {
     static ACITVE_CUDA_DEVICE: RefCell<i32> = RefCell::new(-1);
@@ -26,7 +13,6 @@ thread_local! {
 
 pub struct CudaDevice {
     device: i32,
-    //ctx: CUcontext,
 }
 
 impl Drop for CudaDevice {
@@ -70,7 +56,6 @@ type CudaDeviceBuf<T> = DeviceBuf<T, *mut c_void>;
 
 impl Device<*mut c_void> for CudaDevice {
     fn get_device_count() -> DeviceResult<usize> {
-        *CUDA_INIT;
         let mut count = 0;
         unsafe {
             let res = cuda_runtime_sys::cudaGetDeviceCount(&mut count);
@@ -79,26 +64,15 @@ impl Device<*mut c_void> for CudaDevice {
     }
 
     fn get_device(idx: usize) -> DeviceResult<Self> {
-        /*
-        *CUDA_INIT;
-        unsafe {
-            let mut device = 0;
-            let res = cuda_runtime_sys::cudaGetDevice(&mut device, idx as i32);
-            let device = to_result(device, res, "fail to get device")?;
-
-            let mut ctx = mem::zeroed();
-            let res = cuda_driver_sys::cuCtxCreate_v2(
-                &mut ctx,
-                CUctx_flags::CU_CTX_MAP_HOST as u32
-                    | CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC as u32,
-                device,
-            );
-            let ctx = to_result(ctx, res, "fail to get device")?;
-
-            Ok(Self { device, ctx })
+        let count = Self::get_device_count()?;
+        if idx < count {
+            Ok(Self { device: idx as i32 })
+        } else {
+            Err(Error::DeviceError(format!(
+                "Cuda Error(): Invalid device idx {}",
+                idx
+            )))
         }
-         */
-        Ok(Self { device: idx as i32 })
     }
 
     fn alloc_device_buffer<T>(&self, size: usize) -> DeviceResult<CudaDeviceBuf<T>> {

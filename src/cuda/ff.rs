@@ -2,9 +2,7 @@ use std::ffi::c_void;
 
 #[link(name = "zkwasm_prover_kernel", kind = "static")]
 extern "C" {
-    fn test_int_add(blocks: i32, threads: i32, array: *mut c_void, array_len: i32);
-    fn _main();
-    fn vectorAdd_main();
+    pub fn test_int_add(blocks: i32, threads: i32, array: *mut c_void, array_len: i32);
 }
 
 #[test]
