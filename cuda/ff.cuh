@@ -295,5 +295,75 @@ public:
     {
         return pow(a, NEG_TOW, LIMBS);
     }
+
+    __device__ Field inv() const
+    {
+        return inv(this);
+    }
+
+    __device__ Field neg() const
+    {
+        Field tmp;
+        if (this->is_zero())
+        {
+            return *this;
+        }
+        else
+        {
+            sub_u64x4((ulong *)tmp.limbs_le, (const ulong *)MODULUS, (const ulong *)this->limbs_le);
+            return tmp;
+        }
+    }
+
+    __device__ bool is_zero() const
+    {
+#pragma unroll
+        for (int i = 0; i < LIMBS; i++)
+        {
+            if (this->limbs_le[i] != 0)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // operator
+
+    __device__ Field operator+(const Field &b)
+    {
+        return add(this, &b);
+    }
+
+    __device__ Field operator-(const Field &b)
+    {
+        return sub(this, &b);
+    }
+
+    __device__ void operator+=(const Field &b)
+    {
+        return add_no_copy(this, this, &b);
+    }
+
+    __device__ void operator-=(const Field &b)
+    {
+        return sub_no_copy(this, this, &b);
+    }
+
+    __device__ Field operator*(const Field &b)
+    {
+        return mul(this, &b);
+    }
+
+    __device__ bool operator==(const Field &b)
+    {
+        return eq(this, &b);
+    }
+
+    __device__ Field
+    operator-()
+    {
+        return this->neg();
+    }
 };
 #endif
