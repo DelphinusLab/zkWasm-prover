@@ -1,37 +1,39 @@
 #ifndef COMMON_CUH
 #define COMMON_CUH
 
-__forceinline__ __device__ void add_u64x4(const ulong *a, const ulong *b, ulong *c)
+#include <assert.h>
+
+__forceinline__ __device__ void add_u64x4(ulong *out, const ulong *a, const ulong *b)
 {
   asm("add.cc.u64  %0, %4, %8; \n\t"
       "addc.cc.u64 %1, %5, %9; \n\t"
       "addc.cc.u64 %2, %6, %10;\n\t"
-      "addc.u64    %3, %7, %11;\n\t" :                 //
-      "=l"(c[0]), "=l"(c[1]), "=l"(c[2]), "=l"(c[3]) : //
+      "addc.u64    %3, %7, %11;\n\t" :                         //
+      "=l"(out[0]), "=l"(out[1]), "=l"(out[2]), "=l"(out[3]) : //
       "l"(a[0]), "l"(a[1]), "l"(a[2]), "l"(a[3]),
       "l"(b[0]), "l"(b[1]), "l"(b[2]), "l"(b[3]));
 }
 
-__forceinline__ __device__ void sub_u64x4(const ulong *a, const ulong *b, ulong *c)
+__forceinline__ __device__ void sub_u64x4(ulong *out, const ulong *a, const ulong *b)
 {
   asm("sub.cc.u64  %0, %4, %8; \n\t"
       "subc.cc.u64 %1, %5, %9; \n\t"
       "subc.cc.u64 %2, %6, %10;\n\t"
-      "subc.u64    %3, %7, %11;\n\t" :               //
-      "=l"(c[0]), "=l"(c[1]), "=l"(c[2]), "=l"(c[3]) //
+      "subc.u64    %3, %7, %11;\n\t" :                       //
+      "=l"(out[0]), "=l"(out[1]), "=l"(out[2]), "=l"(out[3]) //
       : "l"(a[0]), "l"(a[1]), "l"(a[2]), "l"(a[3]),
         "l"(b[0]), "l"(b[1]), "l"(b[2]), "l"(b[3]));
 }
 
-__forceinline__ __device__ uint sub_u64x4_with_borrow(const ulong *a, const ulong *b, ulong *c)
+__forceinline__ __device__ uint sub_u64x4_with_borrow(ulong *out, const ulong *a, const ulong *b)
 {
   uint ret;
   asm("sub.cc.u64  %0, %5, %9; \n\t"
       "subc.cc.u64 %1, %6, %10;\n\t"
       "subc.cc.u64 %2, %7, %11;\n\t"
       "subc.cc.u64 %3, %8, %12;\n\t"
-      "subc.u32    %4,  0,   0;\n\t" :                            //
-      "=l"(c[0]), "=l"(c[1]), "=l"(c[2]), "=l"(c[3]), "=r"(ret) : //
+      "subc.u32    %4,  0,   0;\n\t" :                                    //
+      "=l"(out[0]), "=l"(out[1]), "=l"(out[2]), "=l"(out[3]), "=r"(ret) : //
       "l"(a[0]), "l"(a[1]), "l"(a[2]), "l"(a[3]),
       "l"(b[0]), "l"(b[1]), "l"(b[2]), "l"(b[3]));
   return ret;
@@ -50,21 +52,21 @@ __device__ void mul_add_u64x4(
                                                   //
       "mad.lo.cc.u64   %1, %10, %7, %1;  \n\t"    //
       "madc.hi.u64     t2, %10, %7, 0;   \n\t"    //
-      "add.cc.u64      %1, %1,  t1;      \n\t"    // (carry, a[i + 1]) = u * m[0] + a[i + 1] + carry
+      "add.cc.u64      %1, %1,  t1;      \n\t"    // (carry, a[i + 1]) = u * m[1] + a[i + 1] + carry
                                                   //
       "madc.lo.cc.u64  %2, %10, %8, %2;  \n\t"    //
       "madc.hi.u64     t1, %10, %8, 0;   \n\t"    //
-      "add.cc.u64      %2, %2,  t2;      \n\t"    // (carry, a[i + 2]) = u * m[0] + a[i + 2] + carry
+      "add.cc.u64      %2, %2,  t2;      \n\t"    // (carry, a[i + 2]) = u * m[2] + a[i + 2] + carry
                                                   //
       "madc.lo.cc.u64  %3, %10, %9, %3;  \n\t"    //
       "madc.hi.u64     t2, %10, %9, 0;   \n\t"    //
-      "add.cc.u64      %3, %3,  t1;      \n\t"    // (carry, a[i + 3]) = u * m[0] + a[i + 3] + carry
+      "add.cc.u64      %3, %3,  t1;      \n\t"    // (carry, a[i + 3]) = u * m[3] + a[i + 3] + carry
                                                   //
-      "addc.cc.u64     %4, %4,  t2;      \n\t"    //
-      "addc.u64        %10, 0,  0;       \n\t"    //
-      "add.cc.u64      %4, %4,  %5;      \n\t"    // (carry, a[i + 4]) += carry + last_carray
+      "addc.cc.u64     %4, %4,  %5;      \n\t"    // 
+      "addc.u64        %5, 0,   0;       \n\t"    //
+      "add.cc.u64      %4, %4,  t2;      \n\t"    // (carry, a[i + 4]) += carry + last_carray
                                                   //
-      "addc.u64        %5, %10, 0;       \n\t"    // return carry
+      "addc.u64        %5, %5,  0;        \n\t"     // return carry
       "}" :                                       //
       "+l"(*a0),                                  // 0
       "+l"(*a1), "+l"(*a2), "+l"(*a3), "+l"(*a4), // 1, 2, 3, 4

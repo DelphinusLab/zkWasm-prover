@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod test {
     use std::ffi::c_void;
+    use std::mem;
 
     use crate::device::cuda::CudaDevice;
     use crate::device::{Device, DeviceBuf};
@@ -95,7 +96,7 @@ mod test {
     #[test]
     fn test_bn254_fr_field_mont_cuda() {
         let device = CudaDevice::get_device(0).unwrap();
-        let len = 1;
+        let len = 16;
         let threads = if len >= 32 { 32 } else { len };
         let mut a = vec![];
         let mut b = vec![];
@@ -222,7 +223,8 @@ mod test {
         let mut a = vec![];
         let mut b = vec![];
         let mut c_expect = vec![];
-        let len = 32;
+        let mut c = vec![];
+        let len = 1024;
 
         for _ in 0..len {
             let x = Fr::rand();
@@ -230,6 +232,7 @@ mod test {
 
             a.push(x);
             b.push(y);
+            c.push(x);
         }
 
         let timer = start_timer!(|| "cpu add");
@@ -255,10 +258,24 @@ mod test {
         end_timer!(timer);
 
         let timer = start_timer!(|| "gpu copy");
-        device.copy_from_device_to_host(&mut a[..], &a_buf).unwrap();
+        device.copy_from_device_to_host(&mut c[..], &a_buf).unwrap();
         end_timer!(timer);
 
-        assert_eq!(a, c_expect);
+        //assert_eq!(a, c_expect);
+        for i in 0..len {
+            if c[i] != c_expect[i] {
+                unsafe {
+                    println!(
+                        "{:?} * {:?} = {:?} but got {:?}",
+                        mem::transmute::<_, &[u64; 4]>(&a[i]),
+                        mem::transmute::<_, &[u64; 4]>(&b[i]),
+                        mem::transmute::<_, &[u64; 4]>(&c_expect[i]),
+                        mem::transmute::<_, &[u64; 4]>(&c[i]),
+                    );
+                }
+                assert!(false);
+            }
+        }
     }
 
     #[test]

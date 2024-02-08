@@ -4,11 +4,12 @@
 #include <assert.h>
 #include "common.cuh"
 
-typedef unsigned long FieldLimb;
+typedef ulong FieldLimb;
 
 template <
     const uint LIMBS,
     const FieldLimb MODULUS[LIMBS],
+    const FieldLimb R[LIMBS],
     const FieldLimb R2[LIMBS],
     const FieldLimb INV>
 class Field
@@ -18,7 +19,7 @@ private:
     FieldLimb limbs_le[LIMBS];
 
     // <http://cacr.uwaterloo.ca/hac/about/chap14.pdf>.
-    __forceinline__ __device__ static bool _mont_reduce(
+    __device__ static bool _mont_reduce(
         FieldLimb *lo, ulong h0, ulong h1, ulong h2, ulong h3)
     {
         if (LIMBS == 4)
@@ -26,14 +27,14 @@ private:
             mont_reduce_u64x8(
                 (ulong *)&lo[0], (ulong *)&lo[1], (ulong *)&lo[2], (ulong *)&lo[3],
                 &h0, &h1, &h2, &h3,
-                MODULUS, INV);
+                (const ulong *)MODULUS, (ulong)INV);
             lo[0] = h0;
             lo[1] = h1;
             lo[2] = h2;
             lo[3] = h3;
             if (_gte(lo, MODULUS))
             {
-                sub_u64x4((ulong *)lo, (ulong *)MODULUS, (ulong *)lo);
+                sub_u64x4((ulong *)lo, (ulong *)lo, (ulong *)MODULUS);
             }
         }
         else
@@ -42,7 +43,7 @@ private:
         }
     }
 
-    __forceinline__ __device__ static bool _gte(const FieldLimb *a, const FieldLimb *b)
+    __device__ static bool _gte(const FieldLimb *a, const FieldLimb *b)
     {
 #pragma unroll
         for (int i = LIMBS - 1; i >= 0; i--)
@@ -55,10 +56,10 @@ private:
         return true;
     }
 
-    __forceinline__ __device__ static void _mul(const FieldLimb *a, const FieldLimb *b, FieldLimb *c)
+    __device__ static void _mul(FieldLimb *out, const FieldLimb *a, const FieldLimb *b)
     {
-        assert(a != c);
-        assert(b != c);
+        assert(a != out);
+        assert(b != out);
         if (LIMBS == 4)
         {
             ulong h0 = 0;
@@ -66,14 +67,10 @@ private:
             ulong h2 = 0;
             ulong h3 = 0;
             mul_u64x4(
-                (ulong *)&c[0], (ulong *)&c[1], (ulong *)&c[2], (ulong *)&c[3],
+                (ulong *)&out[0], (ulong *)&out[1], (ulong *)&out[2], (ulong *)&out[3],
                 &h0, &h1, &h2, &h3,
-                (ulong *)a, (ulong *)b);
-            _mont_reduce(c, h0, h1, h2, h3);
-            if (_gte(c, MODULUS))
-            {
-                sub_u64x4((ulong *)c, (ulong *)MODULUS, (ulong *)c);
-            }
+                (const ulong *)a, (const ulong *)b);
+            _mont_reduce(out, h0, h1, h2, h3);
         }
         else
         {
@@ -82,9 +79,12 @@ private:
     }
 
 public:
-    __device__ Field()
+    __device__ Field(bool reset = false)
     {
-        memset(limbs_le, 0, sizeof(FieldLimb) * LIMBS);
+        if (reset)
+        {
+            memset(limbs_le, 0, sizeof(FieldLimb) * LIMBS);
+        }
     }
 
     __device__ ~Field() {}
@@ -103,14 +103,14 @@ public:
         return true;
     }
 
-    __device__ static void add(const Field *a, const Field *b, Field *c)
+    __device__ static void add_no_copy(Field *out, const Field *a, const Field *b)
     {
         if (LIMBS == 4)
         {
-            add_u64x4((ulong *)a, (ulong *)b, (ulong *)c);
-            if (_gte(c->limbs_le, MODULUS))
+            add_u64x4((ulong *)out, (const ulong *)a, (const ulong *)b);
+            if (_gte(out->limbs_le, MODULUS))
             {
-                sub_u64x4((ulong *)c->limbs_le, (ulong *)MODULUS, (ulong *)c->limbs_le);
+                sub_u64x4((ulong *)out->limbs_le, (const ulong *)out->limbs_le, (const ulong *)MODULUS);
             }
         }
         else
@@ -119,27 +119,48 @@ public:
         }
     }
 
-    __device__ static void mul(const Field *a, const Field *b, Field *c)
-    {
-        Field tmp;
-        _mul(a->limbs_le, b->limbs_le, tmp.limbs_le);
-        *c = tmp;
-    }
-
-    __device__ static void sub(const Field *a, const Field *b, Field *c)
+    __device__ static void sub_no_copy(Field *out, const Field *a, const Field *b)
     {
         if (LIMBS == 4)
         {
-            uint borrow = sub_u64x4_with_borrow((ulong *)a, (ulong *)b, (ulong *)c);
+            uint borrow = sub_u64x4_with_borrow((ulong *)out, (const ulong *)a, (const ulong *)b);
             if (borrow)
             {
-                add_u64x4((ulong *)c, (ulong *)MODULUS, (ulong *)c);
+                add_u64x4((ulong *)out, (const ulong *)out, (const ulong *)MODULUS);
             }
         }
         else
         {
             assert(0);
         }
+    }
+
+    // out can't overlap with a or b
+    __device__ static void mul_no_copy(Field *out, const Field *a, const Field *b)
+    {
+        memset(out, 0, sizeof(*out));
+        _mul(out->limbs_le, a->limbs_le, b->limbs_le);
+    }
+
+    __device__ static Field add(const Field *a, const Field *b)
+    {
+        Field tmp;
+        add_no_copy(&tmp, a, b);
+        return tmp;
+    }
+
+    __device__ static Field sub(const Field *a, const Field *b)
+    {
+        Field tmp;
+        sub_no_copy(&tmp, a, b);
+        return tmp;
+    }
+
+    __device__ static Field mul(const Field *a, const Field *b)
+    {
+        Field tmp(true);
+        _mul(tmp.limbs_le, a->limbs_le, b->limbs_le);
+        return tmp;
     }
 
     __device__ static void unmont(Field *a)
@@ -158,14 +179,48 @@ public:
     {
         if (LIMBS == 4)
         {
-            Field tmp;
-            _mul(a->limbs_le, R2, tmp.limbs_le);
+            Field tmp(true);
+            _mul(tmp.limbs_le, a->limbs_le, R2);
             *a = tmp;
         }
         else
         {
             assert(0);
         }
+    }
+
+    __forceinline__ __device__ static Field sqr(Field *out, const Field *a)
+    {
+        mul(out, a, a);
+    }
+
+    __forceinline__ __device__ static Field one()
+    {
+        Field tmp;
+        memcpy(tmp->limbs_le, R, LIMBS * sizeof(FieldLimb));
+        return tmp;
+    }
+
+    __forceinline__ __device__ static Field zero()
+    {
+        return Field(true);
+    }
+
+    __device__ static void exp(Field *out, const Field *a, ulong m)
+    {
+        Field acc = Field::one();
+        if (m > 0)
+        {
+            Field base = *a;
+
+            if (m & 1)
+            {
+                acc = mul(&acc, &base);
+                base = sqr(&base);
+            }
+        }
+
+        *out = acc;
     }
 };
 #endif

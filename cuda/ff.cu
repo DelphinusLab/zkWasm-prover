@@ -11,6 +11,13 @@ __device__ const ulong Bn254FrModulus[4] = {
     0x30644e72e131a029ul,
 };
 
+__device__ const ulong Bn254FrR[4] = {
+    0xac96341c4ffffffbul,
+    0x36fc76959f60cd29ul,
+    0x666ea36f7879462eul,
+    0x0e0a77c19a07df2ful,
+};
+
 __device__ const ulong Bn254FrR2[4] = {
     0x1bb8e645ae216da7ul,
     0x53fe3ab1e35c59e3ul,
@@ -20,7 +27,7 @@ __device__ const ulong Bn254FrR2[4] = {
 
 __device__ const ulong Bn254FrInv = 0xc2e1f593effffffful;
 
-typedef Field<4, Bn254FrModulus, Bn254FrR2, Bn254FrInv> Bn254FrField;
+typedef Field<4, Bn254FrModulus, Bn254FrR, Bn254FrR2, Bn254FrInv> Bn254FrField;
 
 // Tests
 
@@ -48,7 +55,7 @@ __global__ void _test_bn254_fr_field_add(Bn254FrField *a, Bn254FrField *b, Bn254
 
     for (int i = start; i < end; i++)
     {
-        Bn254FrField::add(&a[i], &b[i], &c[i]);
+        c[i] = Bn254FrField::add(&a[i], &b[i]);
     }
 }
 
@@ -62,7 +69,7 @@ __global__ void _test_bn254_fr_field_sub(Bn254FrField *a, Bn254FrField *b, Bn254
 
     for (int i = start; i < end; i++)
     {
-        Bn254FrField::sub(&a[i], &b[i], &c[i]);
+        c[i] = Bn254FrField::sub(&a[i], &b[i]);
     }
 }
 
@@ -76,7 +83,7 @@ __global__ void _test_bn254_fr_field_mul(Bn254FrField *a, Bn254FrField *b, Bn254
 
     for (int i = start; i < end; i++)
     {
-        Bn254FrField::mul(&a[i], &b[i], &c[i]);
+        c[i] = Bn254FrField::mul(&a[i], &b[i]);
     }
 }
 
@@ -132,6 +139,7 @@ extern "C"
     cudaError_t test_bn254_fr_field_mul(int blocks, int threads, Bn254FrField *a, Bn254FrField *b, Bn254FrField *c, int n)
     {
         _test_bn254_fr_field_mul<<<blocks, threads>>>(a, b, c, n);
+        cudaDeviceSynchronize();
         return cudaGetLastError();
     }
 
