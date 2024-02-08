@@ -6,7 +6,7 @@ fn main() {
         .flag("-cudart=shared")
         .flag("-gencode")
         .flag("arch=compute_89,code=sm_89")
-        .file("cuda/ff.cu")
+        .file("cuda/bn254.cu")
         .compile("libzkwasm_prover_kernel.a");
 
     /* Link CUDA Runtime (libcudart.so) */

@@ -3,6 +3,7 @@
 
 #include "common.cuh"
 #include "ff.cuh"
+#include "ec.cuh"
 
 __device__ const ulong BN254_FR_MODULUS[4] = {
     0x43e1f593f0000001ul,
@@ -67,6 +68,9 @@ __device__ const ulong BN254_FP_R2[4] = {
 __device__ const ulong Bn254_FP_INV = 0x87d20782e4866389ul;
 
 typedef Field<4, BN254_FP_MODULUS, BN254_FP_NEG_TWO, BN254_FP_R, BN254_FP_R2, Bn254_FP_INV> Bn254FpField;
+
+typedef CurveAffine<Bn254FpField> Bn254G1Affine;
+typedef Curve<Bn254FpField> Bn254G1;
 
 // Tests
 __global__ void _test_bn254_fr_field(
