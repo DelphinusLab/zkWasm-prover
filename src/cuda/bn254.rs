@@ -8,13 +8,13 @@ mod test {
     use ark_std::rand::rngs::OsRng;
     use ark_std::{end_timer, start_timer};
     use cuda_runtime_sys::cudaError;
-    use halo2_proofs::arithmetic::{BaseExt, Field};
-    use halo2_proofs::pairing::bn256::{Fq, Fr, G1Affine};
-    use halo2_proofs::pairing::group::ff::PrimeField;
+    use halo2_proofs::arithmetic::{BaseExt, Group};
+    use halo2_proofs::pairing::bn256::{Fr, G1Affine, G1};
     use halo2_proofs::pairing::group::Curve;
 
     #[link(name = "zkwasm_prover_kernel", kind = "static")]
     extern "C" {
+        #[cfg(features = "full-test")]
         pub fn test_bn254_fr_field(
             blocks: i32,
             threads: i32,
@@ -32,6 +32,7 @@ mod test {
             array_len: i32,
         ) -> cudaError;
 
+        #[cfg(features = "full-test")]
         pub fn test_bn254_fp_field(
             blocks: i32,
             threads: i32,
@@ -59,8 +60,11 @@ mod test {
             double: *mut c_void,
             array_len: i32,
         ) -> cudaError;
+
+        pub fn msm(res: *mut c_void, p: *mut c_void, s: *mut c_void, array_len: i32) -> cudaError;
     }
 
+    #[cfg(features = "full-test")]
     #[test]
     fn test_bn254_fr_field_cuda() {
         let device = CudaDevice::get_device(0).unwrap();
@@ -176,6 +180,7 @@ mod test {
         }
     }
 
+    #[cfg(features = "full-test")]
     #[test]
     fn test_bn254_fp_field_cuda() {
         let device = CudaDevice::get_device(0).unwrap();
@@ -304,7 +309,12 @@ mod test {
         let mut sub_expect = vec![];
         let mut double_expect = vec![];
 
-        for _ in 0..len {
+        let x = G1Affine::generator();
+        let y = G1Affine::generator();
+        a.push(x);
+        b.push(y);
+
+        for _ in 1..len {
             let x = G1Affine::random(OsRng);
             let y = G1Affine::random(OsRng);
             a.push(x);
@@ -358,6 +368,78 @@ mod test {
                 .copy_from_device_to_host(&mut b[..], &double_buf)
                 .unwrap();
             assert_eq!(b, double_expect);
+        }
+    }
+
+    #[test]
+    fn test_bn254_msm() {
+        let device = CudaDevice::get_device(0).unwrap();
+        let len = 1 << 16;
+
+        let mut p = vec![];
+        let mut s = vec![];
+
+        let timer = start_timer!(|| "prepare buffer");
+
+        let random_nr = 256;
+        let mut rands_s = vec![];
+        let mut rands_p = vec![];
+        let mut rands_ps = vec![];
+        for _ in 0..random_nr {
+            rands_s.push(Fr::rand());
+            let ps = Fr::rand();
+
+            rands_p.push((G1Affine::generator() * ps).to_affine());
+            rands_ps.push(ps);
+        }
+
+        let mut acc = Fr::zero();
+        for i in 0..len {
+            let x = rands_p[i % random_nr];
+            let y = rands_s[i % random_nr];
+            p.push(x);
+            s.push(y);
+            acc += rands_s[i % random_nr] * rands_ps[i % random_nr];
+        }
+        end_timer!(timer);
+
+        let timer = start_timer!(|| "cpu costs");
+        let msm_res_expect = G1Affine::generator() * acc;
+        end_timer!(timer);
+
+        let mut tmp = vec![];
+        for _ in 0..32 {
+            tmp.push(G1::group_zero());
+        }
+
+        unsafe {
+            let timer = start_timer!(|| "copy buffer");
+            let a_buf = device.alloc_device_buffer_from_slice(&p[..]).unwrap();
+            let b_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
+            let tmp_buf = device.alloc_device_buffer_from_slice(&tmp[..]).unwrap();
+            end_timer!(timer);
+
+            let timer = start_timer!(|| "gpu costs");
+            let res = msm(tmp_buf.handler, a_buf.handler, b_buf.handler, len as i32);
+            device.synchronize().unwrap();
+            end_timer!(timer);
+
+            let timer = start_timer!(|| "copy buffer back");
+            device
+                .copy_from_device_to_host(&mut tmp[..], &tmp_buf)
+                .unwrap();
+            end_timer!(timer);
+
+            let mut msm_res = tmp[31];
+            for i in 0..31 {
+                for _ in 0..8 {
+                    msm_res = msm_res + msm_res;
+                }
+                msm_res = msm_res + tmp[30 - i];
+            }
+
+            assert_eq!(res, cudaError::cudaSuccess);
+            assert_eq!(msm_res.to_affine(), msm_res_expect.to_affine());
         }
     }
 }

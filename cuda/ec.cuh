@@ -54,6 +54,11 @@ public:
     {
         return CurveAffine(this->x, -this->y);
     }
+
+    __device__ CurveAffine ec_neg_assign()
+    {
+        this->y.neg_assign();
+    }
 };
 
 template <class F>
@@ -75,12 +80,16 @@ public:
     {
         x = p.x;
         y = p.y;
-        z = F(1);
+        z = p.is_identity() ? F(0) : F(1);
+    }
+
+    __device__ Curve() : x(0), y(0), z(0)
+    {
     }
 
     __device__ static Curve identity()
     {
-        return Curve(F(0), F(0), F(1));
+        return Curve();
     }
 
     __device__ CurveAffine<F> to_affine() const
@@ -94,7 +103,7 @@ public:
 
     __device__ bool is_identity() const
     {
-        return x.is_zero() && y.is_zero();
+        return z.is_zero();
     }
 
     __device__ Curve ec_double() const
@@ -132,13 +141,13 @@ public:
 
     __device__ Curve ec_add(const Curve &rhs) const
     {
-        if (rhs.is_identity())
-        {
-            return *this;
-        }
-        else if (this->is_identity())
+        if (this->is_identity())
         {
             return rhs;
+        }
+        else if (rhs.is_identity())
+        {
+            return *this;
         }
         else
         {
@@ -168,10 +177,7 @@ public:
                 F hhh = hh * h;
                 F u1hh = u1 * hh;
 
-                F _x = u1hh + u1hh; // 2u1hh
-                _x += hhh;          // hhh + 2u1hh
-                _x = r * r - _x;    // rr - hhh - 2u1hh
-
+                F _x = r * r - hhh - u1hh - u1hh;
                 F _y = r * (u1hh - _x) - s1 * hhh;
                 F _z = h * rhs.z * this->z;
                 return Curve(_x, _y, _z);
@@ -216,10 +222,7 @@ public:
                 F hhh = hh * h;
                 F u1hh = u1 * hh;
 
-                F _x = u1hh + u1hh; // 2u1hh
-                _x += hhh;          // hhh + 2u1hh
-                _x = r * r - _x;    // rr - hhh - 2u1hh
-
+                F _x = r * r - hhh - u1hh - u1hh;
                 F _y = r * (u1hh - _x) - s1 * hhh;
                 F _z = h * this->z;
                 return Curve(_x, _y, _z);

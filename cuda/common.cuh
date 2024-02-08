@@ -1,8 +1,6 @@
 #ifndef COMMON_CUH
 #define COMMON_CUH
 
-#include <assert.h>
-
 __forceinline__ __device__ void add_u64x4(ulong *out, const ulong *a, const ulong *b)
 {
   asm("add.cc.u64  %0, %4, %8; \n\t"

@@ -230,6 +230,18 @@ public:
         }
     }
 
+    __device__ void unmont_assign()
+    {
+        unmont(this);
+    }
+
+    __device__ Field unmont() const
+    {
+        Field t(*this);
+        unmont(&t);
+        return t;
+    }
+
     __device__ static void mont(Field *a)
     {
         if (LIMBS == 4)
@@ -320,6 +332,14 @@ public:
         }
     }
 
+    __device__ Field neg_assign()
+    {
+        if (!this->is_zero())
+        {
+            sub_u64x4((ulong *)this->limbs_le, (const ulong *)MODULUS, (const ulong *)this->limbs_le);
+        }
+    }
+
     __device__ bool is_zero() const
     {
 #pragma unroll
@@ -331,6 +351,22 @@ public:
             }
         }
         return true;
+    }
+
+    __device__ bool get_bit(uint i) const
+    {
+        uint limb = i / (sizeof(FieldLimb) * 8);
+        uint bit = i % (sizeof(FieldLimb) * 8);
+
+        return this->limbs_le[limb] & (1 << bit) != 0;
+    }
+
+    __device__ ulong get_8bits(uint i) const
+    {
+        uint limb = i / (sizeof(FieldLimb));
+        uint idx = i % (sizeof(FieldLimb));
+
+        return (this->limbs_le[limb] >> (idx * 8)) & (0x00fful);
     }
 
     // operator
