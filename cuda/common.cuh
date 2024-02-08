@@ -40,7 +40,7 @@ __forceinline__ __device__ uint sub_u64x4_with_borrow(ulong *out, const ulong *a
 }
 
 // a[0..5] += u * m[0..4]
-__device__ void mul_add_u64x4(
+__forceinline__ __device__ void mul_add_u64x4(
     ulong *a0, ulong *a1, ulong *a2, ulong *a3, ulong *a4,
     const ulong *m, ulong u, ulong *last_carry)
 {

@@ -9,15 +9,13 @@ typedef ulong FieldLimb;
 template <
     const uint LIMBS,
     const FieldLimb MODULUS[LIMBS],
+    const FieldLimb MODULUS_MINUS_2[LIMBS],
     const FieldLimb R[LIMBS],
     const FieldLimb R2[LIMBS],
     const FieldLimb INV>
 class Field
 {
 private:
-    // little-endian
-    FieldLimb limbs_le[LIMBS];
-
     // <http://cacr.uwaterloo.ca/hac/about/chap14.pdf>.
     __device__ static bool _mont_reduce(
         FieldLimb *lo, ulong h0, ulong h1, ulong h2, ulong h3)
@@ -66,10 +64,20 @@ private:
             ulong h1 = 0;
             ulong h2 = 0;
             ulong h3 = 0;
+            ulong l0 = 0;
+            ulong l1 = 0;
+            ulong l2 = 0;
+            ulong l3 = 0;
+
             mul_u64x4(
-                (ulong *)&out[0], (ulong *)&out[1], (ulong *)&out[2], (ulong *)&out[3],
+                &l0, &l1, &l2, &l3,
                 &h0, &h1, &h2, &h3,
                 (const ulong *)a, (const ulong *)b);
+
+            out[0] = l0;
+            out[1] = l1;
+            out[2] = l2;
+            out[3] = l3;
             _mont_reduce(out, h0, h1, h2, h3);
         }
         else
@@ -78,12 +86,60 @@ private:
         }
     }
 
-public:
-    __device__ Field(bool reset = false)
+    __device__ static void _pow_at_leading(Field *acc, const Field *base, ulong exp)
     {
-        if (reset)
+        Field t = *base;
+
+        while (exp > 0)
+        {
+            if (exp & 1)
+            {
+                *acc = mul(acc, &t);
+            }
+
+            exp >>= 1;
+
+            if (exp > 0)
+            {
+                t = sqr(&t);
+            }
+        }
+    }
+
+    __device__ static void _pow_at_nonleading(Field *acc, const Field *base, ulong exp)
+    {
+        for (ulong bit = 1ul << (sizeof(ulong) * 8 - 1); bit != 0; bit >>= 1)
+        {
+            *acc = sqr(acc);
+            if (exp & bit)
+            {
+                *acc = mul(acc, base);
+            }
+        }
+    }
+
+public:
+    // little-endian
+    FieldLimb limbs_le[LIMBS];
+
+    __device__ Field()
+    {
+    }
+
+    __device__ Field(ulong v)
+    {
+        if (v == 0)
         {
             memset(limbs_le, 0, sizeof(FieldLimb) * LIMBS);
+        }
+        else if (v == 1)
+        {
+            memcpy(limbs_le, R, sizeof(FieldLimb) * LIMBS);
+        }
+        else
+        {
+            FieldLimb t[LIMBS] = {v};
+            Field::_mul(limbs_le, t, R);
         }
     }
 
@@ -138,8 +194,7 @@ public:
     // out can't overlap with a or b
     __device__ static void mul_no_copy(Field *out, const Field *a, const Field *b)
     {
-        memset(out, 0, sizeof(*out));
-        _mul(out->limbs_le, a->limbs_le, b->limbs_le);
+        _mul((FieldLimb *)&out->limbs_le, a->limbs_le, b->limbs_le);
     }
 
     __device__ static Field add(const Field *a, const Field *b)
@@ -158,8 +213,8 @@ public:
 
     __device__ static Field mul(const Field *a, const Field *b)
     {
-        Field tmp(true);
-        _mul(tmp.limbs_le, a->limbs_le, b->limbs_le);
+        Field tmp;
+        _mul((FieldLimb *)&tmp.limbs_le, a->limbs_le, b->limbs_le);
         return tmp;
     }
 
@@ -179,8 +234,8 @@ public:
     {
         if (LIMBS == 4)
         {
-            Field tmp(true);
-            _mul(tmp.limbs_le, a->limbs_le, R2);
+            Field tmp;
+            _mul((FieldLimb *)&tmp.limbs_le, a->limbs_le, R2);
             *a = tmp;
         }
         else
@@ -189,38 +244,56 @@ public:
         }
     }
 
-    __forceinline__ __device__ static Field sqr(Field *out, const Field *a)
+    __device__ static Field sqr(const Field *a)
     {
-        mul(out, a, a);
+        return mul(a, a);
     }
 
     __forceinline__ __device__ static Field one()
     {
         Field tmp;
-        memcpy(tmp->limbs_le, R, LIMBS * sizeof(FieldLimb));
+        memcpy(tmp.limbs_le, R, LIMBS * sizeof(FieldLimb));
         return tmp;
     }
 
     __forceinline__ __device__ static Field zero()
     {
-        return Field(true);
+        return Field(0);
     }
 
-    __device__ static void exp(Field *out, const Field *a, ulong m)
+    __device__ static Field pow(const Field *a, ulong exp)
     {
         Field acc = Field::one();
-        if (m > 0)
+        if (exp > 0)
         {
-            Field base = *a;
+            _pow_at_leading(&acc, a, exp);
+        }
+        return acc;
+    }
 
-            if (m & 1)
+    __device__ static Field pow(const Field *a, const FieldLimb *exp_le, int exp_len)
+    {
+        Field acc = Field::one();
+        int i = exp_len - 1;
+        for (; i >= 0; i--)
+        {
+            if (exp_le[i] != 0)
             {
-                acc = mul(&acc, &base);
-                base = sqr(&base);
+                _pow_at_leading(&acc, a, exp_le[i]);
+                i--;
+                break;
             }
         }
+        for (; i >= 0; i--)
+        {
+            _pow_at_nonleading(&acc, a, exp_le[i]);
+        }
+        return acc;
+    }
 
-        *out = acc;
+    __device__ static Field inv(const Field *a)
+    {
+        return pow(a, MODULUS_MINUS_2, LIMBS);
     }
 };
 #endif

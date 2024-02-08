@@ -7,7 +7,7 @@ mod test {
     use crate::device::{Device, DeviceBuf};
     use ark_std::{end_timer, start_timer};
     use cuda_runtime_sys::cudaError;
-    use halo2_proofs::arithmetic::BaseExt;
+    use halo2_proofs::arithmetic::{BaseExt, Field};
     use halo2_proofs::pairing::bn256::Fr;
     use halo2_proofs::pairing::group::ff::PrimeField;
 
@@ -51,10 +51,29 @@ mod test {
             bn254_field_array_a: *mut c_void,
             array_len: i32,
         ) -> cudaError;
+        pub fn test_bn254_fr_field_sqr(
+            blocks: i32,
+            threads: i32,
+            bn254_field_array_a: *mut c_void,
+            array_len: i32,
+        ) -> cudaError;
+        pub fn test_bn254_fr_field_inv(
+            blocks: i32,
+            threads: i32,
+            bn254_field_array_a: *mut c_void,
+            array_len: i32,
+        ) -> cudaError;
         pub fn test_bn254_fr_field_unmont(
             blocks: i32,
             threads: i32,
             bn254_field_array_a: *mut c_void,
+            array_len: i32,
+        ) -> cudaError;
+        pub fn test_bn254_fr_field_pow(
+            blocks: i32,
+            threads: i32,
+            bn254_field_array_a: *mut c_void,
+            uint64_array_a: *mut c_void,
             array_len: i32,
         ) -> cudaError;
     }
@@ -96,7 +115,7 @@ mod test {
     #[test]
     fn test_bn254_fr_field_mont_cuda() {
         let device = CudaDevice::get_device(0).unwrap();
-        let len = 16;
+        let len = 1024;
         let threads = if len >= 32 { 32 } else { len };
         let mut a = vec![];
         let mut b = vec![];
@@ -127,12 +146,78 @@ mod test {
     }
 
     #[test]
+    fn test_bn254_fr_field_sqr_cuda() {
+        let device = CudaDevice::get_device(0).unwrap();
+        let len = 1024;
+        let threads = if len >= 32 { 32 } else { len };
+        let mut a = vec![];
+        let mut b = vec![];
+
+        for _ in 0..len {
+            let x = Fr::rand();
+            a.push(x);
+            b.push(x.square());
+        }
+
+        let a_buf = device.alloc_device_buffer_from_slice(&a[..]).unwrap();
+        unsafe {
+            let err = test_bn254_fr_field_sqr(
+                len as i32 / threads as i32,
+                threads as i32,
+                a_buf.handler,
+                len as i32,
+            );
+            println!("error is {:?}", err);
+            device
+                .copy_from_device_to_host(
+                    &mut a[..],
+                    &*(&a_buf as *const DeviceBuf<Fr, *mut c_void> as *const _),
+                )
+                .unwrap();
+        }
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_bn254_fr_field_inv_cuda() {
+        let device = CudaDevice::get_device(0).unwrap();
+        let len = 1024;
+        let threads = if len >= 32 { 32 } else { len };
+        let mut a = vec![];
+        let mut b = vec![];
+
+        for _ in 0..len {
+            let x = Fr::rand();
+            a.push(x);
+            b.push(x.invert().unwrap_or(Fr::zero()));
+        }
+
+        let a_buf = device.alloc_device_buffer_from_slice(&a[..]).unwrap();
+        unsafe {
+            let err = test_bn254_fr_field_inv(
+                len as i32 / threads as i32,
+                threads as i32,
+                a_buf.handler,
+                len as i32,
+            );
+            println!("error is {:?}", err);
+            device
+                .copy_from_device_to_host(
+                    &mut a[..],
+                    &*(&a_buf as *const DeviceBuf<Fr, *mut c_void> as *const _),
+                )
+                .unwrap();
+        }
+        assert_eq!(a, b);
+    }
+
+    #[test]
     fn test_bn254_fr_field_sub_cuda() {
         let device = CudaDevice::get_device(0).unwrap();
         let mut a = vec![];
         let mut b = vec![];
         let mut c_expect = vec![];
-        let len = 16;
+        let len = 1024;
 
         for _ in 0..len {
             let x = Fr::rand();
@@ -178,7 +263,7 @@ mod test {
         let mut a = vec![];
         let mut b = vec![];
         let mut c_expect = vec![];
-        let len = 32;
+        let len = 1024;
 
         for _ in 0..len {
             let x = Fr::rand();
@@ -205,6 +290,45 @@ mod test {
                 a_buf.handler,
                 b_buf.handler,
                 a_buf.handler,
+                len as i32,
+            );
+        }
+        end_timer!(timer);
+
+        let timer = start_timer!(|| "gpu copy");
+        device.copy_from_device_to_host(&mut a[..], &a_buf).unwrap();
+        end_timer!(timer);
+
+        assert_eq!(a, c_expect);
+    }
+
+    #[test]
+    fn test_bn254_fr_field_pow_cuda() {
+        let device = CudaDevice::get_device(0).unwrap();
+        let mut a = vec![];
+        let mut b = vec![];
+        let mut c_expect = vec![];
+        let len = 1024;
+
+        for _ in 0..len {
+            let x = Fr::rand();
+            let y = unsafe { *(&Fr::rand() as *const _ as *const u64) };
+
+            a.push(x);
+            b.push(y);
+            c_expect.push(x.pow_vartime([y]));
+        }
+
+        let a_buf = device.alloc_device_buffer_from_slice(&a[..]).unwrap();
+        let b_buf = device.alloc_device_buffer_from_slice(&b[..]).unwrap();
+
+        let timer = start_timer!(|| "gpu add");
+        unsafe {
+            test_bn254_fr_field_pow(
+                (len / 1) as i32,
+                1,
+                a_buf.handler,
+                b_buf.handler,
                 len as i32,
             );
         }
@@ -284,7 +408,7 @@ mod test {
         let mut a = vec![];
         let mut b = vec![];
         let mut c_expect = vec![];
-        let len = 8;
+        let len = 1024;
 
         let gte = |l: &[u64; 4], r: &[u64; 4]| {
             for i in 0..4 {
