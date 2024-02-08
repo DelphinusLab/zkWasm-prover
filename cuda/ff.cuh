@@ -9,7 +9,7 @@ typedef ulong FieldLimb;
 template <
     const uint LIMBS,
     const FieldLimb MODULUS[LIMBS],
-    const FieldLimb MODULUS_MINUS_2[LIMBS],
+    const FieldLimb NEG_TOW[LIMBS],
     const FieldLimb R[LIMBS],
     const FieldLimb R2[LIMBS],
     const FieldLimb INV>
@@ -293,7 +293,7 @@ public:
 
     __device__ static Field inv(const Field *a)
     {
-        return pow(a, MODULUS_MINUS_2, LIMBS);
+        return pow(a, NEG_TOW, LIMBS);
     }
 };
 #endif
