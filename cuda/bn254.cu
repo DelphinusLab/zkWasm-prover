@@ -73,6 +73,39 @@ typedef CurveAffine<Bn254FpField> Bn254G1Affine;
 typedef Curve<Bn254FpField> Bn254G1;
 
 // Tests
+
+__global__ void _test_bn254_ec(
+    const Bn254G1Affine *a,
+    const Bn254G1Affine *b,
+    Bn254G1Affine *add,
+    Bn254G1Affine *sub,
+    Bn254G1Affine *_double,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int worker = blockDim.x * gridDim.x;
+    int size_per_worker = n / worker;
+    int start = gid * size_per_worker;
+    int end = start + size_per_worker;
+
+    for (int i = start; i < end; i++)
+    {
+        Bn254G1 _a(a[i]);
+        Bn254G1 _b(b[i]);
+
+        add[i] = _a + _b;
+        assert(add[i] == _a + b[i]);
+        sub[i] = _a - _b;
+        _double[i] = _a + _a;
+        assert(_double[i] == _a.ec_double());
+        assert(a[i] == _a + Bn254G1::identity());
+        assert(a[i] == _a + Bn254G1Affine::identity());
+        assert(a[i] == Bn254G1::identity() + _a);
+        assert(a[i] == Bn254G1::identity() + _a);
+        assert(_a - a[i] == Bn254G1::identity());
+    }
+}
+
 __global__ void _test_bn254_fr_field(
     const Bn254FrField *a,
     const Bn254FrField *b,
@@ -210,6 +243,19 @@ extern "C"
         int n)
     {
         _test_bn254_fp_field<<<blocks, threads>>>(a, b, exp, add, sub, mul, sqr, inv, pow, unmont, compare, n);
+        return cudaGetLastError();
+    }
+
+    cudaError_t test_bn254_ec(
+        int blocks, int threads,
+        const Bn254G1Affine *a,
+        const Bn254G1Affine *b,
+        Bn254G1Affine *add,
+        Bn254G1Affine *sub,
+        Bn254G1Affine *_double,
+        int n)
+    {
+        _test_bn254_ec<<<blocks, threads>>>(a, b, add, sub, _double, n);
         return cudaGetLastError();
     }
 }

@@ -101,7 +101,7 @@ private:
 
             if (exp > 0)
             {
-                t = sqr(&t);
+                t = t.sqr();
             }
         }
     }
@@ -110,7 +110,7 @@ private:
     {
         for (ulong bit = 1ul << (sizeof(ulong) * 8 - 1); bit != 0; bit >>= 1)
         {
-            *acc = sqr(acc);
+            *acc = acc->sqr();
             if (exp & bit)
             {
                 *acc = mul(acc, base);
@@ -249,6 +249,11 @@ public:
         return mul(a, a);
     }
 
+    __device__ Field sqr() const
+    {
+        return sqr(this);
+    }
+
     __forceinline__ __device__ static Field one()
     {
         Field tmp;
@@ -330,12 +335,12 @@ public:
 
     // operator
 
-    __device__ Field operator+(const Field &b)
+    __device__ Field operator+(const Field &b) const
     {
         return add(this, &b);
     }
 
-    __device__ Field operator-(const Field &b)
+    __device__ Field operator-(const Field &b) const
     {
         return sub(this, &b);
     }
@@ -350,18 +355,22 @@ public:
         return sub_no_copy(this, this, &b);
     }
 
-    __device__ Field operator*(const Field &b)
+    __device__ Field operator*(const Field &b) const
     {
         return mul(this, &b);
     }
 
-    __device__ bool operator==(const Field &b)
+    __device__ void operator*=(const Field &b)
+    {
+        *this = mul(this, &b);
+    }
+
+    __device__ bool operator==(const Field &b) const
     {
         return eq(this, &b);
     }
 
-    __device__ Field
-    operator-()
+    __device__ Field operator-() const
     {
         return this->neg();
     }

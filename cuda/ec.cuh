@@ -2,23 +2,57 @@
 #define EC_CUH
 
 template <class F>
+class Curve;
+
+template <class F>
 class CurveAffine
 {
 public:
     F x;
     F y;
 
-    CurveAffine(F &_x, F &_y)
+    __device__ CurveAffine() {}
+
+    __device__ CurveAffine(const F &_x, const F &_y)
     {
         x = _x;
         y = _y;
     }
 
-    __device__ CurveAffine identity()
+    __device__ static CurveAffine identity()
     {
-        CurveAffine p;
-        p.x = F(0);
-        p.y = F(0);
+        CurveAffine p(F(0), F(0));
+        return p;
+    }
+
+    __device__ bool is_identity() const
+    {
+        return x.is_zero() && y.is_zero();
+    }
+
+    __device__ bool eq(const CurveAffine &rhs) const
+    {
+        return this->x == rhs.x && this->y == rhs.y;
+    }
+
+    __device__ bool operator==(const CurveAffine &rhs) const
+    {
+        return this->eq(rhs);
+    }
+
+    __device__ bool operator==(const Curve<F> &rhs) const
+    {
+        return this->eq(rhs.to_affine());
+    }
+
+    __device__ void operator=(const Curve<F> &rhs)
+    {
+        *this = rhs.to_affine();
+    }
+
+    __device__ CurveAffine ec_neg() const
+    {
+        return CurveAffine(this->x, -this->y);
     }
 };
 
@@ -30,33 +64,31 @@ public:
     F y;
     F z;
 
-    __device__ Curve(F &_x, F &_y, F &_z)
+    __device__ Curve(const F &_x, const F &_y, const F &_z)
     {
         x = _x;
         y = _y;
         z = _z;
     }
 
-    __device__ Curve(CurveAffine<F> p)
+    __device__ Curve(const CurveAffine<F> &p)
     {
         x = p.x;
         y = p.y;
         z = F(1);
     }
 
-    __device__ Curve identity()
+    __device__ static Curve identity()
     {
-        Curve p;
-        p.x = F(0);
-        p.y = F(0);
-        p.z = F(1);
-        return p;
+        return Curve(F(0), F(0), F(1));
     }
 
     __device__ CurveAffine<F> to_affine() const
     {
-        F z_inv = this->z.inv();
-        CurveAffine p(this->x * z_inv, this->y * z_inv);
+        F zi = this->z.inv();
+        F zizi = zi * zi;
+
+        CurveAffine p(this->x * zizi, this->y * zizi * zi);
         return p;
     }
 
@@ -65,7 +97,7 @@ public:
         return x.is_zero() && y.is_zero();
     }
 
-    __device__ Curve<F> ec_double() const
+    __device__ Curve ec_double() const
     {
         F x2 = x.sqr();
         F y2 = y.sqr();
@@ -98,7 +130,7 @@ public:
         return Curve(_x, _y, _z);
     }
 
-    __device__ Curve<F> ec_add(const Curve<F> &rhs) const
+    __device__ Curve ec_add(const Curve &rhs) const
     {
         if (rhs.is_identity())
         {
@@ -147,7 +179,7 @@ public:
         }
     }
 
-    __device__ Curve<F> ec_add(CurveAffine<F> &rhs)
+    __device__ Curve ec_add(const CurveAffine<F> &rhs) const
     {
         if (rhs.is_identity())
         {
@@ -189,14 +221,19 @@ public:
                 _x = r * r - _x;    // rr - hhh - 2u1hh
 
                 F _y = r * (u1hh - _x) - s1 * hhh;
-                F _z = h * rhs.z * this->z;
+                F _z = h * this->z;
                 return Curve(_x, _y, _z);
             }
         }
     }
 
+    __device__ Curve ec_neg() const
+    {
+        return Curve(this->x, -this->y, this->z);
+    }
+
     // operator
-    __device__ Curve operator+(const Curve<F> &b)
+    __device__ Curve operator+(const Curve &b)
     {
         return this->ec_add(b);
     }
@@ -204,6 +241,26 @@ public:
     __device__ Curve operator+(const CurveAffine<F> &b)
     {
         return this->ec_add(b);
+    }
+
+    __device__ Curve operator-(const Curve &b)
+    {
+        return this->ec_add(b.ec_neg());
+    }
+
+    __device__ Curve operator-(const CurveAffine<F> &b)
+    {
+        return this->ec_add(b.ec_neg());
+    }
+
+    __device__ Curve operator-()
+    {
+        return this->ec_neg();
+    }
+
+    __device__ bool operator==(const Curve &b) const
+    {
+        return this->to_affine() == b.to_affine();
     }
 };
 
