@@ -119,6 +119,56 @@ __global__ void _test_bn254_fr_field(
     }
 }
 
+__global__ void _test_bn254_fp_field(
+    const Bn254FpField *a,
+    const Bn254FpField *b,
+    const ulong *exp,
+    Bn254FpField *add,
+    Bn254FpField *sub,
+    Bn254FpField *mul,
+    Bn254FpField *sqr,
+    Bn254FpField *inv,
+    Bn254FpField *pow,
+    Bn254FpField *unmont,
+    bool *compare,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int worker = blockDim.x * gridDim.x;
+    int size_per_worker = n / worker;
+    int start = gid * size_per_worker;
+    int end = start + size_per_worker;
+
+    for (int i = start; i < end; i++)
+    {
+        add[i] = Bn254FpField::add(&a[i], &b[i]);
+        sub[i] = Bn254FpField::sub(&a[i], &b[i]);
+        mul[i] = Bn254FpField::mul(&a[i], &b[i]);
+        sqr[i] = Bn254FpField::sqr(&a[i]);
+        inv[i] = Bn254FpField::inv(&a[i]);
+        pow[i] = Bn254FpField::pow(&a[i], exp[i]);
+
+        {
+            unmont[i] = a[i];
+            Bn254FpField::unmont(&unmont[i]);
+        }
+
+        {
+            Bn254FpField t = unmont[i];
+            Bn254FpField::mont(&t);
+            assert(Bn254FpField::eq(&t, &a[i]));
+        }
+
+        {
+            Bn254FpField l = a[i];
+            Bn254FpField r = b[i];
+            Bn254FpField::unmont(&l);
+            Bn254FpField::unmont(&r);
+            compare[i] = Bn254FpField::gte(&l, &r);
+        }
+    }
+}
+
 extern "C"
 {
     cudaError_t test_bn254_fr_field(
@@ -137,6 +187,25 @@ extern "C"
         int n)
     {
         _test_bn254_fr_field<<<blocks, threads>>>(a, b, exp, add, sub, mul, sqr, inv, pow, unmont, compare, n);
+        return cudaGetLastError();
+    }
+
+    cudaError_t test_bn254_fp_field(
+        int blocks, int threads,
+        const Bn254FpField *a,
+        const Bn254FpField *b,
+        const ulong *exp,
+        Bn254FpField *add,
+        Bn254FpField *sub,
+        Bn254FpField *mul,
+        Bn254FpField *sqr,
+        Bn254FpField *inv,
+        Bn254FpField *pow,
+        Bn254FpField *unmont,
+        bool *compare,
+        int n)
+    {
+        _test_bn254_fp_field<<<blocks, threads>>>(a, b, exp, add, sub, mul, sqr, inv, pow, unmont, compare, n);
         return cudaGetLastError();
     }
 }
