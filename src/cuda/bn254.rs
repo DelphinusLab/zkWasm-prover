@@ -62,7 +62,7 @@ mod test {
     }
 
     #[test]
-    fn test_bn254_fr_field_unmont_cuda() {
+    fn test_bn254_fr_field_cuda() {
         let device = CudaDevice::get_device(0).unwrap();
         let len = 4096;
         let threads = if len >= 32 { 32 } else { len };
@@ -177,9 +177,9 @@ mod test {
     }
 
     #[test]
-    fn test_bn254_fp_field_unmont_cuda() {
+    fn test_bn254_fp_field_cuda() {
         let device = CudaDevice::get_device(0).unwrap();
-        let len = 1 << 20;
+        let len = 4096;
         let threads = if len >= 32 { 32 } else { len };
         let blocks = len / threads;
 
@@ -294,7 +294,7 @@ mod test {
     #[test]
     fn test_bn254_ec_cuda() {
         let device = CudaDevice::get_device(0).unwrap();
-        let len = 1024;
+        let len = 4096;
         let threads = if len >= 32 { 32 } else { len };
         let blocks = len / threads;
 
