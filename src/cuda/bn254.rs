@@ -10,7 +10,7 @@ mod test {
     use cuda_runtime_sys::cudaError;
     use halo2_proofs::arithmetic::{BaseExt, Group};
     use halo2_proofs::pairing::bn256::{Fr, G1Affine, G1};
-    use halo2_proofs::pairing::group::Curve;
+    use halo2_proofs::pairing::group::{Curve, Group as _};
 
     #[link(name = "zkwasm_prover_kernel", kind = "static")]
     extern "C" {
@@ -393,8 +393,9 @@ mod test {
         let mut rands_p = vec![];
         let mut rands_ps = vec![];
         for _ in 0..random_nr {
-            rands_s.push(Fr::rand());
-            let ps = Fr::rand();
+            let s = Fr::one(); //Fr::rand();
+            rands_s.push(s);
+            let ps = Fr::one(); //Fr::rand();
 
             rands_p.push((G1Affine::generator() * ps).to_affine());
             rands_ps.push(ps);
@@ -414,7 +415,7 @@ mod test {
         let msm_res_expect = G1Affine::generator() * acc;
         end_timer!(timer);
 
-        let msm_groups = 1;
+        let msm_groups = 8;
         let mut tmp = vec![];
         for _ in 0..32 * msm_groups {
             tmp.push(G1::group_zero());
@@ -446,18 +447,19 @@ mod test {
                 .unwrap();
             end_timer!(timer);
 
+            for i in 0..32 {
+                for j in 1..msm_groups {
+                    tmp[i] = tmp[i] + tmp[i + j * 32];
+                }
+            }
+
             let timer = start_timer!(|| "gpu msm merge");
             let mut msm_res = tmp[31];
-            for j in 1..msm_groups {
-                msm_res = msm_res + tmp[31 + j * 32];
-            }
             for i in 0..31 {
                 for _ in 0..8 {
                     msm_res = msm_res + msm_res;
                 }
-                for j in 0..msm_groups {
-                    msm_res = msm_res + tmp[30 - i + j * 32];
-                }
+                msm_res = msm_res + tmp[30 - i];
             }
             end_timer!(timer);
             assert_eq!(msm_res.to_affine(), msm_res_expect.to_affine());

@@ -54,7 +54,7 @@ __global__ void _msm_step2(
     int start = window_idx * size_per_worker;
     int end = start + size_per_worker;
     end = end > n ? n : end;
-
+    
     __shared__ Bn254G1 thread_res[256];
 
     Bn254G1 buckets[255];
@@ -103,11 +103,10 @@ extern "C"
         Bn254FrField *s,
         int n)
     {
-        int threads = n >= 256 ? 256 : 32;
+        int threads = n >= 256 ? 256 : 1;
         int blocks = (n + threads - 1) / threads;
         _msm_step1<<<blocks, threads>>>(p, s, n);
         _msm_step2<<<dim3(32, msm_blocks), threads>>>(res, p, s, n);
-        _msm_step2<<<32, threads>>>(res, p, s, n);
         _msm_step3<<<blocks, threads>>>(p, s, n);
         return cudaGetLastError();
     }
