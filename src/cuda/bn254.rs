@@ -78,6 +78,7 @@ mod test {
             pq: *mut c_void,
             omega: *mut c_void,
             array_log: i32,
+            max_deg: i32,
             swap: *mut c_void,
         ) -> cudaError;
     }
@@ -488,7 +489,7 @@ mod test {
     #[test]
     fn test_bn254_fft() {
         let device = CudaDevice::get_device(0).unwrap();
-        let len_log = 9;
+        let len_log = 25;
         let len = 1 << len_log;
 
         let mut omega = Fr::ROOT_OF_UNITY_INV.invert().unwrap();
@@ -502,7 +503,7 @@ mod test {
         }
         println!("omega is {:?}", omega);
 
-        let max_deg = 8.min(len_log);
+        let max_deg = 9.min(len_log);
         let mut pq = vec![Fr::zero(); 1 << max_deg >> 1];
         let twiddle = omega.pow_vartime([(len >> max_deg) as u64]);
         pq[0] = Fr::one();
@@ -559,6 +560,7 @@ mod test {
                     pq_buf.handler,
                     omegas_buf.handler,
                     len_log as i32,
+                    max_deg as i32,
                     &mut swap as *mut _ as _,
                 );
                 assert_eq!(res, cudaError::cudaSuccess);
@@ -573,7 +575,7 @@ mod test {
                 }
                 println!("swap is {}", swap);
                 end_timer!(timer);
-                assert_eq!(s, expected_ntt_s);
+                assert_eq!(s == expected_ntt_s);
             }
         }
     }

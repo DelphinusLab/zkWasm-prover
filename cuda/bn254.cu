@@ -182,12 +182,12 @@ __global__ void _ntt_core(
         const Bn254FrField *x = _x + index;
         Bn254FrField *y = _y + ((index - k) << deg) + k;
 
-        __shared__ Bn254FrField u[256];
+        __shared__ Bn254FrField u[512];
         const Bn254FrField twiddle = pow_lookup(omegas, (n >> log_p >> deg) * k);
         Bn254FrField tmp = Bn254FrField::pow(&twiddle, counts);
         for (uint i = counts; i < counte; i++)
         {
-            printf("update u[%d] %d %p %d\n", i, t, x, (ulong)x[i * t].is_zero());
+            //printf("update u[%d] %d %p %d\n", i, t, x, (ulong)x[i * t].is_zero());
             u[i] = tmp * x[i * t];
             assert(!tmp.is_zero());
             //assert(!x[i * t].is_zero());
@@ -238,9 +238,9 @@ extern "C"
         const Bn254FrField *pq,
         const Bn254FrField *omegas,
         int log_n,
+        int max_deg,
         bool *swap)
     {
-        int max_deg = log_n > 8 ? 8 : log_n;
         int p = 0;
 
         Bn254FrField *src = buf;
