@@ -82,12 +82,12 @@ __global__ void _msm_core(
         res[group_idx + blockIdx.y * gridDim.x] = acc;
     }
 }
-
+/*
 __global__ void _ntt_core(
     Bn254FrField *buf,
     const Bn254FrField *omega,
     int log_n,
-    int round)
+    int _round)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int worker = blockDim.x * gridDim.x;
@@ -97,26 +97,119 @@ __global__ void _ntt_core(
     int end = start + size_per_worker;
     end = end > n ? n : end;
 
-    int shift = 1 << round;
-    int mask = shift - 1;
-
-    int twiddle_chunk = log_n - (round + 1);
-
-    for (int i = start; i < end; i++)
+    for (int round = 0; round < 8; round++)
     {
-        int inner = i & mask;
-        int outer = (i - inner);
-        int l = (outer << 1) + inner;
-        int r = l + shift;
+        int shift = 1 << round;
+        int mask = shift - 1;
 
-        Bn254FrField t = buf[r];
-        if (inner != 0)
+        int twiddle_chunk = log_n - (round + 1);
+
+        for (int i = start; i < end; i++)
         {
-            const Bn254FrField *twiddle = &omega[inner << twiddle_chunk];
-            t = t * *twiddle;
+            int inner = i & mask;
+            int outer = (i - inner);
+            int l = (outer << 1) + inner;
+            int r = l + shift;
+
+            Bn254FrField t = buf[r];
+            if (inner != 0)
+            {
+                const Bn254FrField *twiddle = &omega[0];
+                t = t * *twiddle;
+            }
+            buf[r] = buf[l] - t;
+            buf[l] += t;
         }
-        buf[r] = buf[l] - t;
-        buf[l] += t;
+
+        __syncthreads();
+    }
+}
+*/
+
+__device__ uint bit_reverse(uint n, uint bits)
+{
+    uint r = 0;
+    for (int i = 0; i < bits; i++)
+    {
+        r = (r << 1) | (n & 1);
+        n >>= 1;
+    }
+    return r;
+}
+
+__device__ Bn254FrField pow_lookup(const Bn254FrField *bases, uint exponent)
+{
+    Bn254FrField res(1);
+    uint i = 0;
+    while (exponent > 0)
+    {
+        if (exponent & 1)
+            res = res * bases[i];
+        exponent = exponent >> 1;
+        i++;
+    }
+    return res;
+}
+
+__global__ void _ntt_core(
+    const Bn254FrField *x,
+    Bn254FrField *y,
+    const Bn254FrField *pq,
+    const Bn254FrField *omegas,
+    uint n,       // Number of elements
+    uint log_p,   // Log2 of `p` (Read more in the link above)
+    uint deg,     // 1=>radix2, 2=>radix4, 3=>radix8, ...
+    uint max_deg) // Maximum degree supported, according to `pq` and `omegas`
+{
+    uint lid = threadIdx.x;
+    uint lsize = blockDim.x;
+    uint index = gridDim.x;
+    uint t = n >> deg;
+    uint p = 1 << log_p;
+    uint k = index & (p - 1);
+
+    x += index;
+    y += ((index - k) << deg) + k;
+
+    uint count = 1 << deg;    // 2^deg
+    uint counth = count >> 1; // Half of count
+
+    uint counts = count / lsize * lid;
+    uint counte = counts + count / lsize;
+
+    __shared__ Bn254FrField u[256];
+    const Bn254FrField twiddle = pow_lookup(omegas, (n >> log_p >> deg) * k);
+    Bn254FrField tmp = Bn254FrField::pow(&twiddle, counts);
+    for (uint i = counts; i < counte; i++)
+    {
+        u[i] = tmp * x[i * t];
+        tmp = tmp * twiddle;
+    }
+    __syncthreads();
+
+    const uint pqshift = max_deg - deg;
+    for (uint rnd = 0; rnd < deg; rnd++)
+    {
+        const uint bit = counth >> rnd;
+        for (uint i = counts >> 1; i < counte >> 1; i++)
+        {
+            const uint di = i & (bit - 1);
+            const uint i0 = (i << 1) - di;
+            const uint i1 = i0 + bit;
+            tmp = u[i0];
+            u[i0] = u[i0] + u[i1];
+            u[i1] = tmp - u[i1];
+            if (di != 0)
+                u[i1] = pq[di << rnd << pqshift] * u[i1];
+        }
+
+        __syncthreads();
+    }
+
+    for (uint i = counts >> 1; i < counte >> 1; i++)
+    {
+        y[i * p] = u[bit_reverse(i, deg)];
+        y[(i + counth) * p] = u[bit_reverse(i + counth, deg)];
     }
 }
 
@@ -125,14 +218,19 @@ extern "C"
     cudaError_t ntt(
         int blocks,
         Bn254FrField *buf,
+        Bn254FrField *tmp,
         const Bn254FrField *omega,
         int log_n)
     {
         printf("log_n is %d\n", log_n);
-        //_ntt_core<<<1, 256>>>(buf, omega, log_n, 0);
+        _ntt_core<<<(1 << log_n) / 512 / 64, 64, 256>>>(buf, tmp, omega, omega, 1 << log_n, 0, 8, 8);
+        _ntt_core<<<(1 << log_n) / 512 / 64, 64, 256>>>(buf, tmp, omega, omega, 1 << log_n, 8, 8, 8);
+        _ntt_core<<<(1 << log_n) / 512 / 64, 64, 256>>>(buf, tmp, omega, omega, 1 << log_n, 16, 8, 8);
+        _ntt_core<<<(1 << log_n) / 2 / 64, 64, 1>>>(buf, tmp, omega, omega, 1 << log_n, 24, 1, 8);
+        //_ntt_core<<<blocks, 256>>>(buf, omega, log_n, 1);
         for (int i = 0; i < log_n; i++)
         {
-            _ntt_core<<<blocks, 512>>>(buf, omega, log_n, i);
+            //_ntt_core<<<blocks, 256>>>(buf, omega, log_n, i);
         }
         return cudaGetLastError();
     }

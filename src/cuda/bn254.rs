@@ -69,10 +69,11 @@ mod test {
             s: *mut c_void,
             array_len: i32,
         ) -> cudaError;
-        
+
         pub fn ntt(
             blocks: i32,
             buf: *mut c_void,
+            tmp: *mut c_void,
             omega: *mut c_void,
             array_log: i32,
         ) -> cudaError;
@@ -393,55 +394,55 @@ mod test {
         let mut p = vec![];
         let mut s = vec![];
 
-        let timer = start_timer!(|| "prepare buffer");
+        for _ in 0..4 {
+            let timer = start_timer!(|| "prepare buffer");
 
-        let random_nr = 256;
-        let mut rands_s = vec![];
-        let mut rands_p = vec![];
-        let mut rands_ps = vec![];
-        for _ in 0..random_nr {
-            let s = Fr::rand();
-            rands_s.push(s);
-            let ps = Fr::rand();
+            let random_nr = 256;
+            let mut rands_s = vec![];
+            let mut rands_p = vec![];
+            let mut rands_ps = vec![];
+            for _ in 0..random_nr {
+                let s = Fr::rand();
+                rands_s.push(s);
+                let ps = Fr::rand();
 
-            rands_p.push((G1Affine::generator() * ps).to_affine());
-            rands_ps.push(ps);
-        }
+                rands_p.push((G1Affine::generator() * ps).to_affine());
+                rands_ps.push(ps);
+            }
 
-        let mut acc = Fr::zero();
-        for i in 0..len {
-            let x = rands_p[i % random_nr];
-            let y = rands_s[i % random_nr];
-            p.push(x);
-            s.push(y);
-            acc += rands_s[i % random_nr] * rands_ps[i % random_nr];
-        }
-        end_timer!(timer);
-
-        let timer = start_timer!(|| "cpu costs");
-        let msm_res_expect = G1Affine::generator() * acc;
-        end_timer!(timer);
-
-        let msm_groups = 4;
-        let windows = 32;
-        let windows_bits = 8;
-        let mut tmp = vec![];
-        for _ in 0..windows * msm_groups {
-            tmp.push(G1::group_zero());
-        }
-
-        unsafe {
-            let timer = start_timer!(|| "copy buffer");
-            let tmp_buf = device.alloc_device_buffer_from_slice(&tmp[..]).unwrap();
-            end_timer!(timer);
-            let timer = start_timer!(|| "copy buffer");
-            let a_buf = device.alloc_device_buffer_from_slice(&p[..]).unwrap();
-            end_timer!(timer);
-            let timer = start_timer!(|| "copy buffer");
-            let b_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
+            let mut acc = Fr::zero();
+            for i in 0..len {
+                let x = rands_p[i % random_nr];
+                let y = rands_s[i % random_nr];
+                p.push(x);
+                s.push(y);
+                acc += rands_s[i % random_nr] * rands_ps[i % random_nr];
+            }
             end_timer!(timer);
 
-            for _ in 0..4 {
+            let timer = start_timer!(|| "cpu costs");
+            let msm_res_expect = G1Affine::generator() * acc;
+            end_timer!(timer);
+
+            let msm_groups = 4;
+            let windows = 32;
+            let windows_bits = 8;
+            let mut tmp = vec![];
+            for _ in 0..windows * msm_groups {
+                tmp.push(G1::group_zero());
+            }
+
+            unsafe {
+                let timer = start_timer!(|| "copy buffer");
+                let tmp_buf = device.alloc_device_buffer_from_slice(&tmp[..]).unwrap();
+                end_timer!(timer);
+                let timer = start_timer!(|| "copy buffer");
+                let a_buf = device.alloc_device_buffer_from_slice(&p[..]).unwrap();
+                end_timer!(timer);
+                let timer = start_timer!(|| "copy buffer");
+                let b_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
+                end_timer!(timer);
+
                 let timer = start_timer!(|| "gpu costs");
                 let res = msm(
                     msm_groups as i32,
@@ -481,7 +482,6 @@ mod test {
         }
     }
 
-    
     #[test]
     fn test_bn254_fft() {
         let device = CudaDevice::get_device(0).unwrap();
@@ -511,13 +511,16 @@ mod test {
         }
         end_timer!(timer);
 
-        let blocks = 128;
+        let blocks = 64;
         unsafe {
             let timer = start_timer!(|| "copy buffer");
             let a_buf = device.alloc_device_buffer_from_slice(&p[..]).unwrap();
             end_timer!(timer);
             let timer = start_timer!(|| "copy buffer");
             let b_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
+            end_timer!(timer);
+            let timer = start_timer!(|| "copy buffer");
+            let c_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
             end_timer!(timer);
 
             for _ in 0..4 {
@@ -526,6 +529,7 @@ mod test {
                     blocks as i32,
                     a_buf.handler,
                     b_buf.handler,
+                    c_buf.handler,
                     len_log as i32,
                 );
                 device.synchronize().unwrap();
@@ -533,9 +537,7 @@ mod test {
                 end_timer!(timer);
 
                 let timer = start_timer!(|| "copy buffer back");
-                device
-                    .copy_from_device_to_host(&mut p[..], &a_buf)
-                    .unwrap();
+                device.copy_from_device_to_host(&mut p[..], &a_buf).unwrap();
                 end_timer!(timer);
             }
         }
