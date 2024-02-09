@@ -47,7 +47,7 @@ __global__ void _msm_core(
 
     __shared__ Bn254G1 thread_res[256];
 
-    Bn254G1 buckets[255];
+    Bn254G1 buckets[256];
 
     for (int i = start; i < end; i++)
     {
@@ -83,8 +83,60 @@ __global__ void _msm_core(
     }
 }
 
+__global__ void _ntt_core(
+    Bn254FrField *buf,
+    const Bn254FrField *omega,
+    int log_n,
+    int round)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int worker = blockDim.x * gridDim.x;
+    int n = 1 << (log_n - 1);
+    int size_per_worker = (n + worker - 1) / worker;
+    int start = gid * size_per_worker;
+    int end = start + size_per_worker;
+    end = end > n ? n : end;
+
+    int shift = 1 << round;
+    int mask = shift - 1;
+
+    int twiddle_chunk = log_n - (round + 1);
+
+    for (int i = start; i < end; i++)
+    {
+        int inner = i & mask;
+        int outer = (i - inner);
+        int l = (outer << 1) + inner;
+        int r = l + shift;
+
+        Bn254FrField t = buf[r];
+        if (inner != 0)
+        {
+            const Bn254FrField *twiddle = &omega[inner << twiddle_chunk];
+            t = t * *twiddle;
+        }
+        buf[r] = buf[l] - t;
+        buf[l] += t;
+    }
+}
+
 extern "C"
 {
+    cudaError_t ntt(
+        int blocks,
+        Bn254FrField *buf,
+        const Bn254FrField *omega,
+        int log_n)
+    {
+        printf("log_n is %d\n", log_n);
+        //_ntt_core<<<1, 256>>>(buf, omega, log_n, 0);
+        for (int i = 0; i < log_n; i++)
+        {
+            _ntt_core<<<blocks, 512>>>(buf, omega, log_n, i);
+        }
+        return cudaGetLastError();
+    }
+
     cudaError_t msm(
         int msm_blocks,
         int max_msm_threads,

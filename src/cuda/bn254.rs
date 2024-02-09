@@ -69,6 +69,13 @@ mod test {
             s: *mut c_void,
             array_len: i32,
         ) -> cudaError;
+        
+        pub fn ntt(
+            blocks: i32,
+            buf: *mut c_void,
+            omega: *mut c_void,
+            array_log: i32,
+        ) -> cudaError;
     }
 
     #[cfg(features = "full-test")]
@@ -470,6 +477,66 @@ mod test {
                 }
                 end_timer!(timer);
                 assert_eq!(msm_res.to_affine(), msm_res_expect.to_affine());
+            }
+        }
+    }
+
+    
+    #[test]
+    fn test_bn254_fft() {
+        let device = CudaDevice::get_device(0).unwrap();
+        let len_log = 25;
+        let len = 1 << len_log;
+
+        let mut p = vec![];
+        let mut s = vec![];
+
+        let timer = start_timer!(|| "prepare buffer");
+
+        let random_nr = 256;
+        let mut rands_s = vec![];
+        let mut rands_p = vec![];
+        for _ in 0..random_nr {
+            let s = Fr::rand();
+            rands_s.push(s);
+            let p = Fr::rand();
+            rands_p.push(p);
+        }
+
+        for i in 0..len {
+            let x = rands_p[i % random_nr];
+            let y = rands_s[i % random_nr];
+            p.push(x);
+            s.push(y);
+        }
+        end_timer!(timer);
+
+        let blocks = 128;
+        unsafe {
+            let timer = start_timer!(|| "copy buffer");
+            let a_buf = device.alloc_device_buffer_from_slice(&p[..]).unwrap();
+            end_timer!(timer);
+            let timer = start_timer!(|| "copy buffer");
+            let b_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
+            end_timer!(timer);
+
+            for _ in 0..4 {
+                let timer = start_timer!(|| "gpu costs");
+                let res = ntt(
+                    blocks as i32,
+                    a_buf.handler,
+                    b_buf.handler,
+                    len_log as i32,
+                );
+                device.synchronize().unwrap();
+                assert_eq!(res, cudaError::cudaSuccess);
+                end_timer!(timer);
+
+                let timer = start_timer!(|| "copy buffer back");
+                device
+                    .copy_from_device_to_host(&mut p[..], &a_buf)
+                    .unwrap();
+                end_timer!(timer);
             }
         }
     }
