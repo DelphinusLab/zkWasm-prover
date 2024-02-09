@@ -393,9 +393,9 @@ mod test {
         let mut rands_p = vec![];
         let mut rands_ps = vec![];
         for _ in 0..random_nr {
-            let s = Fr::one(); //Fr::rand();
+            let s = Fr::rand();
             rands_s.push(s);
-            let ps = Fr::one(); //Fr::rand();
+            let ps = Fr::rand();
 
             rands_p.push((G1Affine::generator() * ps).to_affine());
             rands_ps.push(ps);
@@ -415,54 +415,62 @@ mod test {
         let msm_res_expect = G1Affine::generator() * acc;
         end_timer!(timer);
 
-        let msm_groups = 8;
+        let msm_groups = 4;
+        let windows = 32;
+        let windows_bits = 8;
         let mut tmp = vec![];
-        for _ in 0..32 * msm_groups {
+        for _ in 0..windows * msm_groups {
             tmp.push(G1::group_zero());
         }
 
         unsafe {
             let timer = start_timer!(|| "copy buffer");
-            let a_buf = device.alloc_device_buffer_from_slice(&p[..]).unwrap();
-            let b_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
             let tmp_buf = device.alloc_device_buffer_from_slice(&tmp[..]).unwrap();
             end_timer!(timer);
-
-            let timer = start_timer!(|| "gpu costs");
-            let res = msm(
-                msm_groups as i32,
-                256,
-                tmp_buf.handler,
-                a_buf.handler,
-                b_buf.handler,
-                len as i32,
-            );
-            device.synchronize().unwrap();
-            assert_eq!(res, cudaError::cudaSuccess);
+            let timer = start_timer!(|| "copy buffer");
+            let a_buf = device.alloc_device_buffer_from_slice(&p[..]).unwrap();
+            end_timer!(timer);
+            let timer = start_timer!(|| "copy buffer");
+            let b_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
             end_timer!(timer);
 
-            let timer = start_timer!(|| "copy buffer back");
-            device
-                .copy_from_device_to_host(&mut tmp[..], &tmp_buf)
-                .unwrap();
-            end_timer!(timer);
+            for _ in 0..4 {
+                let timer = start_timer!(|| "gpu costs");
+                let res = msm(
+                    msm_groups as i32,
+                    256,
+                    tmp_buf.handler,
+                    a_buf.handler,
+                    b_buf.handler,
+                    len as i32,
+                );
+                device.synchronize().unwrap();
+                assert_eq!(res, cudaError::cudaSuccess);
+                end_timer!(timer);
 
-            for i in 0..32 {
-                for j in 1..msm_groups {
-                    tmp[i] = tmp[i] + tmp[i + j * 32];
+                let timer = start_timer!(|| "copy buffer back");
+                device
+                    .copy_from_device_to_host(&mut tmp[..], &tmp_buf)
+                    .unwrap();
+                end_timer!(timer);
+
+                for i in 0..windows {
+                    for j in 1..msm_groups {
+                        tmp[i] = tmp[i] + tmp[i + j * windows];
+                    }
                 }
-            }
 
-            let timer = start_timer!(|| "gpu msm merge");
-            let mut msm_res = tmp[31];
-            for i in 0..31 {
-                for _ in 0..8 {
-                    msm_res = msm_res + msm_res;
+                let timer = start_timer!(|| "gpu msm merge");
+                let mut msm_res = tmp[windows - 1];
+                for i in 0..windows - 1 {
+                    for _ in 0..windows_bits {
+                        msm_res = msm_res + msm_res;
+                    }
+                    msm_res = msm_res + tmp[windows - 2 - i];
                 }
-                msm_res = msm_res + tmp[30 - i];
+                end_timer!(timer);
+                assert_eq!(msm_res.to_affine(), msm_res_expect.to_affine());
             }
-            end_timer!(timer);
-            assert_eq!(msm_res.to_affine(), msm_res_expect.to_affine());
         }
     }
 }

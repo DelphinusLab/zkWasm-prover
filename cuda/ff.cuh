@@ -378,6 +378,14 @@ public:
 
         return (this->limbs_le[limb] >> (idx * 8)) & (0x00fful);
     }
+    
+    __device__ ulong get_4bits(uint i) const
+    {
+        uint limb = i / (sizeof(FieldLimb) * 2);
+        uint idx = i % (sizeof(FieldLimb) * 2);
+
+        return (this->limbs_le[limb] >> (idx * 4)) & (0xful);
+    }
 
     // operator
 
