@@ -4,9 +4,10 @@
 
 #include "bn254.cuh"
 
-__global__ void _msm_step1(
+__global__ void _msm_mont_unmont(
     Bn254G1Affine *p,
     Bn254FrField *s,
+    bool mont,
     int n)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -18,29 +19,18 @@ __global__ void _msm_step1(
 
     for (int i = start; i < end; i++)
     {
-        s[i].unmont_assign();
+        if (mont)
+        {
+            s[i].mont_assign();
+        }
+        else
+        {
+            s[i].unmont_assign();
+        }
     }
 }
 
-__global__ void _msm_step3(
-    Bn254G1Affine *p,
-    Bn254FrField *s,
-    int n)
-{
-    int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    int worker = blockDim.x * gridDim.x;
-    int size_per_worker = (n + worker - 1) / worker;
-    int start = gid * size_per_worker;
-    int end = start + size_per_worker;
-    end = end > n ? n : end;
-
-    for (int i = start; i < end; i++)
-    {
-        s[i].mont_assign();
-    }
-}
-
-__global__ void _msm_step2(
+__global__ void _msm_core(
     Bn254G1 *res,
     const Bn254G1Affine *p,
     Bn254FrField *s,
@@ -54,7 +44,7 @@ __global__ void _msm_step2(
     int start = window_idx * size_per_worker;
     int end = start + size_per_worker;
     end = end > n ? n : end;
-    
+
     __shared__ Bn254G1 thread_res[256];
 
     Bn254G1 buckets[255];
@@ -105,9 +95,9 @@ extern "C"
     {
         int threads = n >= 256 ? 256 : 1;
         int blocks = (n + threads - 1) / threads;
-        _msm_step1<<<blocks, threads>>>(p, s, n);
-        _msm_step2<<<dim3(32, msm_blocks), threads>>>(res, p, s, n);
-        _msm_step3<<<blocks, threads>>>(p, s, n);
+        _msm_mont_unmont<<<blocks, threads>>>(p, s, false, n);
+        _msm_core<<<dim3(32, msm_blocks), threads>>>(res, p, s, n);
+        _msm_mont_unmont<<<blocks, threads>>>(p, s, true, n);
         return cudaGetLastError();
     }
 }
