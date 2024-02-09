@@ -11,21 +11,32 @@ __global__ void _msm_step1(
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int worker = blockDim.x * gridDim.x;
-    int size_per_worker = n / worker;
+    int size_per_worker = (n + worker - 1) / worker;
     int start = gid * size_per_worker;
     int end = start + size_per_worker;
+    end = end > n ? n : end;
 
     for (int i = start; i < end; i++)
     {
-        /*
-        if (s[i].get_bit(253))
-        {
-            p[i].ec_neg_assign();
-            s[i].neg_assign();
-        }
-        assert(!s[i].get_bit(253));
-        */
         s[i].unmont_assign();
+    }
+}
+
+__global__ void _msm_step3(
+    Bn254G1Affine *p,
+    Bn254FrField *s,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int worker = blockDim.x * gridDim.x;
+    int size_per_worker = (n + worker - 1) / worker;
+    int start = gid * size_per_worker;
+    int end = start + size_per_worker;
+    end = end > n ? n : end;
+
+    for (int i = start; i < end; i++)
+    {
+        s[i].mont_assign();
     }
 }
 
@@ -35,42 +46,69 @@ __global__ void _msm_step2(
     Bn254FrField *s,
     int n)
 {
-    int idx = threadIdx.x;
+    int group_idx = blockIdx.x;
+    int worker = blockDim.x * gridDim.y;
+    int size_per_worker = (n + worker - 1) / worker;
+    int inner_idx = threadIdx.x;
+    int window_idx = inner_idx + blockIdx.y * blockDim.x;
+    int start = window_idx * size_per_worker;
+    int end = start + size_per_worker;
+    end = end > n ? n : end;
+
+    __shared__ Bn254G1 thread_res[256];
+
     Bn254G1 buckets[255];
 
-    for (int i = 0; i < n; i++)
+    for (int i = start; i < end; i++)
     {
-        int v = s[i].unmont().get_8bits(idx);
-        if (v != 0)
+        int v = s[i].get_8bits(group_idx);
+        if (v--)
         {
-            buckets[v - 1] = buckets[v - 1] + p[i];
+            buckets[v] = buckets[v] + p[i];
         }
     }
 
-    Bn254G1 round;
-    Bn254G1 acc;
-    for (int i = 254; i >= 0; i--)
+    if (end > start)
     {
-        round = round + buckets[i];
-        acc = acc + round;
+        Bn254G1 round;
+        Bn254G1 acc;
+        for (int i = 254; i >= 0; i--)
+        {
+            round = round + buckets[i];
+            acc = acc + round;
+        }
+
+        thread_res[inner_idx] = acc;
     }
 
-    res[idx] = acc;
+    __syncthreads();
+    if (inner_idx == 0)
+    {
+        Bn254G1 acc;
+        for (int i = 0; i < blockDim.x; i++)
+        {
+            acc = acc + thread_res[i];
+        }
+        res[group_idx + blockIdx.y * gridDim.x] = acc;
+    }
 }
 
 extern "C"
 {
     cudaError_t msm(
+        int msm_blocks,
+        int max_msm_threads,
         Bn254G1 *res,
         Bn254G1Affine *p,
         Bn254FrField *s,
         int n)
     {
-        /*
-        int blocks = n / 32;
-        _msm_step1<<<blocks, 32>>>(p, s, n);
-        */
-        _msm_step2<<<1, 32>>>(res, p, s, n);
+        int threads = n >= 256 ? 256 : 32;
+        int blocks = (n + threads - 1) / threads;
+        _msm_step1<<<blocks, threads>>>(p, s, n);
+        _msm_step2<<<dim3(32, msm_blocks), threads>>>(res, p, s, n);
+        _msm_step2<<<32, threads>>>(res, p, s, n);
+        _msm_step3<<<blocks, threads>>>(p, s, n);
         return cudaGetLastError();
     }
 }

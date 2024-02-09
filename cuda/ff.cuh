@@ -56,8 +56,6 @@ private:
 
     __device__ static void _mul(FieldLimb *out, const FieldLimb *a, const FieldLimb *b)
     {
-        assert(a != out);
-        assert(b != out);
         if (LIMBS == 4)
         {
             ulong h0 = 0;
@@ -254,6 +252,18 @@ public:
         {
             assert(0);
         }
+    }
+
+    __device__ void mont_assign()
+    {
+        mont(this);
+    }
+
+    __device__ Field mont() const
+    {
+        Field t(*this);
+        mont(&t);
+        return t;
     }
 
     __device__ static Field sqr(const Field *a)

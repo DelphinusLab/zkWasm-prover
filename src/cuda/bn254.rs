@@ -61,7 +61,14 @@ mod test {
             array_len: i32,
         ) -> cudaError;
 
-        pub fn msm(res: *mut c_void, p: *mut c_void, s: *mut c_void, array_len: i32) -> cudaError;
+        pub fn msm(
+            blocks: i32,
+            threads: i32,
+            res: *mut c_void,
+            p: *mut c_void,
+            s: *mut c_void,
+            array_len: i32,
+        ) -> cudaError;
     }
 
     #[cfg(features = "full-test")]
@@ -374,7 +381,7 @@ mod test {
     #[test]
     fn test_bn254_msm() {
         let device = CudaDevice::get_device(0).unwrap();
-        let len = 1 << 16;
+        let len = 1 << 20;
 
         let mut p = vec![];
         let mut s = vec![];
@@ -407,8 +414,9 @@ mod test {
         let msm_res_expect = G1Affine::generator() * acc;
         end_timer!(timer);
 
+        let msm_groups = 1;
         let mut tmp = vec![];
-        for _ in 0..32 {
+        for _ in 0..32 * msm_groups {
             tmp.push(G1::group_zero());
         }
 
@@ -420,8 +428,16 @@ mod test {
             end_timer!(timer);
 
             let timer = start_timer!(|| "gpu costs");
-            let res = msm(tmp_buf.handler, a_buf.handler, b_buf.handler, len as i32);
+            let res = msm(
+                msm_groups as i32,
+                256,
+                tmp_buf.handler,
+                a_buf.handler,
+                b_buf.handler,
+                len as i32,
+            );
             device.synchronize().unwrap();
+            assert_eq!(res, cudaError::cudaSuccess);
             end_timer!(timer);
 
             let timer = start_timer!(|| "copy buffer back");
@@ -430,15 +446,20 @@ mod test {
                 .unwrap();
             end_timer!(timer);
 
+            let timer = start_timer!(|| "gpu msm merge");
             let mut msm_res = tmp[31];
+            for j in 1..msm_groups {
+                msm_res = msm_res + tmp[31 + j * 32];
+            }
             for i in 0..31 {
                 for _ in 0..8 {
                     msm_res = msm_res + msm_res;
                 }
-                msm_res = msm_res + tmp[30 - i];
+                for j in 0..msm_groups {
+                    msm_res = msm_res + tmp[30 - i + j * 32];
+                }
             }
-
-            assert_eq!(res, cudaError::cudaSuccess);
+            end_timer!(timer);
             assert_eq!(msm_res.to_affine(), msm_res_expect.to_affine());
         }
     }
