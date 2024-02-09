@@ -2,14 +2,16 @@
 mod test {
     use std::ffi::c_void;
     use std::mem;
+    use std::ops::MulAssign as _;
 
     use crate::device::cuda::CudaDevice;
     use crate::device::Device;
     use ark_std::rand::rngs::OsRng;
     use ark_std::{end_timer, start_timer};
     use cuda_runtime_sys::cudaError;
-    use halo2_proofs::arithmetic::{BaseExt, Group};
+    use halo2_proofs::arithmetic::{best_fft_cpu, BaseExt, Field as _, FieldExt, Group};
     use halo2_proofs::pairing::bn256::{Fr, G1Affine, G1};
+    use halo2_proofs::pairing::group::ff::PrimeField as _;
     use halo2_proofs::pairing::group::{Curve, Group as _};
 
     #[link(name = "zkwasm_prover_kernel", kind = "static")]
@@ -71,11 +73,12 @@ mod test {
         ) -> cudaError;
 
         pub fn ntt(
-            blocks: i32,
             buf: *mut c_void,
             tmp: *mut c_void,
+            pq: *mut c_void,
             omega: *mut c_void,
             array_log: i32,
+            swap: *mut c_void,
         ) -> cudaError;
     }
 
@@ -485,60 +488,92 @@ mod test {
     #[test]
     fn test_bn254_fft() {
         let device = CudaDevice::get_device(0).unwrap();
-        let len_log = 25;
+        let len_log = 9;
         let len = 1 << len_log;
 
-        let mut p = vec![];
-        let mut s = vec![];
-
-        let timer = start_timer!(|| "prepare buffer");
-
-        let random_nr = 256;
-        let mut rands_s = vec![];
-        let mut rands_p = vec![];
-        for _ in 0..random_nr {
-            let s = Fr::rand();
-            rands_s.push(s);
-            let p = Fr::rand();
-            rands_p.push(p);
+        let mut omega = Fr::ROOT_OF_UNITY_INV.invert().unwrap();
+        for _ in len_log..Fr::S {
+            omega = omega.square();
         }
 
-        for i in 0..len {
-            let x = rands_p[i % random_nr];
-            let y = rands_s[i % random_nr];
-            p.push(x);
-            s.push(y);
+        let mut omegas = vec![Fr::one()];
+        for _ in 1..32 {
+            omegas.push(omega * omegas.last().unwrap());
         }
-        end_timer!(timer);
+        println!("omega is {:?}", omega);
 
-        let blocks = 64;
-        unsafe {
-            let timer = start_timer!(|| "copy buffer");
-            let a_buf = device.alloc_device_buffer_from_slice(&p[..]).unwrap();
-            end_timer!(timer);
-            let timer = start_timer!(|| "copy buffer");
-            let b_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
-            end_timer!(timer);
-            let timer = start_timer!(|| "copy buffer");
-            let c_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
+        let max_deg = 8.min(len_log);
+        let mut pq = vec![Fr::zero(); 1 << max_deg >> 1];
+        let twiddle = omega.pow_vartime([(len >> max_deg) as u64]);
+        pq[0] = Fr::one();
+        if max_deg > 1 {
+            pq[1] = twiddle;
+            for i in 2..(1 << max_deg >> 1) {
+                pq[i] = pq[i - 1];
+                pq[i].mul_assign(&twiddle);
+            }
+        }
+
+        for _ in 0..4 {
+            let mut s = vec![];
+
+            let timer = start_timer!(|| "prepare buffer");
+            let random_nr = 256;
+            let mut rands_s = vec![];
+            for _ in 0..random_nr {
+                let s = Fr::rand();
+                rands_s.push(s);
+            }
+
+            for i in 0..len {
+                let x = rands_s[i % random_nr];
+                s.push(x);
+            }
             end_timer!(timer);
 
-            for _ in 0..4 {
+            let timer = start_timer!(|| "st cpu cost");
+            let mut expected_ntt_s = s.clone();
+            // println!("s is {:?}", expected_ntt_s);
+            best_fft_cpu(&mut expected_ntt_s[..], omega, len_log);
+            end_timer!(timer);
+
+            unsafe {
+                let timer = start_timer!(|| "copy buffer");
+                let a_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
+                end_timer!(timer);
+                let timer = start_timer!(|| "copy buffer");
+                let b_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
+                end_timer!(timer);
+                let timer = start_timer!(|| "copy buffer");
+                let omegas_buf = device.alloc_device_buffer_from_slice(&omegas[..]).unwrap();
+                end_timer!(timer);
+                let timer = start_timer!(|| "copy buffer");
+                let pq_buf = device.alloc_device_buffer_from_slice(&pq[..]).unwrap();
+                end_timer!(timer);
+
+                let mut swap = false;
                 let timer = start_timer!(|| "gpu costs");
                 let res = ntt(
-                    blocks as i32,
                     a_buf.handler,
                     b_buf.handler,
-                    c_buf.handler,
+                    pq_buf.handler,
+                    omegas_buf.handler,
                     len_log as i32,
+                    &mut swap as *mut _ as _,
                 );
-                device.synchronize().unwrap();
                 assert_eq!(res, cudaError::cudaSuccess);
+                device.synchronize().unwrap();
                 end_timer!(timer);
 
                 let timer = start_timer!(|| "copy buffer back");
-                device.copy_from_device_to_host(&mut p[..], &a_buf).unwrap();
+                if swap {
+                    device.copy_from_device_to_host(&mut s[..], &b_buf).unwrap();
+                } else {
+                    device.copy_from_device_to_host(&mut s[..], &a_buf).unwrap();
+                }
+                println!("swap is {}", swap);
                 end_timer!(timer);
+                assert_eq!(s, expected_ntt_s);
             }
         }
     }
