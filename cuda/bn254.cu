@@ -187,9 +187,11 @@ __global__ void _ntt_core(
         Bn254FrField tmp = Bn254FrField::pow(&twiddle, counts);
         for (uint i = counts; i < counte; i++)
         {
-            //printf("update u[%d]\n", i);
+            printf("update u[%d] %d %p %d\n", i, t, x, (ulong)x[i * t].is_zero());
             u[i] = tmp * x[i * t];
-            assert(!u[i].is_zero());
+            assert(!tmp.is_zero());
+            //assert(!x[i * t].is_zero());
+            //assert(!u[i].is_zero());
             tmp = tmp * twiddle;
         }
         __syncthreads();
@@ -223,6 +225,8 @@ __global__ void _ntt_core(
             y[i * p] = u[bit_reverse(i, deg)];
             y[(i + counth) * p] = u[bit_reverse(i + counth, deg)];
         }
+        
+        __syncthreads();
     }
 }
 
@@ -260,7 +264,7 @@ extern "C"
             int blocks = total >> (deg - 1);
             blocks = blocks > 65536 ? 65536 : blocks;
             int grids = (total / blocks) >> (deg - 1);
-            //printf("round %d %d %d %d\n", log_n, grids, blocks, threads);
+            printf("round %d %d %d %d %p %p\n", log_n, grids, blocks, threads, src, dst);
             _ntt_core<<<blocks, threads>>>(src, dst, pq, omegas, len, p, deg, max_deg, grids);
 
             Bn254FrField *t = src;
