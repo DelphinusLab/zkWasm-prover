@@ -42,7 +42,7 @@ impl CudaDevice {
 }
 
 #[inline]
-fn to_result<T>(value: T, res: cudaError, msg: &'static str) -> DeviceResult<T> {
+pub(crate) fn to_result<T>(value: T, res: cudaError, msg: &'static str) -> DeviceResult<T> {
     if res != cudaError::cudaSuccess {
         Err(Error::DeviceError(format!(
             "Cuda Error({:?}): {}",
@@ -53,7 +53,7 @@ fn to_result<T>(value: T, res: cudaError, msg: &'static str) -> DeviceResult<T> 
     }
 }
 
-type CudaDeviceBuf<T> = DeviceBuf<T, *mut c_void>;
+pub type CudaDeviceBuf<T> = DeviceBuf<T, *mut c_void>;
 
 impl Device<*mut c_void> for CudaDevice {
     fn get_device_count() -> DeviceResult<usize> {

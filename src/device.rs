@@ -7,7 +7,7 @@ pub enum Error {
     DeviceError(String),
 }
 
-type DeviceResult<T> = Result<T, Error>;
+pub type DeviceResult<T> = Result<T, Error>;
 
 pub struct DeviceBuf<T, H: Sized> {
     pub handler: H,

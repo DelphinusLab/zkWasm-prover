@@ -264,7 +264,7 @@ extern "C"
         Bn254FrField *s,
         int n)
     {
-        int threads = n >= 256 ? 256 : 1;
+        int threads = n >= max_msm_threads ? max_msm_threads : 1;
         int blocks = (n + threads - 1) / threads;
         _msm_mont_unmont<<<blocks, threads>>>(p, s, false, n);
         _msm_core<<<dim3(32, msm_blocks), threads>>>(res, p, s, n);

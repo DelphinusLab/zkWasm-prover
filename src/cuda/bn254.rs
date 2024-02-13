@@ -1,16 +1,75 @@
+use crate::device::cuda::{to_result, CudaDevice, CudaDeviceBuf};
+use crate::device::Device;
+use crate::device::Error;
+use halo2_proofs::arithmetic::CurveAffine;
+use halo2_proofs::pairing::group::Curve;
+use std::mem::zeroed;
+
+mod cuda_c {
+    use cuda_runtime_sys::cudaError;
+    use std::ffi::c_void;
+    #[link(name = "zkwasm_prover_kernel", kind = "static")]
+    extern "C" {
+        pub fn msm(
+            blocks: i32,
+            threads: i32,
+            res: *mut c_void,
+            p: *mut c_void,
+            s: *mut c_void,
+            array_len: i32,
+        ) -> cudaError;
+
+        pub fn ntt(
+            buf: *mut c_void,
+            tmp: *mut c_void,
+            pq: *mut c_void,
+            omega: *mut c_void,
+            array_log: i32,
+            max_deg: i32,
+            swap: *mut c_void,
+        ) -> cudaError;
+    }
+}
+
+pub fn msm<C: CurveAffine>(
+    device: &CudaDevice,
+    res_buf: &CudaDeviceBuf<C::Curve>,
+    p_buf: &CudaDeviceBuf<C>,
+    s_buf: &CudaDeviceBuf<C::ScalarExt>,
+    len: usize,
+) -> Result<C, Error> {
+    let mut res = [unsafe { zeroed() }];
+    unsafe {
+        let err = cuda_c::msm(
+            4,
+            256,
+            res_buf.handler,
+            p_buf.handler,
+            s_buf.handler,
+            len as i32,
+        );
+        to_result((), err, "fail to run msm")?;
+    }
+
+    device.copy_from_device_to_host(&mut res[..], res_buf)?;
+    Ok(res[0].to_affine())
+}
+
 #[cfg(test)]
 mod test {
     use std::ffi::c_void;
     use std::mem;
     use std::ops::MulAssign as _;
 
-    use crate::device::cuda::CudaDevice;
-    use crate::device::Device;
+    use crate::device::cuda::{to_result, CudaDevice};
+    use crate::device::{Device, DeviceBuf};
     use crate::hugetlb::HUGE_PAGE_ALLOCATOR;
     use ark_std::rand::rngs::OsRng;
     use ark_std::{end_timer, start_timer};
     use cuda_runtime_sys::cudaError;
-    use halo2_proofs::arithmetic::{best_fft_cpu, BaseExt, Field as _, FieldExt, Group};
+    use halo2_proofs::arithmetic::{
+        best_fft_cpu, BaseExt, CurveAffine, Field as _, FieldExt, Group,
+    };
     use halo2_proofs::pairing::bn256::{Fr, G1Affine, G1};
     use halo2_proofs::pairing::group::ff::PrimeField as _;
     use halo2_proofs::pairing::group::{Curve, Group as _};
@@ -62,25 +121,6 @@ mod test {
             sub: *mut c_void,
             double: *mut c_void,
             array_len: i32,
-        ) -> cudaError;
-
-        pub fn msm(
-            blocks: i32,
-            threads: i32,
-            res: *mut c_void,
-            p: *mut c_void,
-            s: *mut c_void,
-            array_len: i32,
-        ) -> cudaError;
-
-        pub fn ntt(
-            buf: *mut c_void,
-            tmp: *mut c_void,
-            pq: *mut c_void,
-            omega: *mut c_void,
-            array_log: i32,
-            max_deg: i32,
-            swap: *mut c_void,
         ) -> cudaError;
     }
 
@@ -396,12 +436,11 @@ mod test {
         let device = CudaDevice::get_device(0).unwrap();
         let len = 1 << 20;
 
-        let mut p = vec![];
-        let mut s = vec![];
-
         for _ in 0..4 {
-            let timer = start_timer!(|| "prepare buffer");
+            let mut p = vec![];
+            let mut s = vec![];
 
+            let timer = start_timer!(|| "prepare buffer");
             let random_nr = 256;
             let mut rands_s = vec![];
             let mut rands_p = vec![];
@@ -449,7 +488,7 @@ mod test {
                 end_timer!(timer);
 
                 let timer = start_timer!(|| "gpu costs");
-                let res = msm(
+                let res = crate::cuda::bn254::cuda_c::msm(
                     msm_groups as i32,
                     256,
                     tmp_buf.handler,
@@ -583,7 +622,7 @@ mod test {
 
                 let mut swap = false;
                 let timer = start_timer!(|| "gpu costs");
-                let res = ntt(
+                let res = crate::cuda::bn254::cuda_c::ntt(
                     a_buf.handler,
                     b_buf.handler,
                     pq_buf.handler,
