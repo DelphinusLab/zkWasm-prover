@@ -4,8 +4,6 @@ use ark_std::end_timer;
 use ark_std::start_timer;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
-use halo2_proofs::pairing::bls12_381::G1Affine;
-use halo2_proofs::pairing::bn256::G1;
 use halo2_proofs::pairing::group::Group as _;
 use halo2_proofs::plonk::ProvingKey;
 use halo2_proofs::poly::commitment::Params;
@@ -16,7 +14,6 @@ use std::alloc::Allocator;
 use crate::cuda::bn254::msm;
 use crate::device::cuda::CudaDevice;
 use crate::device::Device as _;
-use crate::device::DeviceBuf;
 use crate::device::DeviceResult;
 
 pub mod cuda;
@@ -37,6 +34,7 @@ pub fn prepare_advice_buffer<C: CurveAffine>(pk: &ProvingKey<C>) -> Vec<Vec<C::S
     advices
 }
 
+#[derive(Debug)]
 pub enum Error {
     DeviceError(device::Error),
 }
@@ -51,7 +49,6 @@ pub fn create_proof_from_advices<
     C: CurveAffine,
     E: EncodedChallenge<C>,
     T: TranscriptWrite<C, E>,
-    A: Allocator,
 >(
     params: &Params<C>,
     pk: &ProvingKey<C>,
@@ -60,6 +57,10 @@ pub fn create_proof_from_advices<
     transcript: &mut T,
 ) -> Result<(), Error> {
     let size = 1 << pk.get_vk().domain.k();
+
+    let timer = start_timer!(|| "create single instances");
+    let instance = halo2_proofs::plonk::create_single_instances(params, pk, &[instances], transcript).unwrap();
+    end_timer!(timer);
 
     let device = CudaDevice::get_device(0).unwrap();
 
