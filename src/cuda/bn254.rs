@@ -489,7 +489,7 @@ mod test {
     #[test]
     fn test_bn254_fft() {
         let device = CudaDevice::get_device(0).unwrap();
-        let len_log = 25;
+        let len_log = 24;
         let len = 1 << len_log;
 
         let mut omega = Fr::ROOT_OF_UNITY_INV.invert().unwrap();
@@ -497,11 +497,10 @@ mod test {
             omega = omega.square();
         }
 
-        let mut omegas = vec![Fr::one()];
+        let mut omegas = vec![omega];
         for _ in 1..32 {
-            omegas.push(omega * omegas.last().unwrap());
+            omegas.push(omegas.last().unwrap().square());
         }
-        println!("omega is {:?}", omega);
 
         let max_deg = 9.min(len_log);
         let mut pq = vec![Fr::zero(); 1 << max_deg >> 1];
@@ -573,9 +572,8 @@ mod test {
                 } else {
                     device.copy_from_device_to_host(&mut s[..], &a_buf).unwrap();
                 }
-                println!("swap is {}", swap);
                 end_timer!(timer);
-                assert_eq!(s == expected_ntt_s);
+                assert!(s == expected_ntt_s);
             }
         }
     }

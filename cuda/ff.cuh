@@ -276,21 +276,9 @@ public:
         return sqr(this);
     }
 
-    __forceinline__ __device__ static Field one()
-    {
-        Field tmp;
-        memcpy(tmp.limbs_le, R, LIMBS * sizeof(FieldLimb));
-        return tmp;
-    }
-
-    __forceinline__ __device__ static Field zero()
-    {
-        return Field(0);
-    }
-
     __device__ static Field pow(const Field *a, ulong exp)
     {
-        Field acc = Field::one();
+        Field acc = Field(1);
         if (exp > 0)
         {
             _pow_at_leading(&acc, a, exp);
@@ -300,7 +288,7 @@ public:
 
     __device__ static Field pow(const Field *a, const FieldLimb *exp_le, int exp_len)
     {
-        Field acc = Field::one();
+        Field acc = Field(1);
         int i = exp_len - 1;
         for (; i >= 0; i--)
         {

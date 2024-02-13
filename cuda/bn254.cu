@@ -187,11 +187,7 @@ __global__ void _ntt_core(
         Bn254FrField tmp = Bn254FrField::pow(&twiddle, counts);
         for (uint i = counts; i < counte; i++)
         {
-            //printf("update u[%d] %d %p %d\n", i, t, x, (ulong)x[i * t].is_zero());
             u[i] = tmp * x[i * t];
-            assert(!tmp.is_zero());
-            //assert(!x[i * t].is_zero());
-            //assert(!u[i].is_zero());
             tmp = tmp * twiddle;
         }
         __syncthreads();
@@ -204,17 +200,12 @@ __global__ void _ntt_core(
                 const uint di = i & (bit - 1);
                 const uint i0 = (i << 1) - di;
                 const uint i1 = i0 + bit;
-                //printf("di i0 i1 is %d %d %d %d\n", di, i0, i1, di << rnd << pqshift);
                 tmp = u[i0];
                 u[i0] += u[i1];
                 u[i1] = tmp - u[i1];
 
-                //assert(!pq[di << rnd << pqshift].is_zero());
                 if (di != 0)
                     u[i1] = pq[di << rnd << pqshift] * u[i1];
-
-                //assert(!u[i0].is_zero());
-                //assert(!u[i1].is_zero());
             }
 
             __syncthreads();
@@ -225,7 +216,7 @@ __global__ void _ntt_core(
             y[i * p] = u[bit_reverse(i, deg)];
             y[(i + counth) * p] = u[bit_reverse(i + counth, deg)];
         }
-        
+
         __syncthreads();
     }
 }
@@ -247,24 +238,16 @@ extern "C"
         Bn254FrField *dst = tmp;
         int len = 1 << log_n;
         int total = 1 << (log_n - 1);
-        //printf("log_n %d\n", log_n);
         while (p < log_n)
         {
-            int deg = 0;
-            if (p + max_deg >= log_n)
-            {
-                deg = log_n - p;
-            }
-            else
-            {
-                deg = max_deg;
-            }
+            int res = log_n - p;
+            int round = (res + max_deg - 1) / max_deg;
+            int deg = (res + round - 1) / round;
 
             int threads = 1 << (deg - 1);
             int blocks = total >> (deg - 1);
             blocks = blocks > 65536 ? 65536 : blocks;
             int grids = (total / blocks) >> (deg - 1);
-            printf("round %d %d %d %d %p %p\n", log_n, grids, blocks, threads, src, dst);
             _ntt_core<<<blocks, threads>>>(src, dst, pq, omegas, len, p, deg, max_deg, grids);
 
             Bn254FrField *t = src;
