@@ -6,6 +6,7 @@ mod test {
 
     use crate::device::cuda::CudaDevice;
     use crate::device::Device;
+    use crate::hugetlb::HUGE_PAGE_ALLOCATOR;
     use ark_std::rand::rngs::OsRng;
     use ark_std::{end_timer, start_timer};
     use cuda_runtime_sys::cudaError;
@@ -489,7 +490,7 @@ mod test {
     #[test]
     fn test_bn254_fft() {
         let device = CudaDevice::get_device(0).unwrap();
-        let len_log = 25;
+        let len_log = 24;
         let len = 1 << len_log;
 
         let mut omega = Fr::ROOT_OF_UNITY_INV.invert().unwrap();
@@ -520,10 +521,8 @@ mod test {
             }
         }
 
-        for _ in 0..4 {
-            let mut s = vec![];
-
-            let timer = start_timer!(|| "prepare buffer");
+        for i in 0..4 {
+            println!("test round {}", i);
             let random_nr = 256;
             let mut rands_s = vec![];
             for _ in 0..random_nr {
@@ -531,24 +530,49 @@ mod test {
                 rands_s.push(s);
             }
 
-            for i in 0..len {
-                let x = rands_s[i % random_nr];
-                s.push(x);
-            }
-            end_timer!(timer);
+            #[cfg(feature = "hugetlb")]
+            let mut s_vec = {
+                let timer = start_timer!(|| "prepare buffer with hugetlb");
+                let mut s_vec = Vec::new_in(unsafe { &HUGE_PAGE_ALLOCATOR });
+                s_vec.reserve(len);
+                for i in 0..len {
+                    let x = rands_s[i % random_nr];
+                    s_vec.push(x);
+                }
+                end_timer!(timer);
+                s_vec
+            };
+
+            #[cfg(not(feature = "hugetlb"))]
+            let mut s_vec = {
+                let timer = start_timer!(|| "prepare buffer with");
+                let mut s_vec = vec![];
+                s_vec.reserve(len);
+                for i in 0..len {
+                    let x = rands_s[i % random_nr];
+                    s_vec.push(x);
+                }
+                end_timer!(timer);
+                s_vec
+            };
 
             let timer = start_timer!(|| "st cpu cost");
-            let mut expected_ntt_s = s.clone();
+            let mut expected_ntt_s = s_vec.clone();
             // println!("s is {:?}", expected_ntt_s);
             best_fft_cpu(&mut expected_ntt_s[..], omega, len_log);
             end_timer!(timer);
 
+            let timer = start_timer!(|| "pin buffer");
+            let s = &mut s_vec[..];
+            device.pin_memory(s).unwrap();
+            end_timer!(timer);
+
             unsafe {
                 let timer = start_timer!(|| "copy buffer");
-                let a_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
+                let a_buf = device.alloc_device_buffer_from_slice(s).unwrap();
                 end_timer!(timer);
                 let timer = start_timer!(|| "copy buffer");
-                let b_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
+                let b_buf = device.alloc_device_buffer_from_slice(s).unwrap();
                 end_timer!(timer);
                 let timer = start_timer!(|| "copy buffer");
                 let omegas_buf = device.alloc_device_buffer_from_slice(&omegas[..]).unwrap();
@@ -574,13 +598,17 @@ mod test {
 
                 let timer = start_timer!(|| "copy buffer back");
                 if swap {
-                    device.copy_from_device_to_host(&mut s[..], &b_buf).unwrap();
+                    device.copy_from_device_to_host(s, &b_buf).unwrap();
                 } else {
-                    device.copy_from_device_to_host(&mut s[..], &a_buf).unwrap();
+                    device.copy_from_device_to_host(s, &a_buf).unwrap();
                 }
                 end_timer!(timer);
                 assert!(s == expected_ntt_s);
             }
+
+            let timer = start_timer!(|| "unpin buffer");
+            device.unpin_memory(s).unwrap();
+            end_timer!(timer);
         }
     }
 }

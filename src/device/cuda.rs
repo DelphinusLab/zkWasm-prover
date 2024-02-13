@@ -1,6 +1,7 @@
 use core::mem;
 use core::{cell::RefCell, marker::PhantomData};
 use std::ffi::c_void;
+use std::mem::size_of;
 
 use cuda_runtime_sys::cudaError;
 
@@ -133,6 +134,26 @@ impl Device<*mut c_void> for CudaDevice {
         self.acitve_ctx()?;
         unsafe {
             let res = cuda_runtime_sys::cudaDeviceSynchronize();
+            to_result((), res, "fail to synchronize")
+        }
+    }
+
+    fn pin_memory<T>(&self, dst: &mut [T]) -> DeviceResult<()> {
+        self.acitve_ctx()?;
+        unsafe {
+            let res = cuda_runtime_sys::cudaHostRegister(
+                dst.as_mut_ptr() as *mut _,
+                dst.len() * size_of::<T>(),
+                cuda_runtime_sys::cudaHostAllocMapped,
+            );
+            to_result((), res, "fail to synchronize")
+        }
+    }
+
+    fn unpin_memory<T>(&self, dst: &mut [T]) -> DeviceResult<()> {
+        self.acitve_ctx()?;
+        unsafe {
+            let res = cuda_runtime_sys::cudaHostUnregister(dst.as_mut_ptr() as *mut _);
             to_result((), res, "fail to synchronize")
         }
     }

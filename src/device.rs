@@ -32,4 +32,7 @@ pub trait Device<H>: Sized {
         -> DeviceResult<()>;
 
     fn synchronize(&self) -> DeviceResult<()>;
+
+    fn pin_memory<T>(&self, dst: &mut [T]) -> DeviceResult<()>;
+    fn unpin_memory<T>(&self, dst: &mut [T]) -> DeviceResult<()>;
 }

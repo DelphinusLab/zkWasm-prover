@@ -12,6 +12,7 @@ use std::alloc::Allocator;
 
 pub mod cuda;
 pub mod device;
+mod hugetlb;
 
 #[macro_use]
 extern crate lazy_static;

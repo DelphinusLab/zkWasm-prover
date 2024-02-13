@@ -671,5 +671,6 @@ dependencies = [
  "cuda-runtime-sys",
  "halo2_proofs",
  "lazy_static",
+ "libc",
  "thread_local",
 ]
