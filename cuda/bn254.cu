@@ -151,6 +151,7 @@ __device__ Bn254FrField pow_lookup(const Bn254FrField *bases, uint exponent)
     return res;
 }
 
+// Learn from ec-gpu
 __global__ void _ntt_core(
     const Bn254FrField *_x,
     Bn254FrField *_y,
@@ -183,12 +184,10 @@ __global__ void _ntt_core(
         Bn254FrField *y = _y + ((index - k) << deg) + k;
 
         __shared__ Bn254FrField u[512];
-        const Bn254FrField twiddle = pow_lookup(omegas, (n >> log_p >> deg) * k);
-        Bn254FrField tmp = Bn254FrField::pow(&twiddle, counts);
+        uint base_exp = (n >> log_p >> deg) * k;
         for (uint i = counts; i < counte; i++)
         {
-            u[i] = tmp * x[i * t];
-            tmp = tmp * twiddle;
+            u[i] = omegas[base_exp * i] * x[i * t];
         }
         __syncthreads();
 
@@ -200,7 +199,7 @@ __global__ void _ntt_core(
                 const uint di = i & (bit - 1);
                 const uint i0 = (i << 1) - di;
                 const uint i1 = i0 + bit;
-                tmp = u[i0];
+                Bn254FrField tmp = u[i0];
                 u[i0] += u[i1];
                 u[i1] = tmp - u[i1];
 
@@ -216,8 +215,6 @@ __global__ void _ntt_core(
             y[i * p] = u[bit_reverse(i, deg)];
             y[(i + counth) * p] = u[bit_reverse(i + counth, deg)];
         }
-
-        __syncthreads();
     }
 }
 

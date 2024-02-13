@@ -489,7 +489,7 @@ mod test {
     #[test]
     fn test_bn254_fft() {
         let device = CudaDevice::get_device(0).unwrap();
-        let len_log = 24;
+        let len_log = 25;
         let len = 1 << len_log;
 
         let mut omega = Fr::ROOT_OF_UNITY_INV.invert().unwrap();
@@ -497,9 +497,15 @@ mod test {
             omega = omega.square();
         }
 
+        /*
         let mut omegas = vec![omega];
         for _ in 1..32 {
             omegas.push(omegas.last().unwrap().square());
+        }
+        */
+        let mut omegas = vec![Fr::one()];
+        for _ in 1..len {
+            omegas.push(omegas.last().unwrap() * omega);
         }
 
         let max_deg = 9.min(len_log);
