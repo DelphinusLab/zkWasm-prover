@@ -1,5 +1,5 @@
+use core::cell::RefCell;
 use core::mem;
-use core::{cell::RefCell, marker::PhantomData};
 use std::ffi::c_void;
 use std::mem::size_of;
 
@@ -12,6 +12,7 @@ thread_local! {
     static ACITVE_CUDA_DEVICE: RefCell<i32> = RefCell::new(-1);
 }
 
+#[derive(Debug, Clone)]
 pub struct CudaDevice {
     device: i32,
 }
@@ -53,9 +54,39 @@ pub(crate) fn to_result<T>(value: T, res: cudaError, msg: &'static str) -> Devic
     }
 }
 
-pub type CudaDeviceBuf<T> = DeviceBuf<T, *mut c_void>;
+pub trait CudaBuffer {
+    fn ptr(&self) -> *mut c_void;
+    fn device<'a>(&'a self) -> &'a CudaDevice;
+}
 
-impl Device<*mut c_void> for CudaDevice {
+impl CudaBuffer for CudaDeviceBufRaw {
+    fn ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    fn device<'a>(&'a self) -> &'a CudaDevice {
+        &self.device
+    }
+}
+
+pub struct CudaDeviceBufRaw {
+    ptr: *mut c_void,
+    device: CudaDevice,
+}
+
+impl Drop for CudaDeviceBufRaw {
+    fn drop(&mut self) {
+        self.device().acitve_ctx().unwrap();
+        unsafe {
+            let res = cuda_runtime_sys::cudaFree(self.ptr());
+            to_result((), res, "fail to free device memory").unwrap();
+        }
+    }
+}
+
+impl DeviceBuf for CudaDeviceBufRaw {}
+
+impl Device<CudaDeviceBufRaw> for CudaDevice {
     fn get_device_count() -> DeviceResult<usize> {
         let mut count = 0;
         unsafe {
@@ -76,35 +107,24 @@ impl Device<*mut c_void> for CudaDevice {
         }
     }
 
-    fn alloc_device_buffer<T>(&self, size: usize) -> DeviceResult<CudaDeviceBuf<T>> {
+    fn alloc_device_buffer<T>(&self, size: usize) -> DeviceResult<CudaDeviceBufRaw> {
         self.acitve_ctx()?;
         let mut ptr = 0 as *mut c_void;
         unsafe {
             let res = cuda_runtime_sys::cudaMalloc(&mut ptr, size * mem::size_of::<T>());
             to_result(
-                DeviceBuf {
-                    handler: ptr,
-                    phantom: PhantomData,
-                },
+                CudaDeviceBufRaw { ptr, device: self.clone() },
                 res,
                 "fail to alloc device memory",
             )
         }
     }
 
-    fn free_device_buffer<T>(&self, buf: CudaDeviceBuf<T>) -> DeviceResult<()> {
-        self.acitve_ctx()?;
-        unsafe {
-            let res = cuda_runtime_sys::cudaFree(buf.handler);
-            to_result((), res, "fail to free device memory")
-        }
-    }
-
-    fn copy_from_host_to_device<T>(&self, dst: &CudaDeviceBuf<T>, src: &[T]) -> DeviceResult<()> {
+    fn copy_from_host_to_device<T>(&self, dst: &CudaDeviceBufRaw, src: &[T]) -> DeviceResult<()> {
         self.acitve_ctx()?;
         unsafe {
             let res = cuda_runtime_sys::cudaMemcpy(
-                dst.handler,
+                dst.ptr(),
                 src.as_ptr() as _,
                 src.len() * mem::size_of::<T>(),
                 cuda_runtime_sys::cudaMemcpyKind::cudaMemcpyHostToDevice,
@@ -116,13 +136,13 @@ impl Device<*mut c_void> for CudaDevice {
     fn copy_from_device_to_host<T>(
         &self,
         dst: &mut [T],
-        src: &CudaDeviceBuf<T>,
+        src: &CudaDeviceBufRaw,
     ) -> DeviceResult<()> {
         self.acitve_ctx()?;
         unsafe {
             let res = cuda_runtime_sys::cudaMemcpy(
                 dst.as_ptr() as _,
-                src.handler,
+                src.ptr(),
                 dst.len() * mem::size_of::<T>(),
                 cuda_runtime_sys::cudaMemcpyKind::cudaMemcpyDeviceToHost,
             );

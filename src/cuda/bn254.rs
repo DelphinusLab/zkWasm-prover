@@ -1,9 +1,9 @@
-use crate::device::cuda::{to_result, CudaDevice, CudaDeviceBuf};
+use crate::device::cuda::{to_result, CudaBuffer, CudaDevice, CudaDeviceBufRaw};
 use crate::device::Device;
 use crate::device::Error;
 use halo2_proofs::arithmetic::CurveAffine;
+use halo2_proofs::pairing::group::Group;
 use halo2_proofs::pairing::group::Curve;
-use std::mem::zeroed;
 
 mod cuda_c {
     use cuda_runtime_sys::cudaError;
@@ -33,21 +33,14 @@ mod cuda_c {
 
 pub fn msm<C: CurveAffine>(
     device: &CudaDevice,
-    res_buf: &CudaDeviceBuf<C::Curve>,
-    p_buf: &CudaDeviceBuf<C>,
-    s_buf: &CudaDeviceBuf<C::ScalarExt>,
+    res_buf: &CudaDeviceBufRaw,
+    p_buf: &CudaDeviceBufRaw,
+    s_buf: &CudaDeviceBufRaw,
     len: usize,
 ) -> Result<C, Error> {
-    let mut res = [unsafe { zeroed() }];
+    let mut res = [C::Curve::identity()];
     unsafe {
-        let err = cuda_c::msm(
-            4,
-            256,
-            res_buf.handler,
-            p_buf.handler,
-            s_buf.handler,
-            len as i32,
-        );
+        let err = cuda_c::msm(4, 256, res_buf.ptr(), p_buf.ptr(), s_buf.ptr(), len as i32);
         to_result((), err, "fail to run msm")?;
     }
 
@@ -61,7 +54,7 @@ mod test {
     use std::mem;
     use std::ops::MulAssign as _;
 
-    use crate::device::cuda::{to_result, CudaDevice};
+    use crate::device::cuda::{to_result, CudaBuffer as _, CudaDevice};
     use crate::device::{Device, DeviceBuf};
     use crate::hugetlb::HUGE_PAGE_ALLOCATOR;
     use ark_std::rand::rngs::OsRng;
@@ -193,17 +186,17 @@ mod test {
             let res = test_bn254_fr_field(
                 blocks as i32,
                 threads as i32,
-                a_buf.handler,
-                b_buf.handler,
-                exp_buf.handler,
-                add_buf.handler,
-                sub_buf.handler,
-                mul_buf.handler,
-                sqr_buf.handler,
-                inv_buf.handler,
-                pow_buf.handler,
-                unmont_buf.handler,
-                compare_buf.handler,
+                a_buf.ptr(),
+                b_buf.ptr(),
+                exp_buf.ptr(),
+                add_buf.ptr(),
+                sub_buf.ptr(),
+                mul_buf.ptr(),
+                sqr_buf.ptr(),
+                inv_buf.ptr(),
+                pow_buf.ptr(),
+                unmont_buf.ptr(),
+                compare_buf.ptr(),
                 len as i32,
             );
             end_timer!(timer);
@@ -309,17 +302,17 @@ mod test {
             let res = test_bn254_fp_field(
                 blocks as i32,
                 threads as i32,
-                a_buf.handler,
-                b_buf.handler,
-                exp_buf.handler,
-                add_buf.handler,
-                sub_buf.handler,
-                mul_buf.handler,
-                sqr_buf.handler,
-                inv_buf.handler,
-                pow_buf.handler,
-                unmont_buf.handler,
-                compare_buf.handler,
+                a_buf.ptr(),
+                b_buf.ptr(),
+                exp_buf.ptr(),
+                add_buf.ptr(),
+                sub_buf.ptr(),
+                mul_buf.ptr(),
+                sqr_buf.ptr(),
+                inv_buf.ptr(),
+                pow_buf.ptr(),
+                unmont_buf.ptr(),
+                compare_buf.ptr(),
                 len as i32,
             );
             end_timer!(timer);
@@ -403,11 +396,11 @@ mod test {
             let res = test_bn254_ec(
                 blocks as i32,
                 threads as i32,
-                a_buf.handler,
-                b_buf.handler,
-                add_buf.handler,
-                sub_buf.handler,
-                double_buf.handler,
+                a_buf.ptr(),
+                b_buf.ptr(),
+                add_buf.ptr(),
+                sub_buf.ptr(),
+                double_buf.ptr(),
                 len as i32,
             );
             end_timer!(timer);
@@ -491,9 +484,9 @@ mod test {
                 let res = crate::cuda::bn254::cuda_c::msm(
                     msm_groups as i32,
                     256,
-                    tmp_buf.handler,
-                    a_buf.handler,
-                    b_buf.handler,
+                    tmp_buf.ptr(),
+                    a_buf.ptr(),
+                    b_buf.ptr(),
                     len as i32,
                 );
                 device.synchronize().unwrap();
@@ -623,10 +616,10 @@ mod test {
                 let mut swap = false;
                 let timer = start_timer!(|| "gpu costs");
                 let res = crate::cuda::bn254::cuda_c::ntt(
-                    a_buf.handler,
-                    b_buf.handler,
-                    pq_buf.handler,
-                    omegas_buf.handler,
+                    a_buf.ptr(),
+                    b_buf.ptr(),
+                    pq_buf.ptr(),
+                    omegas_buf.ptr(),
                     len_log as i32,
                     max_deg as i32,
                     &mut swap as *mut _ as _,

@@ -9,27 +9,21 @@ pub enum Error {
 
 pub type DeviceResult<T> = Result<T, Error>;
 
-pub struct DeviceBuf<T, H: Sized> {
-    pub handler: H,
-    phantom: PhantomData<T>,
-}
+pub trait DeviceBuf {}
 
-pub trait Device<H>: Sized {
+pub trait Device<B: DeviceBuf>: Sized {
     fn get_device_count() -> DeviceResult<usize>;
     fn get_device(idx: usize) -> DeviceResult<Self>;
 
-    fn alloc_device_buffer<T>(&self, size: usize) -> DeviceResult<DeviceBuf<T, H>>;
-    fn alloc_device_buffer_from_slice<T>(&self, data: &[T]) -> DeviceResult<DeviceBuf<T, H>> {
-        let buf = self.alloc_device_buffer(data.len())?;
+    fn alloc_device_buffer<T>(&self, size: usize) -> DeviceResult<B>;
+    fn alloc_device_buffer_from_slice<T>(&self, data: &[T]) -> DeviceResult<B> {
+        let buf = self.alloc_device_buffer::<T>(data.len())?;
         self.copy_from_host_to_device(&buf, data)?;
         Ok(buf)
     }
 
-    fn free_device_buffer<T>(&self, buf: DeviceBuf<T, H>) -> DeviceResult<()>;
-
-    fn copy_from_host_to_device<T>(&self, dst: &DeviceBuf<T, H>, src: &[T]) -> DeviceResult<()>;
-    fn copy_from_device_to_host<T>(&self, dst: &mut [T], dst: &DeviceBuf<T, H>)
-        -> DeviceResult<()>;
+    fn copy_from_host_to_device<T>(&self, dst: &B, src: &[T]) -> DeviceResult<()>;
+    fn copy_from_device_to_host<T>(&self, dst: &mut [T], dst: &B) -> DeviceResult<()>;
 
     fn synchronize(&self) -> DeviceResult<()>;
 

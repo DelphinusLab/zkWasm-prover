@@ -20,7 +20,7 @@ use rayon::iter::ParallelIterator as _;
 
 use crate::cuda::bn254::msm;
 use crate::device::cuda::CudaDevice;
-use crate::device::cuda::CudaDeviceBuf;
+use crate::device::cuda::CudaDeviceBufRaw;
 use crate::device::Device as _;
 use crate::device::DeviceResult;
 
@@ -230,7 +230,7 @@ pub fn create_proof_from_advices<
 
     let mut tmp_buf = vec![];
 
-    let eval_expr = |device, tmp_buf: &mut Vec<CudaDeviceBuf<C>>, expr: &Expression<_>| -> CudaDeviceBuf<_> {
+    let eval_expr = |device, tmp_buf: &mut Vec<CudaDeviceBufRaw>, expr: &Expression<_>| -> CudaDeviceBufRaw {
         let res_buf = tmp_buf.pop().unwrap();
         match expr {
             Expression::Constant(_) => todo!(),
