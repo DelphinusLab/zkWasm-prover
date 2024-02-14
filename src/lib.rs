@@ -10,6 +10,7 @@ use ark_std::start_timer;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
+use halo2_proofs::pairing::group::ff::BatchInvert as _;
 use halo2_proofs::pairing::group::Group as _;
 use halo2_proofs::plonk::lookup;
 use halo2_proofs::plonk::Expression;
@@ -141,12 +142,10 @@ pub fn create_proof_from_advices<
     let sub_pk = pk.clone();
     let sub_advices = advices.clone();
     let sub_instance = instance.clone();
-    let sub_device = device.clone();
     let lookup_handler = thread::spawn(move || {
         let pk = sub_pk;
         let advices = sub_advices;
         let instance = sub_instance;
-        let device = sub_device;
         let timer =
             start_timer!(|| format!("prepare lookup buffer, count {}", pk.vk.cs.lookups.len()));
         let lookups = pk
@@ -159,9 +158,9 @@ pub fn create_proof_from_advices<
                 permuted_input.resize(size, C::ScalarExt::zero());
                 let mut permuted_table = Vec::new_in(HugePageAllocator);
                 permuted_table.resize(size, C::ScalarExt::zero());
-                let mut product = Vec::new_in(HugePageAllocator);
-                product.resize(size, C::ScalarExt::zero());
-                (permuted_input, permuted_table, product)
+                let mut z = Vec::new_in(HugePageAllocator);
+                z.resize(size, C::ScalarExt::zero());
+                (permuted_input, permuted_table, z)
             })
             .collect::<Vec<_>>();
         end_timer!(timer);
@@ -170,9 +169,9 @@ pub fn create_proof_from_advices<
             lookup_classify(&pk, lookups);
 
         let timer = start_timer!(|| format!("permute lookup unit {}", single_unit_lookups.len()));
-        single_unit_lookups
-            .par_iter_mut()
-            .for_each(|(i, (input, table, z))| {
+        let single_unit_lookups = single_unit_lookups
+            .into_par_iter()
+            .map(|(i, (mut input, mut table, z))| {
                 let f = |expr: &Expression<_>, target: &mut [_]| {
                     if let Some(v) = expr.is_constant() {
                         target.fill(v);
@@ -191,15 +190,18 @@ pub fn create_proof_from_advices<
                 };
 
                 f(
-                    &pk.vk.cs.lookups[*i].input_expressions[0],
+                    &pk.vk.cs.lookups[i].input_expressions[0],
                     &mut input[0..unusable_rows_start],
                 );
                 f(
-                    &pk.vk.cs.lookups[*i].table_expressions[0],
+                    &pk.vk.cs.lookups[i].table_expressions[0],
                     &mut table[0..unusable_rows_start],
                 );
-                handle_lookup_pair(input, table, unusable_rows_start);
-            });
+                let (permuted_input, permuted_table) =
+                    handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
+                (i, (permuted_input, permuted_table, input, table, z))
+            })
+            .collect::<Vec<_>>();
         end_timer!(timer);
 
         let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
@@ -211,9 +213,9 @@ pub fn create_proof_from_advices<
             .collect::<Vec<_>>()[..];
 
         let timer = start_timer!(|| format!("permute lookup comp {}", single_comp_lookups.len()));
-        single_comp_lookups
-            .par_iter_mut()
-            .for_each(|(i, (input, table, _z))| {
+        let single_comp_lookups = single_comp_lookups
+            .into_par_iter()
+            .map(|(i, (mut input, mut table, z))| {
                 let f = |expr: &Expression<_>, target: &mut [_]| {
                     evaluate_expr(
                         expr,
@@ -227,15 +229,18 @@ pub fn create_proof_from_advices<
                 };
 
                 f(
-                    &pk.vk.cs.lookups[*i].input_expressions[0],
+                    &pk.vk.cs.lookups[i].input_expressions[0],
                     &mut input[0..unusable_rows_start],
                 );
                 f(
-                    &pk.vk.cs.lookups[*i].table_expressions[0],
+                    &pk.vk.cs.lookups[i].table_expressions[0],
                     &mut table[0..unusable_rows_start],
                 );
-                handle_lookup_pair(input, table, unusable_rows_start);
-            });
+                let (permuted_input, permuted_table) =
+                    handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
+                (i, (permuted_input, permuted_table, input, table, z))
+            })
+            .collect::<Vec<_>>();
         end_timer!(timer);
 
         return (single_unit_lookups, single_comp_lookups, tuple_lookups);
@@ -260,46 +265,56 @@ pub fn create_proof_from_advices<
     end_timer!(timer);
 
     // After theta
-    let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
+    let sub_pk = pk.clone();
+    let sub_advices = advices.clone();
+    let sub_instance = instance.clone();
+    let tuple_lookup_handler = thread::spawn(move || {
+        let pk = sub_pk;
+        let advices = sub_advices;
+        let instance = sub_instance;
+        let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
 
-    let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-    let advice_ref = &unsafe { Arc::get_mut_unchecked(&mut advices) }
-        .iter()
-        .map(|x| &x[..])
-        .collect::<Vec<_>>()[..];
-    let instance_ref = &instance[0]
-        .instance_values
-        .iter()
-        .map(|x| &x[..])
-        .collect::<Vec<_>>()[..];
+        let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+        let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+        let instance_ref = &instance[0]
+            .instance_values
+            .iter()
+            .map(|x| &x[..])
+            .collect::<Vec<_>>()[..];
 
-    tuple_lookups
-        .par_iter_mut()
-        .for_each(|(i, (input, table, _z))| {
-            let f = |expr: &[Expression<_>], target: &mut [_]| {
-                evaluate_exprs(
-                    expr,
-                    size,
-                    rot_scale as i32,
-                    fixed_ref,
-                    advice_ref,
-                    instance_ref,
-                    theta,
-                    target,
-                )
-            };
+        let mut tuple_lookups = tuple_lookups
+            .into_par_iter()
+            .map(|(i, (mut input, mut table, z))| {
+                let f = |expr: &[Expression<_>], target: &mut [_]| {
+                    evaluate_exprs(
+                        expr,
+                        size,
+                        rot_scale as i32,
+                        fixed_ref,
+                        advice_ref,
+                        instance_ref,
+                        theta,
+                        target,
+                    )
+                };
 
-            f(
-                &pk.vk.cs.lookups[*i].input_expressions[..],
-                &mut input[0..unusable_rows_start],
-            );
-            f(
-                &pk.vk.cs.lookups[*i].table_expressions[..],
-                &mut table[0..unusable_rows_start],
-            );
-            handle_lookup_pair(input, table, unusable_rows_start);
-        });
-    end_timer!(timer);
+                f(
+                    &pk.vk.cs.lookups[i].input_expressions[..],
+                    &mut input[0..unusable_rows_start],
+                );
+                f(
+                    &pk.vk.cs.lookups[i].table_expressions[..],
+                    &mut table[0..unusable_rows_start],
+                );
+                let (permuted_input, permuted_table) =
+                    handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
+                (i, (permuted_input, permuted_table, input, table, z))
+            })
+            .collect::<Vec<_>>();
+        end_timer!(timer);
+
+        tuple_lookups
+    });
 
     let mut lookup_permuted_commitments = vec![C::identity(); pk.vk.cs.lookups.len() * 2];
 
@@ -368,7 +383,74 @@ pub fn create_proof_from_advices<
             size,
         )?;
     }
+    end_timer!(timer);
 
+    let timer = start_timer!(|| "wait tuple lookup");
+    let mut tuple_lookups = tuple_lookup_handler.join().unwrap();
+    end_timer!(timer);
+
+    let timer = start_timer!(|| format!("tuple lookup msm {}", tuple_lookups.len(),));
+
+    for (i, (permuted_input, permuted_table, _, _, _)) in tuple_lookups.iter() {
+        let permuted_input_buf = device.alloc_device_buffer_from_slice(&permuted_input[..])?;
+        let permuted_table_buf = device.alloc_device_buffer_from_slice(&permuted_table[..])?;
+        lookup_permuted_commitments[i * 2] = msm(
+            &device,
+            &msm_result_buf,
+            &g_lagrange_buf,
+            &permuted_input_buf,
+            size,
+        )?;
+        lookup_permuted_commitments[i * 2 + 1] = msm(
+            &device,
+            &msm_result_buf,
+            &g_lagrange_buf,
+            &permuted_table_buf,
+            size,
+        )?;
+    }
+    end_timer!(timer);
+
+    for commitment in lookup_permuted_commitments {
+        transcript.write_point(commitment).unwrap();
+    }
+
+    let beta: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
+    println!("beta is {:?}", beta);
+    let gamma: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
+    println!("gamma is {:?}", gamma);
+
+    let mut lookups = vec![];
+    lookups.append(&mut single_unit_lookups);
+    lookups.append(&mut single_comp_lookups);
+    lookups.append(&mut tuple_lookups);
+    lookups.sort_by(|l, r| usize::cmp(&l.0, &r.0));
+
+    let timer = start_timer!(|| "generate lookup z");
+    lookups
+        .par_iter_mut()
+        .for_each(|(_, (permuted_input, permuted_table, z, input, table))| {
+            for ((z, permuted_input_value), permuted_table_value) in z
+                .iter_mut()
+                .zip(permuted_input.iter())
+                .zip(permuted_table.iter())
+            {
+                *z = (beta + permuted_input_value) * &(gamma + permuted_table_value);
+            }
+
+            z.batch_invert();
+
+            for ((z, input_value), table_value) in z.iter_mut().zip(input.iter()).zip(table.iter())
+            {
+                *z *= (beta + input_value) * &(gamma + table_value);
+            }
+
+            let mut tmp = C::ScalarExt::one();
+            for i in 0..unusable_rows_start {
+                std::mem::swap(&mut tmp, &mut z[i]);
+                tmp = tmp * z[i];
+            }
+        });
     end_timer!(timer);
 
     Ok(())
@@ -419,15 +501,18 @@ fn handle_lookup_pair<F: FieldExt>(
     input: &mut Vec<F, HugePageAllocator>,
     table: &mut Vec<F, HugePageAllocator>,
     unusable_rows_start: usize,
-) {
+) -> (Vec<F, HugePageAllocator>, Vec<F, HugePageAllocator>) {
     let compare = |a: &_, b: &_| unsafe {
         let a: &[u64; 4] = std::mem::transmute(a);
         let b: &[u64; 4] = std::mem::transmute(b);
         a.cmp(b)
     };
 
-    input[0..unusable_rows_start].sort_unstable_by(compare);
-    table[0..unusable_rows_start].sort_unstable_by(compare);
+    let mut permuted_input = input.clone();
+    let mut sorted_table = table.clone();
+
+    permuted_input[0..unusable_rows_start].sort_unstable_by(compare);
+    sorted_table[0..unusable_rows_start].sort_unstable_by(compare);
 
     let mut permuted_table_state = Vec::new_in(HugePageAllocator);
     permuted_table_state.resize(input.len(), false);
@@ -435,14 +520,14 @@ fn handle_lookup_pair<F: FieldExt>(
     let mut permuted_table = Vec::new_in(HugePageAllocator);
     permuted_table.resize(input.len(), F::zero());
 
-    input
+    permuted_input
         .iter()
         .zip(permuted_table_state.iter_mut())
         .zip(permuted_table.iter_mut())
         .enumerate()
         .for_each(|(row, ((input_value, table_state), table_value))| {
             // If this is the first occurrence of `input_value` in the input expression
-            if row == 0 || *input_value != input[row - 1] {
+            if row == 0 || *input_value != permuted_input[row - 1] {
                 *table_state = true;
                 *table_value = *input_value;
             }
@@ -459,19 +544,17 @@ fn handle_lookup_pair<F: FieldExt>(
     for i in 0..unusable_rows_start {
         to_next_unique(&mut i_unique_input_idx);
         while i_unique_input_idx < unusable_rows_start
-            && permuted_table[i_unique_input_idx] == table[i_sorted_table_idx]
+            && permuted_table[i_unique_input_idx] == sorted_table[i_sorted_table_idx]
         {
             i_unique_input_idx += 1;
             i_sorted_table_idx += 1;
             to_next_unique(&mut i_unique_input_idx);
         }
         if !permuted_table_state[i] {
-            permuted_table[i] = table[i_sorted_table_idx];
+            permuted_table[i] = sorted_table[i_sorted_table_idx];
             i_sorted_table_idx += 1;
         }
     }
-
-    *table = permuted_table;
 
     if true {
         for cell in &mut input[unusable_rows_start..] {
@@ -481,6 +564,8 @@ fn handle_lookup_pair<F: FieldExt>(
             *cell = F::random(&mut OsRng);
         }
     }
+
+    (permuted_input, permuted_table)
 }
 
 /// Simple evaluation of an expression
