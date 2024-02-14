@@ -40,7 +40,7 @@ pub fn msm<C: CurveAffine>(
 ) -> Result<C, Error> {
     let mut res = [C::Curve::identity()];
     unsafe {
-        let err = cuda_c::msm(4, 256, res_buf.ptr(), p_buf.ptr(), s_buf.ptr(), len as i32);
+        let err = cuda_c::msm(8, 256, res_buf.ptr(), p_buf.ptr(), s_buf.ptr(), len as i32);
         to_result((), err, "fail to run msm")?;
     }
 
