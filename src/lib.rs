@@ -5,7 +5,9 @@ use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
+use halo2_proofs::arithmetic::FieldExt;
 use halo2_proofs::pairing::group::Group as _;
+use halo2_proofs::plonk::lookup;
 use halo2_proofs::plonk::Expression;
 use halo2_proofs::plonk::ProvingKey;
 use halo2_proofs::poly::commitment::Params;
@@ -20,7 +22,6 @@ use rayon::iter::ParallelIterator as _;
 
 use crate::cuda::bn254::msm;
 use crate::device::cuda::CudaDevice;
-use crate::device::cuda::CudaDeviceBufRaw;
 use crate::device::Device as _;
 use crate::device::DeviceResult;
 
@@ -33,14 +34,14 @@ extern crate lazy_static;
 
 pub fn prepare_advice_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
-) -> Vec<Vec<C::Scalar, &HugePageAllocator>> {
+) -> Vec<Vec<C::Scalar, HugePageAllocator>> {
     let rows = 1 << pk.get_vk().domain.k();
     let columns = pk.get_vk().cs.num_advice_columns;
     let zero = C::Scalar::zero();
     (0..columns)
         .into_par_iter()
         .map(|_| {
-            let mut buf = Vec::new_in(&HugePageAllocator);
+            let mut buf = Vec::new_in(HugePageAllocator);
             buf.resize(rows, zero);
             buf
         })
@@ -70,6 +71,7 @@ pub fn create_proof_from_advices<
     transcript: &mut T,
 ) -> Result<(), Error> {
     let size = 1 << pk.get_vk().domain.k();
+    let rot_scale = 1 << (pk.get_vk().domain.extended_k() - pk.get_vk().domain.k());
     let meta = &pk.vk.cs;
     let unusable_rows_start = params.n as usize - (meta.blinding_factors() + 1);
 
@@ -143,132 +145,316 @@ pub fn create_proof_from_advices<
         .lookups
         .par_iter()
         .map(|_| {
-            let mut permuted_input = Vec::new_in(&HugePageAllocator);
+            let mut permuted_input = Vec::new_in(HugePageAllocator);
             permuted_input.resize(size, C::ScalarExt::zero());
-            let mut permuted_table = Vec::new_in(&HugePageAllocator);
+            let mut permuted_table = Vec::new_in(HugePageAllocator);
             permuted_table.resize(size, C::ScalarExt::zero());
-            let mut product = Vec::new_in(&HugePageAllocator);
+            let mut product = Vec::new_in(HugePageAllocator);
             product.resize(size, C::ScalarExt::zero());
             (permuted_input, permuted_table, product)
         })
         .collect::<Vec<_>>();
     end_timer!(timer);
 
-    let is_pure = |x: &Expression<_>| {
-        x.is_constant().is_some()
-            || x.is_pure_fixed().is_some()
-            || x.is_pure_advice().is_some()
-            || x.is_pure_instance().is_some()
-    };
+    let [mut single_unit_lookups, mut single_comp_lookups, mut tuple_lookups] =
+        lookup_classify(pk, &mut lookups);
 
-    let mut single_unit_lookups = pk
-        .vk
-        .cs
-        .lookups
-        .iter()
-        .zip(lookups.iter_mut())
-        .filter(|(l, _)| {
-            l.input_expressions.len() == 1
-                && l.table_expressions.len() == 1
-                && is_pure(&l.input_expressions[0])
-                && is_pure(&l.table_expressions[0])
-        })
-        .collect::<Vec<_>>();
+    let timer = start_timer!(|| format!("permute lookup unit {}", single_unit_lookups.len()));
+    single_unit_lookups
+        .par_iter_mut()
+        .for_each(|(arg, (input, table, z))| {
+            let f = |expr: &Expression<_>, target: &mut [_]| {
+                if let Some(v) = expr.is_constant() {
+                    target.fill(v);
+                } else if let Some(idx) = expr.is_pure_fixed() {
+                    target.clone_from_slice(&pk.fixed_values[idx].values[0..unusable_rows_start]);
+                } else if let Some(idx) = expr.is_pure_instance() {
+                    target.clone_from_slice(
+                        &instance[0].instance_values[idx].values[0..unusable_rows_start],
+                    );
+                } else if let Some(idx) = expr.is_pure_advice() {
+                    target.clone_from_slice(&advices[idx][0..unusable_rows_start]);
+                } else {
+                    unreachable!()
+                }
+            };
 
-    let timer = start_timer!(|| format!("permute lookup pure {}", single_unit_lookups.len()));
-    single_unit_lookups.par_iter_mut().for_each(|(l, lookup)| {
-        let f = |expr: &Expression<_>, target: &mut [_]| {
-            if let Some(v) = expr.is_constant() {
-                target.fill(v);
-            } else if let Some(idx) = expr.is_pure_fixed() {
-                target.clone_from_slice(&pk.fixed_values[idx].values[0..unusable_rows_start]);
-            }
-        };
-
-        if true {
-            for cell in &mut lookup.0[unusable_rows_start..] {
-                *cell = C::Scalar::random(&mut OsRng);
-            }
-            for cell in &mut lookup.1[unusable_rows_start..] {
-                *cell = C::Scalar::random(&mut OsRng);
-            }
-        }
-
-        f(
-            &l.input_expressions[0],
-            &mut lookup.0[0..unusable_rows_start],
-        );
-        f(
-            &l.table_expressions[0],
-            &mut lookup.1[0..unusable_rows_start],
-        );
-    });
-
-    single_unit_lookups.par_iter_mut().for_each(|(_, lookup)| {
-        lookup.0[0..unusable_rows_start].sort_unstable_by(|a, b| unsafe {
-            let a: &[u64; 4] = std::mem::transmute(a);
-            let b: &[u64; 4] = std::mem::transmute(b);
-            a.cmp(b)
+            f(
+                &arg.input_expressions[0],
+                &mut input[0..unusable_rows_start],
+            );
+            f(
+                &arg.table_expressions[0],
+                &mut table[0..unusable_rows_start],
+            );
+            handle_lookup_pair(input, table, unusable_rows_start);
         });
-    });
     end_timer!(timer);
 
-    let timer = start_timer!(|| format!("permute lookup pure {}", single_unit_lookups.len()));
-    let mut single_expr_lookups = pk
-        .vk
-        .cs
-        .lookups
+    let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+    let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+    let instance_ref = &instance[0]
+        .instance_values
         .iter()
-        .zip(lookups.iter_mut())
-        .filter(|(l, _)| {
-            l.input_expressions.len() == 1
-                && l.table_expressions.len() == 1
-                && !is_pure(&l.input_expressions[0])
-                && !is_pure(&l.table_expressions[0])
-        })
-        .collect::<Vec<_>>();
+        .map(|x| &x[..])
+        .collect::<Vec<_>>()[..];
 
-    let mut tmp_buf = vec![];
+    let timer = start_timer!(|| format!("permute lookup comp {}", single_comp_lookups.len()));
+    single_comp_lookups
+        .par_iter_mut()
+        .for_each(|(arg, (input, table, _z))| {
+            let f = |expr: &Expression<_>, target: &mut [_]| {
+                evaluate_expr(
+                    expr,
+                    size,
+                    rot_scale as i32,
+                    fixed_ref,
+                    advice_ref,
+                    instance_ref,
+                    target,
+                )
+            };
 
-    let eval_expr = |device, tmp_buf: &mut Vec<CudaDeviceBufRaw>, expr: &Expression<_>| -> CudaDeviceBufRaw {
-        let res_buf = tmp_buf.pop().unwrap();
-        match expr {
-            Expression::Constant(_) => todo!(),
-            Expression::Fixed { query_index, column_index, rotation } => todo!(),
-            Expression::Advice { query_index, column_index, rotation } => todo!(),
-            Expression::Instance { query_index, column_index, rotation } => todo!(),
-            Expression::Negated(_) => todo!(),
-            Expression::Sum(_, _) => todo!(),
-            Expression::Product(_, _) => todo!(),
-            Expression::Scaled(_, _) => todo!(),
-            Expression::Selector(_) => unreachable!(),
-        }
-        res_buf
-    };
+            f(
+                &arg.input_expressions[0],
+                &mut input[0..unusable_rows_start],
+            );
+            f(
+                &arg.table_expressions[0],
+                &mut table[0..unusable_rows_start],
+            );
+            handle_lookup_pair(input, table, unusable_rows_start);
+        });
+    end_timer!(timer);
 
-    single_expr_lookups.iter_mut().for_each(|(l, lookup)| {
-        if true {
-            for cell in &mut lookup.0[unusable_rows_start..] {
-                *cell = C::Scalar::random(&mut OsRng);
-            }
-            for cell in &mut lookup.1[unusable_rows_start..] {
-                *cell = C::Scalar::random(&mut OsRng);
-            }
-        }
+    // After theta
+    let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
+    tuple_lookups
+        .par_iter_mut()
+        .for_each(|(arg, (input, table, _z))| {
+            let f = |expr: &[Expression<_>], target: &mut [_]| {
+                evaluate_exprs(
+                    expr,
+                    size,
+                    rot_scale as i32,
+                    fixed_ref,
+                    advice_ref,
+                    instance_ref,
+                    theta,
+                    target,
+                )
+            };
 
-        let buf1 = eval_expr(
-            &device,
-            &mut tmp_buf,
-            &l.input_expressions[0],
-        );
-
-        let buf = eval_expr(
-            &device,
-            &mut tmp_buf,
-            &l.table_expressions[0],
-        );
-    });
+            f(
+                &arg.input_expressions[..],
+                &mut input[0..unusable_rows_start],
+            );
+            f(
+                &arg.table_expressions[..],
+                &mut table[0..unusable_rows_start],
+            );
+            handle_lookup_pair(input, table, unusable_rows_start);
+        });
     end_timer!(timer);
 
     Ok(())
+}
+
+fn is_expression_pure_unit<F: FieldExt>(x: &Expression<F>) -> bool {
+    x.is_constant().is_some()
+        || x.is_pure_fixed().is_some()
+        || x.is_pure_advice().is_some()
+        || x.is_pure_instance().is_some()
+}
+
+fn lookup_classify<'a, 'b, C: CurveAffine, T>(
+    pk: &'b ProvingKey<C>,
+    lookups_buf: &'a mut Vec<T>,
+) -> [Vec<(&'b lookup::Argument<C::ScalarExt>, &'a mut T)>; 3] {
+    let mut single_unit_lookups = vec![];
+    let mut single_comp_lookups = vec![];
+    let mut tuple_lookups = vec![];
+
+    pk.vk
+        .cs
+        .lookups
+        .iter()
+        .zip(lookups_buf.iter_mut())
+        .for_each(|(lookup, buf)| {
+            let is_single =
+                lookup.input_expressions.len() == 1 && lookup.table_expressions.len() == 1;
+
+            if is_single {
+                let is_unit = is_expression_pure_unit(&lookup.input_expressions[0])
+                    && is_expression_pure_unit(&lookup.table_expressions[0]);
+                if is_unit {
+                    single_unit_lookups.push((lookup, buf));
+                } else {
+                    single_comp_lookups.push((lookup, buf));
+                }
+            } else {
+                tuple_lookups.push((lookup, buf))
+            }
+        });
+
+    return [single_unit_lookups, single_comp_lookups, tuple_lookups];
+}
+
+fn handle_lookup_pair<F: FieldExt>(
+    input: &mut Vec<F, HugePageAllocator>,
+    table: &mut Vec<F, HugePageAllocator>,
+    unusable_rows_start: usize,
+) {
+    let compare = |a: &_, b: &_| unsafe {
+        let a: &[u64; 4] = std::mem::transmute(a);
+        let b: &[u64; 4] = std::mem::transmute(b);
+        a.cmp(b)
+    };
+
+    input[0..unusable_rows_start].sort_unstable_by(compare);
+    table[0..unusable_rows_start].sort_unstable_by(compare);
+
+    let mut permuted_table_state = Vec::new_in(HugePageAllocator);
+    permuted_table_state.resize(input.len(), false);
+
+    let mut permuted_table = Vec::new_in(HugePageAllocator);
+    permuted_table.resize(input.len(), F::zero());
+
+    input
+        .iter()
+        .zip(permuted_table_state.iter_mut())
+        .zip(permuted_table.iter_mut())
+        .enumerate()
+        .for_each(|(row, ((input_value, table_state), table_value))| {
+            // If this is the first occurrence of `input_value` in the input expression
+            if row == 0 || *input_value != input[row - 1] {
+                *table_state = true;
+                *table_value = *input_value;
+            }
+        });
+
+    let to_next_unique = |i: &mut usize| {
+        while *i < unusable_rows_start && !permuted_table_state[*i] {
+            *i += 1;
+        }
+    };
+
+    let mut i_unique_input_idx = 0;
+    let mut i_sorted_table_idx = 0;
+    for i in 0..unusable_rows_start {
+        to_next_unique(&mut i_unique_input_idx);
+        while i_unique_input_idx < unusable_rows_start
+            && permuted_table[i_unique_input_idx] == table[i_sorted_table_idx]
+        {
+            i_unique_input_idx += 1;
+            i_sorted_table_idx += 1;
+            to_next_unique(&mut i_unique_input_idx);
+        }
+        if !permuted_table_state[i] {
+            permuted_table[i] = table[i_sorted_table_idx];
+            i_sorted_table_idx += 1;
+        }
+    }
+
+    *table = permuted_table;
+
+    if true {
+        for cell in &mut input[unusable_rows_start..] {
+            *cell = F::random(&mut OsRng);
+        }
+        for cell in &mut table[unusable_rows_start..] {
+            *cell = F::random(&mut OsRng);
+        }
+    }
+}
+
+/// Simple evaluation of an expression
+pub fn evaluate_expr<F: FieldExt>(
+    expression: &Expression<F>,
+    size: usize,
+    rot_scale: i32,
+    fixed: &[&[F]],
+    advice: &[&[F]],
+    instance: &[&[F]],
+    res: &mut [F],
+) {
+    let isize = size as i32;
+
+    let get_rotation_idx = |idx: usize, rot: i32, rot_scale: i32, isize: i32| -> usize {
+        (((idx as i32) + (rot * rot_scale)).rem_euclid(isize)) as usize
+    };
+
+    for (idx, value) in res.iter_mut().enumerate() {
+        *value = expression.evaluate(
+            &|scalar| scalar,
+            &|_| panic!("virtual selectors are removed during optimization"),
+            &|_, column_index, rotation| {
+                fixed[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
+            },
+            &|_, column_index, rotation| {
+                advice[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
+            },
+            &|_, column_index, rotation| {
+                instance[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
+            },
+            &|a| -a,
+            &|a, b| a + &b,
+            &|a, b| {
+                let a = a();
+
+                if a == F::zero() {
+                    a
+                } else {
+                    a * b()
+                }
+            },
+            &|a, scalar| a * scalar,
+        );
+    }
+}
+
+/// Simple evaluation of an expression
+pub fn evaluate_exprs<F: FieldExt>(
+    expressions: &[Expression<F>],
+    size: usize,
+    rot_scale: i32,
+    fixed: &[&[F]],
+    advice: &[&[F]],
+    instance: &[&[F]],
+    theta: F,
+    res: &mut [F],
+) {
+    let isize = size as i32;
+    let get_rotation_idx = |idx: usize, rot: i32, rot_scale: i32, isize: i32| -> usize {
+        (((idx as i32) + (rot * rot_scale)).rem_euclid(isize)) as usize
+    };
+    for (idx, value) in res.iter_mut().enumerate() {
+        for expression in expressions {
+            *value = *value * theta;
+            *value += expression.evaluate(
+                &|scalar| scalar,
+                &|_| panic!("virtual selectors are removed during optimization"),
+                &|_, column_index, rotation| {
+                    fixed[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
+                },
+                &|_, column_index, rotation| {
+                    advice[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
+                },
+                &|_, column_index, rotation| {
+                    instance[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
+                },
+                &|a| -a,
+                &|a, b| a + &b,
+                &|a, b| {
+                    let a = a();
+                    if a == F::zero() {
+                        a
+                    } else {
+                        a * b()
+                    }
+                },
+                &|a, scalar| a * scalar,
+            );
+        }
+    }
 }
