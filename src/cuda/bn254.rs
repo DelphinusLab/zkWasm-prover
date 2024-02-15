@@ -1,9 +1,9 @@
 use crate::device::cuda::{to_result, CudaBuffer, CudaDevice, CudaDeviceBufRaw};
-use crate::device::Device;
 use crate::device::Error;
-use halo2_proofs::arithmetic::CurveAffine;
-use halo2_proofs::pairing::group::Group;
+use crate::device::{Device, DeviceResult};
+use halo2_proofs::arithmetic::{CurveAffine, FieldExt};
 use halo2_proofs::pairing::group::Curve;
+use halo2_proofs::pairing::group::Group;
 
 mod cuda_c {
     use cuda_runtime_sys::cudaError;
@@ -33,19 +33,108 @@ mod cuda_c {
 
 pub fn msm<C: CurveAffine>(
     device: &CudaDevice,
-    res_buf: &CudaDeviceBufRaw,
     p_buf: &CudaDeviceBufRaw,
     s_buf: &CudaDeviceBufRaw,
     len: usize,
 ) -> Result<C, Error> {
-    let mut res = [C::Curve::identity()];
+    let msm_groups = 2;
+    let threads = 256;
+    let windows = 32;
+    let windows_bits = 8;
+    let mut tmp = vec![C::Curve::identity(); msm_groups * windows];
+    let res_buf = device.alloc_device_buffer_from_slice(&tmp[..])?;
     unsafe {
-        let err = cuda_c::msm(8, 256, res_buf.ptr(), p_buf.ptr(), s_buf.ptr(), len as i32);
+        let err = cuda_c::msm(
+            msm_groups as i32,
+            threads,
+            res_buf.ptr(),
+            p_buf.ptr(),
+            s_buf.ptr(),
+            len as i32,
+        );
         to_result((), err, "fail to run msm")?;
     }
+    device.copy_from_device_to_host(&mut tmp[..], &res_buf)?;
 
-    device.copy_from_device_to_host(&mut res[..], res_buf)?;
-    Ok(res[0].to_affine())
+    for i in 0..windows {
+        for j in 1..msm_groups {
+            tmp[i] = tmp[i] + tmp[i + j * windows];
+        }
+    }
+
+    let mut msm_res = tmp[windows - 1];
+    for i in 0..windows - 1 {
+        for _ in 0..windows_bits {
+            msm_res = msm_res + msm_res;
+        }
+        msm_res = msm_res + tmp[windows - 2 - i];
+    }
+
+    Ok(msm_res.to_affine())
+}
+
+const MAX_DEG: usize = 8;
+
+pub fn ntt_prepare<F: FieldExt>(
+    device: &CudaDevice,
+    len_log: usize,
+) -> DeviceResult<(CudaDeviceBufRaw, CudaDeviceBufRaw)> {
+    let mut omega = F::ROOT_OF_UNITY_INV.invert().unwrap();
+    for _ in len_log..F::S as usize {
+        omega = omega.square();
+    }
+
+    let len = 1 << len_log;
+    let mut omegas = vec![F::one()];
+    for _ in 1..len {
+        omegas.push(*omegas.last().unwrap() * omega);
+    }
+
+    let max_deg = MAX_DEG.min(len_log);
+    let mut pq = vec![F::zero(); 1 << max_deg >> 1];
+    let twiddle = omega.pow_vartime([(len >> max_deg) as u64]);
+    pq[0] = F::one();
+    if max_deg > 1 {
+        pq[1] = twiddle;
+        for i in 2..(1 << max_deg >> 1) {
+            pq[i] = pq[i - 1];
+            pq[i].mul_assign(&twiddle);
+        }
+    }
+
+    let omegas_buf = device.alloc_device_buffer_from_slice(&omegas[..])?;
+    let pq_buf = device.alloc_device_buffer_from_slice(&pq[..])?;
+
+    Ok((omegas_buf, pq_buf))
+}
+
+pub fn ntt<F: FieldExt>(
+    device: &CudaDevice,
+    s_buf: &mut CudaDeviceBufRaw,
+    tmp_buf: &mut CudaDeviceBufRaw,
+    pq_buf: &CudaDeviceBufRaw,
+    omegas_buf: &CudaDeviceBufRaw,
+    result: &mut [F],
+    len_log: usize,
+) -> Result<(), Error> {
+    let mut swap = false;
+    unsafe {
+        let err = crate::cuda::bn254::cuda_c::ntt(
+            s_buf.ptr(),
+            tmp_buf.ptr(),
+            pq_buf.ptr(),
+            omegas_buf.ptr(),
+            len_log as i32,
+            MAX_DEG as i32,
+            &mut swap as *mut _ as _,
+        );
+        to_result((), err, "fail to run ntt")?;
+    }
+    if swap {
+        std::mem::swap(s_buf, tmp_buf);
+    }
+    device.copy_from_device_to_host(result, s_buf)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -66,6 +155,8 @@ mod test {
     use halo2_proofs::pairing::bn256::{Fr, G1Affine, G1};
     use halo2_proofs::pairing::group::ff::PrimeField as _;
     use halo2_proofs::pairing::group::{Curve, Group as _};
+
+    use super::MAX_DEG;
 
     #[link(name = "zkwasm_prover_kernel", kind = "static")]
     extern "C" {
@@ -429,12 +520,12 @@ mod test {
         let device = CudaDevice::get_device(0).unwrap();
         let len = 1 << 20;
 
-        for _ in 0..4 {
+        for _ in 0..10 {
             let mut p = vec![];
             let mut s = vec![];
 
             let timer = start_timer!(|| "prepare buffer");
-            let random_nr = 256;
+            let random_nr = 1;
             let mut rands_s = vec![];
             let mut rands_p = vec![];
             let mut rands_ps = vec![];
@@ -450,10 +541,10 @@ mod test {
             let mut acc = Fr::zero();
             for i in 0..len {
                 let x = rands_p[i % random_nr];
-                let y = rands_s[i % random_nr];
+                let y = rands_s[i % random_nr] + Fr::from(i as u64);
                 p.push(x);
                 s.push(y);
-                acc += rands_s[i % random_nr] * rands_ps[i % random_nr];
+                acc += (rands_s[i % random_nr] + Fr::from(i as u64)) * rands_ps[i % random_nr];
             }
             end_timer!(timer);
 
@@ -461,9 +552,10 @@ mod test {
             let msm_res_expect = G1Affine::generator() * acc;
             end_timer!(timer);
 
-            let msm_groups = 4;
             let windows = 32;
             let windows_bits = 8;
+            let msm_groups = 2;
+            let threads = 256;
             let mut tmp = vec![];
             for _ in 0..windows * msm_groups {
                 tmp.push(G1::group_zero());
@@ -472,18 +564,14 @@ mod test {
             unsafe {
                 let timer = start_timer!(|| "copy buffer");
                 let tmp_buf = device.alloc_device_buffer_from_slice(&tmp[..]).unwrap();
-                end_timer!(timer);
-                let timer = start_timer!(|| "copy buffer");
                 let a_buf = device.alloc_device_buffer_from_slice(&p[..]).unwrap();
-                end_timer!(timer);
-                let timer = start_timer!(|| "copy buffer");
                 let b_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
                 end_timer!(timer);
 
-                let timer = start_timer!(|| "gpu costs");
+                let timer = start_timer!(|| "gpu costs********");
                 let res = crate::cuda::bn254::cuda_c::msm(
                     msm_groups as i32,
-                    256,
+                    threads,
                     tmp_buf.ptr(),
                     a_buf.ptr(),
                     b_buf.ptr(),
@@ -522,7 +610,7 @@ mod test {
     #[test]
     fn test_bn254_fft() {
         let device = CudaDevice::get_device(0).unwrap();
-        let len_log = 24;
+        let len_log = 20;
         let len = 1 << len_log;
 
         let mut omega = Fr::ROOT_OF_UNITY_INV.invert().unwrap();
@@ -541,7 +629,7 @@ mod test {
             omegas.push(omegas.last().unwrap() * omega);
         }
 
-        let max_deg = 9.min(len_log);
+        let max_deg = MAX_DEG.min(len_log as usize);
         let mut pq = vec![Fr::zero(); 1 << max_deg >> 1];
         let twiddle = omega.pow_vartime([(len >> max_deg) as u64]);
         pq[0] = Fr::one();

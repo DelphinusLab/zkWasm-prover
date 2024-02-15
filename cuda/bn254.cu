@@ -82,49 +82,6 @@ __global__ void _msm_core(
         res[group_idx + blockIdx.y * gridDim.x] = acc;
     }
 }
-/*
-__global__ void _ntt_core(
-    Bn254FrField *buf,
-    const Bn254FrField *omega,
-    int log_n,
-    int _round)
-{
-    int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    int worker = blockDim.x * gridDim.x;
-    int n = 1 << (log_n - 1);
-    int size_per_worker = (n + worker - 1) / worker;
-    int start = gid * size_per_worker;
-    int end = start + size_per_worker;
-    end = end > n ? n : end;
-
-    for (int round = 0; round < 8; round++)
-    {
-        int shift = 1 << round;
-        int mask = shift - 1;
-
-        int twiddle_chunk = log_n - (round + 1);
-
-        for (int i = start; i < end; i++)
-        {
-            int inner = i & mask;
-            int outer = (i - inner);
-            int l = (outer << 1) + inner;
-            int r = l + shift;
-
-            Bn254FrField t = buf[r];
-            if (inner != 0)
-            {
-                const Bn254FrField *twiddle = &omega[0];
-                t = t * *twiddle;
-            }
-            buf[r] = buf[l] - t;
-            buf[l] += t;
-        }
-
-        __syncthreads();
-    }
-}
-*/
 
 __device__ uint bit_reverse(uint n, uint bits)
 {

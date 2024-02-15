@@ -26,6 +26,8 @@ use rayon::iter::IntoParallelRefMutIterator as _;
 use rayon::iter::ParallelIterator as _;
 
 use crate::cuda::bn254::msm;
+use crate::cuda::bn254::ntt;
+use crate::cuda::bn254::ntt_prepare;
 use crate::device::cuda::CudaDevice;
 use crate::device::Device as _;
 use crate::device::DeviceResult;
@@ -62,398 +64,6 @@ impl From<device::Error> for Error {
     fn from(e: device::Error) -> Self {
         Error::DeviceError(e)
     }
-}
-
-pub fn create_proof_from_advices<
-    C: CurveAffine,
-    E: EncodedChallenge<C>,
-    T: TranscriptWrite<C, E>,
->(
-    params: &Params<C>,
-    pk: Arc<ProvingKey<C>>,
-    instances: &[&[C::Scalar]],
-    mut advices: Arc<Vec<Vec<C::Scalar, HugePageAllocator>>>,
-    transcript: &mut T,
-) -> Result<(), Error> {
-    let size = 1 << pk.get_vk().domain.k();
-    let rot_scale = 1 << (pk.get_vk().domain.extended_k() - pk.get_vk().domain.k());
-    let meta = &pk.vk.cs;
-    let unusable_rows_start = params.n as usize - (meta.blinding_factors() + 1);
-
-    let timer = start_timer!(|| "create single instances");
-    let instance =
-        halo2_proofs::plonk::create_single_instances(params, &pk, &[instances], transcript)
-            .unwrap();
-    let instance = Arc::new(instance);
-    end_timer!(timer);
-
-    let device = CudaDevice::get_device(0).unwrap();
-
-    let timer = start_timer!(|| "pin advice memory to gpu");
-    unsafe { Arc::get_mut_unchecked(&mut advices) }
-        .iter_mut()
-        .map(|x| -> Result<(), Error> {
-            device.pin_memory(&mut x[..])?;
-            Ok(())
-        })
-        .collect::<Result<_, _>>()?;
-    end_timer!(timer);
-
-    // add random value
-    if true {
-        let named = &pk.vk.cs.named_advices;
-        unsafe { Arc::get_mut_unchecked(&mut advices) }
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, advice)| {
-                if named.iter().find(|n| n.1 as usize == i).is_none() {
-                    for cell in &mut advice[unusable_rows_start..] {
-                        *cell = C::Scalar::random(&mut OsRng);
-                    }
-                }
-            });
-    }
-
-    let timer = start_timer!(|| format!("copy advice columns to gpu, count {}", advices.len()));
-    let advices_device_buf = advices
-        .iter()
-        .map(|x| device.alloc_device_buffer_from_slice(x))
-        .collect::<DeviceResult<Vec<_>>>()?;
-    end_timer!(timer);
-
-    /*
-    let timer =
-        start_timer!(|| format!("copy fixed columns to gpu, count {}", pk.fixed_values.len()));
-    let fixed_device_buf = pk
-        .fixed_values
-        .iter()
-        .map(|x| device.alloc_device_buffer_from_slice(x))
-        .collect::<DeviceResult<Vec<_>>>()?;
-    end_timer!(timer);
-    */
-
-    let timer = start_timer!(|| "copy g_lagrange buffer");
-    let g_lagrange_buf = device
-        .alloc_device_buffer_from_slice(&params.g_lagrange[..])
-        .unwrap();
-    end_timer!(timer);
-
-    // thread for part of lookups
-    let sub_pk = pk.clone();
-    let sub_advices = advices.clone();
-    let sub_instance = instance.clone();
-    let lookup_handler = thread::spawn(move || {
-        let pk = sub_pk;
-        let advices = sub_advices;
-        let instance = sub_instance;
-        let timer =
-            start_timer!(|| format!("prepare lookup buffer, count {}", pk.vk.cs.lookups.len()));
-        let lookups = pk
-            .vk
-            .cs
-            .lookups
-            .par_iter()
-            .map(|_| {
-                let mut permuted_input = Vec::new_in(HugePageAllocator);
-                permuted_input.resize(size, C::ScalarExt::zero());
-                let mut permuted_table = Vec::new_in(HugePageAllocator);
-                permuted_table.resize(size, C::ScalarExt::zero());
-                let mut z = Vec::new_in(HugePageAllocator);
-                z.resize(size, C::ScalarExt::zero());
-                (permuted_input, permuted_table, z)
-            })
-            .collect::<Vec<_>>();
-        end_timer!(timer);
-
-        let [mut single_unit_lookups, mut single_comp_lookups, mut tuple_lookups] =
-            lookup_classify(&pk, lookups);
-
-        let timer = start_timer!(|| format!("permute lookup unit {}", single_unit_lookups.len()));
-        let single_unit_lookups = single_unit_lookups
-            .into_par_iter()
-            .map(|(i, (mut input, mut table, z))| {
-                let f = |expr: &Expression<_>, target: &mut [_]| {
-                    if let Some(v) = expr.is_constant() {
-                        target.fill(v);
-                    } else if let Some(idx) = expr.is_pure_fixed() {
-                        target
-                            .clone_from_slice(&pk.fixed_values[idx].values[0..unusable_rows_start]);
-                    } else if let Some(idx) = expr.is_pure_instance() {
-                        target.clone_from_slice(
-                            &instance[0].instance_values[idx].values[0..unusable_rows_start],
-                        );
-                    } else if let Some(idx) = expr.is_pure_advice() {
-                        target.clone_from_slice(&advices[idx][0..unusable_rows_start]);
-                    } else {
-                        unreachable!()
-                    }
-                };
-
-                f(
-                    &pk.vk.cs.lookups[i].input_expressions[0],
-                    &mut input[0..unusable_rows_start],
-                );
-                f(
-                    &pk.vk.cs.lookups[i].table_expressions[0],
-                    &mut table[0..unusable_rows_start],
-                );
-                let (permuted_input, permuted_table) =
-                    handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
-                (i, (permuted_input, permuted_table, input, table, z))
-            })
-            .collect::<Vec<_>>();
-        end_timer!(timer);
-
-        let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-        let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-        let instance_ref = &instance[0]
-            .instance_values
-            .iter()
-            .map(|x| &x[..])
-            .collect::<Vec<_>>()[..];
-
-        let timer = start_timer!(|| format!("permute lookup comp {}", single_comp_lookups.len()));
-        let single_comp_lookups = single_comp_lookups
-            .into_par_iter()
-            .map(|(i, (mut input, mut table, z))| {
-                let f = |expr: &Expression<_>, target: &mut [_]| {
-                    evaluate_expr(
-                        expr,
-                        size,
-                        rot_scale as i32,
-                        fixed_ref,
-                        advice_ref,
-                        instance_ref,
-                        target,
-                    )
-                };
-
-                f(
-                    &pk.vk.cs.lookups[i].input_expressions[0],
-                    &mut input[0..unusable_rows_start],
-                );
-                f(
-                    &pk.vk.cs.lookups[i].table_expressions[0],
-                    &mut table[0..unusable_rows_start],
-                );
-                let (permuted_input, permuted_table) =
-                    handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
-                (i, (permuted_input, permuted_table, input, table, z))
-            })
-            .collect::<Vec<_>>();
-        end_timer!(timer);
-
-        return (single_unit_lookups, single_comp_lookups, tuple_lookups);
-    });
-
-    // Advice MSM
-    let timer = start_timer!(|| format!("advices msm {}", advices_device_buf.len()));
-    let msm_result = [C::Curve::identity()];
-    let msm_result_buf = device.alloc_device_buffer_from_slice(&msm_result[..])?;
-    for s_buf in advices_device_buf.iter() {
-        let commitment = msm(&device, &msm_result_buf, &g_lagrange_buf, s_buf, size)?;
-        transcript.write_point(commitment).unwrap();
-    }
-    end_timer!(timer);
-
-    let theta: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
-    println!("theta is {:?}", theta);
-
-    let timer = start_timer!(|| "wait single lookups");
-    let (mut single_unit_lookups, mut single_comp_lookups, mut tuple_lookups) =
-        lookup_handler.join().unwrap();
-    end_timer!(timer);
-
-    // After theta
-    let sub_pk = pk.clone();
-    let sub_advices = advices.clone();
-    let sub_instance = instance.clone();
-    let tuple_lookup_handler = thread::spawn(move || {
-        let pk = sub_pk;
-        let advices = sub_advices;
-        let instance = sub_instance;
-        let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
-
-        let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-        let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-        let instance_ref = &instance[0]
-            .instance_values
-            .iter()
-            .map(|x| &x[..])
-            .collect::<Vec<_>>()[..];
-
-        let mut tuple_lookups = tuple_lookups
-            .into_par_iter()
-            .map(|(i, (mut input, mut table, z))| {
-                let f = |expr: &[Expression<_>], target: &mut [_]| {
-                    evaluate_exprs(
-                        expr,
-                        size,
-                        rot_scale as i32,
-                        fixed_ref,
-                        advice_ref,
-                        instance_ref,
-                        theta,
-                        target,
-                    )
-                };
-
-                f(
-                    &pk.vk.cs.lookups[i].input_expressions[..],
-                    &mut input[0..unusable_rows_start],
-                );
-                f(
-                    &pk.vk.cs.lookups[i].table_expressions[..],
-                    &mut table[0..unusable_rows_start],
-                );
-                let (permuted_input, permuted_table) =
-                    handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
-                (i, (permuted_input, permuted_table, input, table, z))
-            })
-            .collect::<Vec<_>>();
-        end_timer!(timer);
-
-        tuple_lookups
-    });
-
-    let mut lookup_permuted_commitments = vec![C::identity(); pk.vk.cs.lookups.len() * 2];
-
-    let timer = start_timer!(|| format!(
-        "single lookup copy {} {}",
-        single_unit_lookups.len(),
-        single_comp_lookups.len()
-    ));
-    let single_unit_buffers = single_unit_lookups
-        .iter_mut()
-        .map(|x| {
-            // FIXME: handle error
-            let input_buf = device.alloc_device_buffer_from_slice(&x.1 .0[..])?;
-            let table_buf = device.alloc_device_buffer_from_slice(&x.1 .1[..])?;
-            Ok((x.0, input_buf, table_buf))
-        })
-        .collect::<DeviceResult<Vec<_>>>()?;
-
-    let single_comp_buffers = single_comp_lookups
-        .iter_mut()
-        .map(|x| {
-            // FIXME: handle error
-            let input_buf = device.alloc_device_buffer_from_slice(&x.1 .0[..])?;
-            let table_buf = device.alloc_device_buffer_from_slice(&x.1 .1[..])?;
-            Ok((x.0, input_buf, table_buf))
-        })
-        .collect::<DeviceResult<Vec<_>>>()?;
-    end_timer!(timer);
-
-    let timer = start_timer!(|| format!(
-        "single lookup msm {} {}",
-        single_unit_lookups.len(),
-        single_comp_lookups.len()
-    ));
-
-    for (i, permuted_input_buf, permuted_table_buf) in single_unit_buffers.iter() {
-        lookup_permuted_commitments[i * 2] = msm(
-            &device,
-            &msm_result_buf,
-            &g_lagrange_buf,
-            &permuted_input_buf,
-            size,
-        )?;
-        lookup_permuted_commitments[i * 2 + 1] = msm(
-            &device,
-            &msm_result_buf,
-            &g_lagrange_buf,
-            &permuted_table_buf,
-            size,
-        )?;
-    }
-
-    for (i, permuted_input_buf, permuted_table_buf) in single_comp_buffers.iter() {
-        lookup_permuted_commitments[i * 2] = msm(
-            &device,
-            &msm_result_buf,
-            &g_lagrange_buf,
-            &permuted_input_buf,
-            size,
-        )?;
-        lookup_permuted_commitments[i * 2 + 1] = msm(
-            &device,
-            &msm_result_buf,
-            &g_lagrange_buf,
-            &permuted_table_buf,
-            size,
-        )?;
-    }
-    end_timer!(timer);
-
-    let timer = start_timer!(|| "wait tuple lookup");
-    let mut tuple_lookups = tuple_lookup_handler.join().unwrap();
-    end_timer!(timer);
-
-    let timer = start_timer!(|| format!("tuple lookup msm {}", tuple_lookups.len(),));
-
-    for (i, (permuted_input, permuted_table, _, _, _)) in tuple_lookups.iter() {
-        let permuted_input_buf = device.alloc_device_buffer_from_slice(&permuted_input[..])?;
-        let permuted_table_buf = device.alloc_device_buffer_from_slice(&permuted_table[..])?;
-        lookup_permuted_commitments[i * 2] = msm(
-            &device,
-            &msm_result_buf,
-            &g_lagrange_buf,
-            &permuted_input_buf,
-            size,
-        )?;
-        lookup_permuted_commitments[i * 2 + 1] = msm(
-            &device,
-            &msm_result_buf,
-            &g_lagrange_buf,
-            &permuted_table_buf,
-            size,
-        )?;
-    }
-    end_timer!(timer);
-
-    for commitment in lookup_permuted_commitments {
-        transcript.write_point(commitment).unwrap();
-    }
-
-    let beta: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
-    println!("beta is {:?}", beta);
-    let gamma: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
-    println!("gamma is {:?}", gamma);
-
-    let mut lookups = vec![];
-    lookups.append(&mut single_unit_lookups);
-    lookups.append(&mut single_comp_lookups);
-    lookups.append(&mut tuple_lookups);
-    lookups.sort_by(|l, r| usize::cmp(&l.0, &r.0));
-
-    let timer = start_timer!(|| "generate lookup z");
-    lookups
-        .par_iter_mut()
-        .for_each(|(_, (permuted_input, permuted_table, z, input, table))| {
-            for ((z, permuted_input_value), permuted_table_value) in z
-                .iter_mut()
-                .zip(permuted_input.iter())
-                .zip(permuted_table.iter())
-            {
-                *z = (beta + permuted_input_value) * &(gamma + permuted_table_value);
-            }
-
-            z.batch_invert();
-
-            for ((z, input_value), table_value) in z.iter_mut().zip(input.iter()).zip(table.iter())
-            {
-                *z *= (beta + input_value) * &(gamma + table_value);
-            }
-
-            let mut tmp = C::ScalarExt::one();
-            for i in 0..unusable_rows_start {
-                std::mem::swap(&mut tmp, &mut z[i]);
-                tmp = tmp * z[i];
-            }
-        });
-    end_timer!(timer);
-
-    Ok(())
 }
 
 fn is_expression_pure_unit<F: FieldExt>(x: &Expression<F>) -> bool {
@@ -657,4 +267,393 @@ pub fn evaluate_exprs<F: FieldExt>(
             );
         }
     }
+}
+
+pub fn create_proof_from_advices<
+    C: CurveAffine,
+    E: EncodedChallenge<C>,
+    T: TranscriptWrite<C, E>,
+>(
+    params: &Params<C>,
+    pk: Arc<ProvingKey<C>>,
+    instances: &[&[C::Scalar]],
+    mut advices: Arc<Vec<Vec<C::Scalar, HugePageAllocator>>>,
+    transcript: &mut T,
+) -> Result<(), Error> {
+    let k = pk.get_vk().domain.k() as usize;
+    let size = 1 << pk.get_vk().domain.k();
+    let extended_k = pk.get_vk().domain.extended_k() as usize;
+    let rot_scale = 1 << (extended_k - k);
+    let meta = &pk.vk.cs;
+    let unusable_rows_start = params.n as usize - (meta.blinding_factors() + 1);
+
+    let timer = start_timer!(|| "create single instances");
+    let instance =
+        halo2_proofs::plonk::create_single_instances(params, &pk, &[instances], transcript)
+            .unwrap();
+    let instance = Arc::new(instance);
+    end_timer!(timer);
+
+    let device = CudaDevice::get_device(0).unwrap();
+
+    let timer = start_timer!(|| "pin advice memory to gpu");
+    unsafe { Arc::get_mut_unchecked(&mut advices) }
+        .iter_mut()
+        .map(|x| -> Result<(), Error> {
+            device.pin_memory(&mut x[..])?;
+            Ok(())
+        })
+        .collect::<Result<_, _>>()?;
+    end_timer!(timer);
+
+    // add random value
+    if true {
+        let named = &pk.vk.cs.named_advices;
+        unsafe { Arc::get_mut_unchecked(&mut advices) }
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, advice)| {
+                if named.iter().find(|n| n.1 as usize == i).is_none() {
+                    for cell in &mut advice[unusable_rows_start..] {
+                        *cell = C::Scalar::random(&mut OsRng);
+                    }
+                }
+            });
+    }
+
+    let timer = start_timer!(|| format!("copy advice columns to gpu, count {}", advices.len()));
+    let advices_device_buf = advices
+        .iter()
+        .map(|x| device.alloc_device_buffer_from_slice(x))
+        .collect::<DeviceResult<Vec<_>>>()?;
+    end_timer!(timer);
+
+    /*
+    let timer =
+        start_timer!(|| format!("copy fixed columns to gpu, count {}", pk.fixed_values.len()));
+    let fixed_device_buf = pk
+        .fixed_values
+        .iter()
+        .map(|x| device.alloc_device_buffer_from_slice(x))
+        .collect::<DeviceResult<Vec<_>>>()?;
+    end_timer!(timer);
+    */
+
+    let timer = start_timer!(|| "copy g_lagrange buffer");
+    let g_lagrange_buf = device
+        .alloc_device_buffer_from_slice(&params.g_lagrange[..])
+        .unwrap();
+    end_timer!(timer);
+
+    // thread for part of lookups
+    let sub_pk = pk.clone();
+    let sub_advices = advices.clone();
+    let sub_instance = instance.clone();
+    let lookup_handler = thread::spawn(move || {
+        let pk = sub_pk;
+        let advices = sub_advices;
+        let instance = sub_instance;
+        let timer =
+            start_timer!(|| format!("prepare lookup buffer, count {}", pk.vk.cs.lookups.len()));
+        let lookups = pk
+            .vk
+            .cs
+            .lookups
+            .par_iter()
+            .map(|_| {
+                let mut permuted_input = Vec::new_in(HugePageAllocator);
+                permuted_input.resize(size, C::ScalarExt::zero());
+                let mut permuted_table = Vec::new_in(HugePageAllocator);
+                permuted_table.resize(size, C::ScalarExt::zero());
+                let mut z = Vec::new_in(HugePageAllocator);
+                z.resize(size, C::ScalarExt::zero());
+                (permuted_input, permuted_table, z)
+            })
+            .collect::<Vec<_>>();
+        end_timer!(timer);
+
+        let [mut single_unit_lookups, mut single_comp_lookups, mut tuple_lookups] =
+            lookup_classify(&pk, lookups);
+
+        let timer = start_timer!(|| format!("permute lookup unit {}", single_unit_lookups.len()));
+        let single_unit_lookups = single_unit_lookups
+            .into_par_iter()
+            .map(|(i, (mut input, mut table, z))| {
+                let f = |expr: &Expression<_>, target: &mut [_]| {
+                    if let Some(v) = expr.is_constant() {
+                        target.fill(v);
+                    } else if let Some(idx) = expr.is_pure_fixed() {
+                        target
+                            .clone_from_slice(&pk.fixed_values[idx].values[0..unusable_rows_start]);
+                    } else if let Some(idx) = expr.is_pure_instance() {
+                        target.clone_from_slice(
+                            &instance[0].instance_values[idx].values[0..unusable_rows_start],
+                        );
+                    } else if let Some(idx) = expr.is_pure_advice() {
+                        target.clone_from_slice(&advices[idx][0..unusable_rows_start]);
+                    } else {
+                        unreachable!()
+                    }
+                };
+
+                f(
+                    &pk.vk.cs.lookups[i].input_expressions[0],
+                    &mut input[0..unusable_rows_start],
+                );
+                f(
+                    &pk.vk.cs.lookups[i].table_expressions[0],
+                    &mut table[0..unusable_rows_start],
+                );
+                let (permuted_input, permuted_table) =
+                    handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
+                (i, (permuted_input, permuted_table, input, table, z))
+            })
+            .collect::<Vec<_>>();
+        end_timer!(timer);
+
+        let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+        let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+        let instance_ref = &instance[0]
+            .instance_values
+            .iter()
+            .map(|x| &x[..])
+            .collect::<Vec<_>>()[..];
+
+        let timer = start_timer!(|| format!("permute lookup comp {}", single_comp_lookups.len()));
+        let single_comp_lookups = single_comp_lookups
+            .into_par_iter()
+            .map(|(i, (mut input, mut table, z))| {
+                let f = |expr: &Expression<_>, target: &mut [_]| {
+                    evaluate_expr(
+                        expr,
+                        size,
+                        rot_scale as i32,
+                        fixed_ref,
+                        advice_ref,
+                        instance_ref,
+                        target,
+                    )
+                };
+
+                f(
+                    &pk.vk.cs.lookups[i].input_expressions[0],
+                    &mut input[0..unusable_rows_start],
+                );
+                f(
+                    &pk.vk.cs.lookups[i].table_expressions[0],
+                    &mut table[0..unusable_rows_start],
+                );
+                let (permuted_input, permuted_table) =
+                    handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
+                (i, (permuted_input, permuted_table, input, table, z))
+            })
+            .collect::<Vec<_>>();
+        end_timer!(timer);
+
+        return (single_unit_lookups, single_comp_lookups, tuple_lookups);
+    });
+
+    // Advice MSM
+    let timer = start_timer!(|| format!("advices msm {}", advices_device_buf.len()));
+    for s_buf in advices_device_buf {
+        let commitment = msm(&device, &g_lagrange_buf, &s_buf, size)?;
+        transcript.write_point(commitment).unwrap();
+    }
+    end_timer!(timer);
+
+    let theta: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
+    println!("theta is {:?}", theta);
+
+    let timer = start_timer!(|| "wait single lookups");
+    let (mut single_unit_lookups, mut single_comp_lookups, mut tuple_lookups) =
+        lookup_handler.join().unwrap();
+    end_timer!(timer);
+
+    // After theta
+    let sub_pk = pk.clone();
+    let sub_advices = advices.clone();
+    let sub_instance = instance.clone();
+    let tuple_lookup_handler = thread::spawn(move || {
+        let pk = sub_pk;
+        let advices = sub_advices;
+        let instance = sub_instance;
+        let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
+
+        let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+        let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+        let instance_ref = &instance[0]
+            .instance_values
+            .iter()
+            .map(|x| &x[..])
+            .collect::<Vec<_>>()[..];
+
+        let mut tuple_lookups = tuple_lookups
+            .into_par_iter()
+            .map(|(i, (mut input, mut table, z))| {
+                let f = |expr: &[Expression<_>], target: &mut [_]| {
+                    evaluate_exprs(
+                        expr,
+                        size,
+                        rot_scale as i32,
+                        fixed_ref,
+                        advice_ref,
+                        instance_ref,
+                        theta,
+                        target,
+                    )
+                };
+
+                f(
+                    &pk.vk.cs.lookups[i].input_expressions[..],
+                    &mut input[0..unusable_rows_start],
+                );
+                f(
+                    &pk.vk.cs.lookups[i].table_expressions[..],
+                    &mut table[0..unusable_rows_start],
+                );
+                let (permuted_input, permuted_table) =
+                    handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
+                (i, (permuted_input, permuted_table, input, table, z))
+            })
+            .collect::<Vec<_>>();
+        end_timer!(timer);
+
+        tuple_lookups
+    });
+
+    let mut lookup_permuted_commitments = vec![C::identity(); pk.vk.cs.lookups.len() * 2];
+
+    let timer = start_timer!(|| format!(
+        "single lookup copy {} {}",
+        single_unit_lookups.len(),
+        single_comp_lookups.len()
+    ));
+    let single_unit_buffers = single_unit_lookups
+        .iter_mut()
+        .map(|x| {
+            // FIXME: handle error
+            let input_buf = device.alloc_device_buffer_from_slice(&x.1 .0[..])?;
+            let table_buf = device.alloc_device_buffer_from_slice(&x.1 .1[..])?;
+            Ok((x.0, input_buf, table_buf))
+        })
+        .collect::<DeviceResult<Vec<_>>>()?;
+
+    let single_comp_buffers = single_comp_lookups
+        .iter_mut()
+        .map(|x| {
+            // FIXME: handle error
+            let input_buf = device.alloc_device_buffer_from_slice(&x.1 .0[..])?;
+            let table_buf = device.alloc_device_buffer_from_slice(&x.1 .1[..])?;
+            Ok((x.0, input_buf, table_buf))
+        })
+        .collect::<DeviceResult<Vec<_>>>()?;
+    end_timer!(timer);
+
+    let timer = start_timer!(|| format!(
+        "single lookup msm {} {}",
+        single_unit_lookups.len(),
+        single_comp_lookups.len()
+    ));
+
+    for (i, permuted_input_buf, permuted_table_buf) in single_unit_buffers.iter() {
+        lookup_permuted_commitments[i * 2] =
+            msm(&device, &g_lagrange_buf, &permuted_input_buf, size)?;
+        lookup_permuted_commitments[i * 2 + 1] =
+            msm(&device, &g_lagrange_buf, &permuted_table_buf, size)?;
+    }
+
+    for (i, permuted_input_buf, permuted_table_buf) in single_comp_buffers.iter() {
+        lookup_permuted_commitments[i * 2] =
+            msm(&device, &g_lagrange_buf, &permuted_input_buf, size)?;
+        lookup_permuted_commitments[i * 2 + 1] =
+            msm(&device, &g_lagrange_buf, &permuted_table_buf, size)?;
+    }
+    end_timer!(timer);
+
+    let timer = start_timer!(|| "wait tuple lookup");
+    let mut tuple_lookups = tuple_lookup_handler.join().unwrap();
+    end_timer!(timer);
+
+    let timer = start_timer!(|| format!("tuple lookup msm {}", tuple_lookups.len(),));
+
+    for (i, (permuted_input, permuted_table, _, _, _)) in tuple_lookups.iter() {
+        let permuted_input_buf = device.alloc_device_buffer_from_slice(&permuted_input[..])?;
+        let permuted_table_buf = device.alloc_device_buffer_from_slice(&permuted_table[..])?;
+        lookup_permuted_commitments[i * 2] =
+            msm(&device, &g_lagrange_buf, &permuted_input_buf, size)?;
+        lookup_permuted_commitments[i * 2 + 1] =
+            msm(&device, &g_lagrange_buf, &permuted_table_buf, size)?;
+    }
+    end_timer!(timer);
+
+    for commitment in lookup_permuted_commitments {
+        transcript.write_point(commitment).unwrap();
+    }
+
+    let beta: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
+    println!("beta is {:?}", beta);
+    let gamma: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
+    println!("gamma is {:?}", gamma);
+
+    let mut lookups = vec![];
+    lookups.append(&mut single_unit_lookups);
+    lookups.append(&mut single_comp_lookups);
+    lookups.append(&mut tuple_lookups);
+    lookups.sort_by(|l, r| usize::cmp(&l.0, &r.0));
+
+    let timer = start_timer!(|| "generate lookup z");
+    lookups
+        .par_iter_mut()
+        .for_each(|(_, (permuted_input, permuted_table, z, input, table))| {
+            for ((z, permuted_input_value), permuted_table_value) in z
+                .iter_mut()
+                .zip(permuted_input.iter())
+                .zip(permuted_table.iter())
+            {
+                *z = (beta + permuted_input_value) * &(gamma + permuted_table_value);
+            }
+
+            z.batch_invert();
+
+            for ((z, input_value), table_value) in z.iter_mut().zip(input.iter()).zip(table.iter())
+            {
+                *z *= (beta + input_value) * &(gamma + table_value);
+            }
+
+            let mut tmp = C::ScalarExt::one();
+            for i in 0..unusable_rows_start {
+                std::mem::swap(&mut tmp, &mut z[i]);
+                tmp = tmp * z[i];
+            }
+        });
+    end_timer!(timer);
+
+    let timer = start_timer!(|| "prepare ntt");
+    let (omegas_buf, pq_buf) = ntt_prepare::<C::ScalarExt>(&device, k)?;
+    end_timer!(timer);
+
+    let timer = start_timer!(|| "lookup z msm and ntt");
+    let mut tmp_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
+    let mut z_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
+    for (_, (_, _, z, _, _)) in lookups.iter_mut() {
+        let timer = start_timer!(|| "prepare buf");
+        device.copy_from_host_to_device(&z_buf, &z[..])?;
+        end_timer!(timer);
+        let timer = start_timer!(|| "msm core");
+        let commitment = msm(&device, &g_lagrange_buf, &z_buf, size)?;
+        end_timer!(timer);
+        transcript.write_point(commitment).unwrap();
+        ntt(
+            &device,
+            &mut z_buf,
+            &mut tmp_buf,
+            &pq_buf,
+            &omegas_buf,
+            z,
+            k,
+        )?;
+    }
+    end_timer!(timer);
+
+    Ok(())
 }
