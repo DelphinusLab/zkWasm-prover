@@ -45,7 +45,7 @@ __global__ void _msm_core(
     int end = start + size_per_worker;
     end = end > n ? n : end;
 
-    __shared__ Bn254G1 thread_res[256];
+    __shared__ Bn254G1 thread_res[128];
 
     Bn254G1 buckets[256];
 

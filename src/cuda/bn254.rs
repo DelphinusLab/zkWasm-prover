@@ -37,8 +37,17 @@ pub fn msm<C: CurveAffine>(
     s_buf: &CudaDeviceBufRaw,
     len: usize,
 ) -> Result<C, Error> {
-    let msm_groups = 2;
-    let threads = 256;
+    msm_with_groups(device, p_buf, s_buf, len, 4)
+}
+
+pub fn msm_with_groups<C: CurveAffine>(
+    device: &CudaDevice,
+    p_buf: &CudaDeviceBufRaw,
+    s_buf: &CudaDeviceBufRaw,
+    len: usize,
+    msm_groups: usize,
+) -> Result<C, Error> {
+    let threads = 128;
     let windows = 32;
     let windows_bits = 8;
     let mut tmp = vec![C::Curve::identity(); msm_groups * windows];
@@ -554,8 +563,8 @@ mod test {
 
             let windows = 32;
             let windows_bits = 8;
-            let msm_groups = 2;
-            let threads = 256;
+            let msm_groups = 4;
+            let threads = 128;
             let mut tmp = vec![];
             for _ in 0..windows * msm_groups {
                 tmp.push(G1::group_zero());

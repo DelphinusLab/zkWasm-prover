@@ -7,12 +7,14 @@ use std::thread;
 use ark_std::end_timer;
 use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
+use halo2_proofs::arithmetic::BaseExt as _;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
 use halo2_proofs::pairing::group::ff::BatchInvert as _;
 use halo2_proofs::pairing::group::Group as _;
 use halo2_proofs::plonk::lookup;
+use halo2_proofs::plonk::Any;
 use halo2_proofs::plonk::Expression;
 use halo2_proofs::plonk::ProvingKey;
 use halo2_proofs::poly::commitment::Params;
@@ -24,8 +26,10 @@ use rayon::iter::IntoParallelIterator as _;
 use rayon::iter::IntoParallelRefIterator as _;
 use rayon::iter::IntoParallelRefMutIterator as _;
 use rayon::iter::ParallelIterator as _;
+use rayon::slice::ParallelSlice as _;
 
 use crate::cuda::bn254::msm;
+use crate::cuda::bn254::msm_with_groups;
 use crate::cuda::bn254::ntt;
 use crate::cuda::bn254::ntt_prepare;
 use crate::device::cuda::CudaDevice;
@@ -286,6 +290,7 @@ pub fn create_proof_from_advices<
     let rot_scale = 1 << (extended_k - k);
     let meta = &pk.vk.cs;
     let unusable_rows_start = params.n as usize - (meta.blinding_factors() + 1);
+    let omega = pk.get_vk().domain.get_omega();
 
     let timer = start_timer!(|| "create single instances");
     let instance =
@@ -632,15 +637,119 @@ pub fn create_proof_from_advices<
     let (omegas_buf, pq_buf) = ntt_prepare::<C::ScalarExt>(&device, k)?;
     end_timer!(timer);
 
+    let chunk_len = &pk.vk.cs.degree() - 2;
+
+    let timer = start_timer!(|| format!(
+        "product permutation {}",
+        (&pk).vk.cs.permutation.columns.chunks(chunk_len).len()
+    ));
+
+    let sub_pk = pk.clone();
+    let sub_advices = advices.clone();
+    let sub_instance = instance.clone();
+    let permutation_products_handler = thread::spawn(move || {
+        let pk = sub_pk;
+        let advices = sub_advices;
+        let instance = sub_instance;
+
+        let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+        let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+        let instance_ref = &instance[0]
+            .instance_values
+            .iter()
+            .map(|x| &x[..])
+            .collect::<Vec<_>>()[..];
+        (&pk)
+            .vk
+            .cs
+            .permutation
+            .columns
+            .par_chunks(chunk_len)
+            .zip((&pk).permutation.permutations.par_chunks(chunk_len))
+            .enumerate()
+            .map(|(i, (columns, permutations))| {
+                let mut delta_omega = C::Scalar::DELTA.pow_vartime([i as u64 * chunk_len as u64]);
+
+                let mut modified_values = Vec::new_in(HugePageAllocator);
+                modified_values.resize(size, C::ScalarExt::one());
+
+                // Iterate over each column of the permutation
+                for (&column, permuted_column_values) in columns.iter().zip(permutations.iter()) {
+                    let values = match column.column_type() {
+                        Any::Advice => advice_ref,
+                        Any::Fixed => fixed_ref,
+                        Any::Instance => instance_ref,
+                    };
+                    for i in 0..size as usize {
+                        modified_values[i] *= &(beta * permuted_column_values[i]
+                            + &gamma
+                            + values[column.index()][i]);
+                    }
+                }
+
+                // Invert to obtain the denominator for the permutation product polynomial
+                modified_values.iter_mut().batch_invert();
+
+                // Iterate over each column again, this time finishing the computation
+                // of the entire fraction by computing the numerators
+                for &column in columns.iter() {
+                    let values = match column.column_type() {
+                        Any::Advice => advice_ref,
+                        Any::Fixed => fixed_ref,
+                        Any::Instance => instance_ref,
+                    };
+                    for i in 0..size as usize {
+                        modified_values[i] *=
+                            &(delta_omega * &beta + &gamma + values[column.index()][i]);
+                        delta_omega *= &omega;
+                    }
+                    delta_omega *= &C::Scalar::DELTA;
+                }
+
+                let mut tmp = C::ScalarExt::one();
+                for i in 0..unusable_rows_start {
+                    std::mem::swap(&mut tmp, &mut modified_values[i]);
+                    tmp = tmp * modified_values[i];
+                }
+
+                modified_values
+            })
+            .collect::<Vec<_>>()
+    });
+    end_timer!(timer);
+
     let timer = start_timer!(|| "lookup z msm and ntt");
     let mut tmp_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
     let mut z_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
     for (_, (_, _, z, _, _)) in lookups.iter_mut() {
+        device.copy_from_host_to_device(&z_buf, &z[..])?;
+        let commitment = msm_with_groups(&device, &g_lagrange_buf, &z_buf, size, 1)?;
+        transcript.write_point(commitment).unwrap();
+        ntt(
+            &device,
+            &mut z_buf,
+            &mut tmp_buf,
+            &pq_buf,
+            &omegas_buf,
+            z,
+            k,
+        )?;
+    }
+    end_timer!(timer);
+
+    let timer = start_timer!(|| "wait permutation_products");
+    let mut permutation_products = permutation_products_handler.join().unwrap();
+    end_timer!(timer);
+
+    let timer = start_timer!(|| "permutation z msm and ntt");
+    let mut tmp_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
+    let mut z_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
+    for z in permutation_products.iter_mut() {
         let timer = start_timer!(|| "prepare buf");
         device.copy_from_host_to_device(&z_buf, &z[..])?;
         end_timer!(timer);
         let timer = start_timer!(|| "msm core");
-        let commitment = msm(&device, &g_lagrange_buf, &z_buf, size)?;
+        let commitment = msm_with_groups(&device, &g_lagrange_buf, &z_buf, size, 1)?;
         end_timer!(timer);
         transcript.write_point(commitment).unwrap();
         ntt(
