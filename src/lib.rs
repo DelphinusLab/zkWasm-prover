@@ -377,7 +377,7 @@ pub fn create_proof_from_advices<
             .collect::<Vec<_>>();
         end_timer!(timer);
 
-        let [mut single_unit_lookups, mut single_comp_lookups, mut tuple_lookups] =
+        let [single_unit_lookups, single_comp_lookups, tuple_lookups] =
             lookup_classify(&pk, lookups);
 
         let timer = start_timer!(|| format!("permute lookup unit {}", single_unit_lookups.len()));
@@ -470,7 +470,7 @@ pub fn create_proof_from_advices<
     println!("theta is {:?}", theta);
 
     let timer = start_timer!(|| "wait single lookups");
-    let (mut single_unit_lookups, mut single_comp_lookups, mut tuple_lookups) =
+    let (mut single_unit_lookups, mut single_comp_lookups, tuple_lookups) =
         lookup_handler.join().unwrap();
     end_timer!(timer);
 
@@ -492,7 +492,7 @@ pub fn create_proof_from_advices<
             .map(|x| &x[..])
             .collect::<Vec<_>>()[..];
 
-        let mut tuple_lookups = tuple_lookups
+        let tuple_lookups = tuple_lookups
             .into_par_iter()
             .map(|(i, (mut input, mut table, z))| {
                 let f = |expr: &[Expression<_>], target: &mut [_]| {
@@ -630,7 +630,18 @@ pub fn create_proof_from_advices<
                 std::mem::swap(&mut tmp, &mut z[i]);
                 tmp = tmp * z[i];
             }
+
+            if true {
+                for cell in &mut z[unusable_rows_start..] {
+                    *cell = C::Scalar::random(&mut OsRng);
+                }
+            }
         });
+
+    let mut lookups = lookups
+        .into_iter()
+        .map(|(_, (permuted_input, permuted_table, z, _, _))| (permuted_input, permuted_table, z))
+        .collect::<Vec<_>>();
     end_timer!(timer);
 
     let timer = start_timer!(|| "prepare ntt");
@@ -718,20 +729,42 @@ pub fn create_proof_from_advices<
     });
     end_timer!(timer);
 
-    let timer = start_timer!(|| "lookup z msm and ntt");
+    let timer = start_timer!(|| "lookup ntt and z msm");
     let mut tmp_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
-    let mut z_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
-    for (_, (_, _, z, _, _)) in lookups.iter_mut() {
-        device.copy_from_host_to_device(&z_buf, &z[..])?;
-        let commitment = msm_with_groups(&device, &g_lagrange_buf, &z_buf, size, 1)?;
+    let mut ntt_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
+    for (permuted_input, permuted_table, z) in lookups.iter_mut() {
+        device.copy_from_host_to_device(&ntt_buf, &z[..])?;
+        let commitment = msm_with_groups(&device, &g_lagrange_buf, &ntt_buf, size, 1)?;
         transcript.write_point(commitment).unwrap();
         ntt(
             &device,
-            &mut z_buf,
+            &mut ntt_buf,
             &mut tmp_buf,
             &pq_buf,
             &omegas_buf,
             z,
+            k,
+        )?;
+
+        device.copy_from_host_to_device(&ntt_buf, &permuted_input[..])?;
+        ntt(
+            &device,
+            &mut ntt_buf,
+            &mut tmp_buf,
+            &pq_buf,
+            &omegas_buf,
+            permuted_input,
+            k,
+        )?;
+
+        device.copy_from_host_to_device(&ntt_buf, &permuted_table[..])?;
+        ntt(
+            &device,
+            &mut ntt_buf,
+            &mut tmp_buf,
+            &pq_buf,
+            &omegas_buf,
+            permuted_table,
             k,
         )?;
     }
@@ -742,19 +775,13 @@ pub fn create_proof_from_advices<
     end_timer!(timer);
 
     let timer = start_timer!(|| "permutation z msm and ntt");
-    let mut tmp_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
-    let mut z_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
     for z in permutation_products.iter_mut() {
-        let timer = start_timer!(|| "prepare buf");
-        device.copy_from_host_to_device(&z_buf, &z[..])?;
-        end_timer!(timer);
-        let timer = start_timer!(|| "msm core");
-        let commitment = msm_with_groups(&device, &g_lagrange_buf, &z_buf, size, 1)?;
-        end_timer!(timer);
+        device.copy_from_host_to_device(&ntt_buf, &z[..])?;
+        let commitment = msm_with_groups(&device, &g_lagrange_buf, &ntt_buf, size, 1)?;
         transcript.write_point(commitment).unwrap();
         ntt(
             &device,
-            &mut z_buf,
+            &mut ntt_buf,
             &mut tmp_buf,
             &pq_buf,
             &omegas_buf,
