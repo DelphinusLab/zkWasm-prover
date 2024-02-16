@@ -1,6 +1,7 @@
 use crate::device::cuda::{to_result, CudaBuffer, CudaDevice, CudaDeviceBufRaw};
 use crate::device::Error;
 use crate::device::{Device, DeviceResult};
+use ark_std::{end_timer, start_timer};
 use halo2_proofs::arithmetic::{CurveAffine, FieldExt};
 use halo2_proofs::pairing::group::Curve;
 use halo2_proofs::pairing::group::Group;
@@ -220,6 +221,7 @@ pub fn ntt_raw(
 ) -> Result<(), Error> {
     let mut swap = false;
     unsafe {
+        device.acitve_ctx()?;
         let err = crate::cuda::bn254::cuda_c::ntt(
             s_buf.ptr(),
             tmp_buf.ptr(),

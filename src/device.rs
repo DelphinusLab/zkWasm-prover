@@ -23,7 +23,7 @@ pub trait Device<B: DeviceBuf>: Sized {
     }
 
     fn copy_from_host_to_device<T>(&self, dst: &B, src: &[T]) -> DeviceResult<()>;
-    fn copy_from_device_to_host<T>(&self, dst: &mut [T], dst: &B) -> DeviceResult<()>;
+    fn copy_from_device_to_host<T>(&self, dst: &mut [T], src: &B) -> DeviceResult<()>;
 
     fn synchronize(&self) -> DeviceResult<()>;
 

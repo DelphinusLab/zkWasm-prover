@@ -833,7 +833,7 @@ pub fn create_proof_from_advices<
 struct EvalHContext<F: FieldExt> {
     y: Vec<F>,
     unit_cache: Cache<CudaDeviceBufRaw>,
-    allocator: Vec<CudaDeviceBufRaw>,
+    allocator: Vec<Rc<CudaDeviceBufRaw>>,
     extended_k: usize,
     size: usize,
     extended_size: usize,
@@ -858,7 +858,7 @@ fn evaluate_h_gates<C: CurveAffine>(
     let size = 1 << pk.get_vk().domain.k();
     let extended_k = pk.get_vk().domain.extended_k() as usize;
     let extended_size = 1 << extended_k;
-    let mut allocator = vec![];
+    let allocator = vec![];
 
     let cache_size = 16;
     let mut unit_cache = Cache::new(cache_size);
@@ -871,7 +871,7 @@ fn evaluate_h_gates<C: CurveAffine>(
         pk.get_vk().domain.g_coset_inv,
     ])?;
     let mut ctx = EvalHContext {
-        y: vec![],
+        y: vec![C::ScalarExt::one(), y],
         unit_cache,
         allocator,
         extended_k,
@@ -893,7 +893,7 @@ fn evaluate_h_gates<C: CurveAffine>(
         advice,
         instance,
         &mut ctx,
-    );
+    )?;
     Ok(res)
 }
 
@@ -905,25 +905,31 @@ fn evaluate_prove_expr<F: FieldExt>(
     advice: &[&[F]],
     instance: &[&[F]],
     ctx: &mut EvalHContext<F>,
-) {
+) -> DeviceResult<()> {
+    let buf = _evaluate_prove_expr(device, expr, fixed, advice, instance, ctx)?;
+    device.copy_from_device_to_host(&mut res[..], &buf.0.unwrap().0)?;
+    //TODO: check rot and constant
+    Ok(())
 }
 
 fn do_extended_fft<F: FieldExt>(
     device: &CudaDevice,
     ctx: &mut EvalHContext<F>,
+    data: &[F],
 ) -> DeviceResult<CudaDeviceBufRaw> {
     let buf = ctx.allocator.pop();
     let mut buf = if buf.is_none() {
         device.alloc_device_buffer::<F>(ctx.extended_size)?
     } else {
-        buf.unwrap()
+        Rc::try_unwrap(buf.unwrap()).unwrap()
     };
     let tmp = ctx.allocator.pop();
     let mut tmp = if tmp.is_none() {
         device.alloc_device_buffer::<F>(ctx.extended_size)?
     } else {
-        tmp.unwrap()
+        Rc::try_unwrap(tmp.unwrap()).unwrap()
     };
+    device.copy_from_host_to_device(&buf, data)?;
     extended_prepare(
         device,
         &buf,
@@ -940,7 +946,7 @@ fn do_extended_fft<F: FieldExt>(
         &ctx.extended_omegas_buf,
         ctx.extended_k,
     )?;
-    ctx.allocator.push(tmp);
+    ctx.allocator.push(Rc::new(tmp));
 
     Ok(buf)
 }
@@ -979,11 +985,13 @@ fn _evaluate_prove_expr<F: FieldExt>(
                     } => (&instance[*column_index], rotation),
                 };
 
-                let buffer = do_extended_fft(device, ctx)?;
+                let timer = start_timer!(|| "do extended fft");
+                let buffer = do_extended_fft(device, ctx, origin_values)?;
+                end_timer!(timer);
 
                 let value = if cache_action == CacheAction::Cache {
                     ctx.unit_cache
-                        .update(group, buffer, |buffer| ctx.allocator.push(buffer))
+                        .update(group, buffer, |buffer| ctx.allocator.push(Rc::new(buffer)))
                 } else {
                     Rc::new(buffer)
                 };
@@ -1004,11 +1012,11 @@ fn _evaluate_prove_expr<F: FieldExt>(
                     } else if r_rot == 0 {
                         r_buf.clone()
                     } else {
-                        let mut buf = ctx.allocator.pop();
+                        let buf = ctx.allocator.pop();
                         if buf.is_none() {
-                            Rc::new(device.alloc_device_buffer::<F>(ctx.size)?)
+                            Rc::new(device.alloc_device_buffer::<F>(ctx.extended_size)?)
                         } else {
-                            Rc::new(buf.unwrap())
+                            buf.unwrap()
                         }
                     };
 
@@ -1026,16 +1034,16 @@ fn _evaluate_prove_expr<F: FieldExt>(
                         Some(&r_buf),
                         r_rot,
                         r_c,
-                        ctx.size,
+                        ctx.extended_size,
                         op,
                     )?;
 
                     if Rc::strong_count(&l_buf) == 1 {
-                        ctx.allocator.push(Rc::try_unwrap(l_buf).unwrap())
+                        ctx.allocator.push(l_buf)
                     }
 
                     if Rc::strong_count(&r_buf) == 1 {
-                        ctx.allocator.push(Rc::try_unwrap(r_buf).unwrap())
+                        ctx.allocator.push(r_buf)
                     }
 
                     Ok((Some((res, 0)), None))
@@ -1045,8 +1053,14 @@ fn _evaluate_prove_expr<F: FieldExt>(
                     Bop::Product => Ok((None, Some(l_c.unwrap() * r_c.unwrap()))),
                 },
                 (None, Some(b)) | (Some(b), None) => match op {
-                    Bop::Sum => Ok((Some(b), Some(l_c.unwrap() + r_c.unwrap()))),
-                    Bop::Product => Ok((Some(b), Some(l_c.unwrap() * r_c.unwrap()))),
+                    Bop::Sum => Ok((
+                        Some(b),
+                        Some(l_c.unwrap_or(F::zero()) + r_c.unwrap_or(F::zero())),
+                    )),
+                    Bop::Product => Ok((
+                        Some(b),
+                        Some(l_c.unwrap_or(F::one()) * r_c.unwrap_or(F::one())),
+                    )),
                 },
             }
         }
@@ -1076,11 +1090,11 @@ fn _evaluate_prove_expr<F: FieldExt>(
                     let res = if l_rot == 0 {
                         l_buf.clone()
                     } else {
-                        let mut buf = ctx.allocator.pop();
+                        let buf = ctx.allocator.pop();
                         if buf.is_none() {
-                            Rc::new(device.alloc_device_buffer::<F>(ctx.size)?)
+                            Rc::new(device.alloc_device_buffer::<F>(ctx.extended_size)?)
                         } else {
-                            Rc::new(buf.unwrap())
+                            buf.unwrap()
                         }
                     };
 
@@ -1093,12 +1107,12 @@ fn _evaluate_prove_expr<F: FieldExt>(
                         None,
                         0,
                         Some(c),
-                        ctx.size,
+                        ctx.extended_size,
                         FieldOp::Mul,
                     )?;
 
                     if Rc::strong_count(&l_buf) == 1 {
-                        ctx.allocator.push(Rc::try_unwrap(l_buf).unwrap());
+                        ctx.allocator.push(l_buf);
                     }
 
                     Ok((Some((res, 0)), None))
