@@ -1,12 +1,13 @@
 use core::cell::RefCell;
 use core::mem;
+use halo2_proofs::{arithmetic::FieldExt, plonk::evaluation_gpu::ProveExpression};
 use std::ffi::c_void;
 use std::mem::size_of;
 
 use cuda_runtime_sys::cudaError;
 
 use super::{Device, DeviceBuf, Error};
-use crate::device::DeviceResult;
+use crate::{cache::Cache, device::DeviceResult};
 
 thread_local! {
     static ACITVE_CUDA_DEVICE: RefCell<i32> = RefCell::new(-1);
@@ -28,7 +29,7 @@ impl Drop for CudaDevice {
 }
 
 impl CudaDevice {
-    fn acitve_ctx(&self) -> DeviceResult<()> {
+    pub(crate) fn acitve_ctx(&self) -> DeviceResult<()> {
         ACITVE_CUDA_DEVICE.with(|x| {
             if *x.borrow() != self.device {
                 *x.borrow_mut() = self.device
@@ -69,6 +70,7 @@ impl CudaBuffer for CudaDeviceBufRaw {
     }
 }
 
+#[derive(Debug)]
 pub struct CudaDeviceBufRaw {
     ptr: *mut c_void,
     device: CudaDevice,
@@ -113,7 +115,10 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
         unsafe {
             let res = cuda_runtime_sys::cudaMalloc(&mut ptr, size * mem::size_of::<T>());
             to_result(
-                CudaDeviceBufRaw { ptr, device: self.clone() },
+                CudaDeviceBufRaw {
+                    ptr,
+                    device: self.clone(),
+                },
                 res,
                 "fail to alloc device memory",
             )
@@ -175,6 +180,23 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
         unsafe {
             let res = cuda_runtime_sys::cudaHostUnregister(dst.as_mut_ptr() as *mut _);
             to_result((), res, "fail to synchronize")
+        }
+    }
+}
+
+pub(crate) fn gen_cache_policy<F: FieldExt, T>(
+    expr: &ProveExpression<F>,
+    unit_cache: &mut Cache<T>,
+) {
+    match expr {
+        ProveExpression::Unit(u) => unit_cache.access(u.get_group()),
+        ProveExpression::Op(l, r, _) => {
+            gen_cache_policy(l, unit_cache);
+            gen_cache_policy(r, unit_cache);
+        }
+        ProveExpression::Y(_) => {}
+        ProveExpression::Scale(l, _) => {
+            gen_cache_policy(l, unit_cache);
         }
     }
 }

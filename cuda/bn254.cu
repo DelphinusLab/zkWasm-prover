@@ -175,8 +175,121 @@ __global__ void _ntt_core(
     }
 }
 
+__global__ void _field_op(
+    Bn254FrField *res,
+    Bn254FrField *l,
+    int l_rot,
+    Bn254FrField *l_c,
+    Bn254FrField *r,
+    int r_rot,
+    Bn254FrField *r_c,
+    int n,
+    int op)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int worker = blockDim.x * gridDim.x;
+    int size_per_worker = (n + worker - 1) / worker;
+    int start = gid * size_per_worker;
+    int end = start + size_per_worker;
+    end = end > n ? n : end;
+
+    Bn254FrField fl(0), fr(0);
+
+    for (int i = start; i < end; i++)
+    {
+        if (l)
+            fl += l[(i + l_rot) & (n - 1)];
+
+        if (l_c)
+            fl += l_c[0];
+
+        if (r)
+            fr += r[(i + r_rot) & (n - 1)];
+
+        if (r_c)
+            fr += r_c[0];
+
+        // add
+        if (op == 0)
+        {
+            res[i] = fl + fr;
+
+            // mul
+        }
+        else if (op == 1)
+        {
+            res[i] = fl * fr;
+            // neg
+        }
+        else if (op == 2)
+        {
+            res[i] = -fl;
+        }
+        else
+        {
+            assert(0);
+        }
+    }
+}
+
+__global__ void _extended_prepare(
+    Bn254FrField *s,
+    Bn254FrField *coset_powers,
+    uint coset_powers_n,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int worker = blockDim.x * gridDim.x;
+    int size_per_worker = (n + worker - 1) / worker;
+    int start = gid * size_per_worker;
+    int end = start + size_per_worker;
+    end = end > n ? n : end;
+
+    for (int i = start; i < end; i++)
+    {
+        int index = i % coset_powers_n;
+        if (index != 0)
+        {
+            s[i] = s[i] * coset_powers[index];
+        }
+    }
+}
+
 extern "C"
 {
+    cudaError_t extended_prepare(
+        Bn254FrField *s,
+        Bn254FrField *coset_powers,
+        uint coset_powers_n,
+        int size,
+        int extended_size)
+    {
+        int threads = size >= 128 ? 128 : 1;
+        int blocks = size / threads;
+        blocks = blocks > 32 ? 32 : blocks;
+        _extended_prepare<<<blocks, threads>>>(s, coset_powers, coset_powers_n, extended_size);
+        cudaMemset(&s[size], 0, (extended_size - size) * sizeof(Bn254FrField));
+        return cudaGetLastError();
+    }
+
+    cudaError_t field_op(
+        Bn254FrField *res,
+        Bn254FrField *l,
+        int l_rot,
+        Bn254FrField *l_c,
+        Bn254FrField *r,
+        int r_rot,
+        Bn254FrField *r_c,
+        int n,
+        int op)
+    {
+        int threads = n >= 128 ? 128 : 1;
+        int blocks = n / threads;
+        blocks = blocks > 32 ? 32 : blocks;
+        _field_op<<<blocks, threads>>>(res, l, l_rot, l_c, r, r_rot, r_c, n, op);
+        return cudaGetLastError();
+    }
+
     cudaError_t ntt(
         Bn254FrField *buf,
         Bn254FrField *tmp,

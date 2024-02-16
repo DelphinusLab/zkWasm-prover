@@ -1,18 +1,28 @@
 #![feature(allocator_api)]
 #![feature(get_mut_unchecked)]
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
 
 use ark_std::end_timer;
 use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
+use cache::Cache;
+use cache::CacheAction;
+use cuda::bn254::extended_prepare;
+use cuda::bn254::field_op;
+use cuda::bn254::FieldOp;
+use device::cuda::CudaDeviceBufRaw;
 use halo2_proofs::arithmetic::BaseExt as _;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
 use halo2_proofs::pairing::group::ff::BatchInvert as _;
 use halo2_proofs::pairing::group::Group as _;
+use halo2_proofs::plonk::evaluation_gpu::Bop;
+use halo2_proofs::plonk::evaluation_gpu::ProveExpression;
+use halo2_proofs::plonk::evaluation_gpu::ProveExpressionUnit;
 use halo2_proofs::plonk::lookup;
 use halo2_proofs::plonk::Any;
 use halo2_proofs::plonk::Expression;
@@ -32,16 +42,15 @@ use crate::cuda::bn254::msm;
 use crate::cuda::bn254::msm_with_groups;
 use crate::cuda::bn254::ntt;
 use crate::cuda::bn254::ntt_prepare;
+use crate::cuda::bn254::ntt_raw;
 use crate::device::cuda::CudaDevice;
 use crate::device::Device as _;
 use crate::device::DeviceResult;
 
+mod cache;
 pub mod cuda;
 pub mod device;
 mod hugetlb;
-
-#[macro_use]
-extern crate lazy_static;
 
 pub fn prepare_advice_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
@@ -790,6 +799,312 @@ pub fn create_proof_from_advices<
         )?;
     }
     end_timer!(timer);
+    let vanishing =
+        halo2_proofs::plonk::vanishing::Argument::commit(params, &pk.vk.domain, OsRng, transcript)
+            .unwrap();
+
+    let y: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
+    println!("y is {:?}", y);
+
+    let timer = start_timer!(|| "h_poly");
+    let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+    let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+    let instance_ref = &instance[0]
+        .instance_values
+        .iter()
+        .map(|x| &x[..])
+        .collect::<Vec<_>>()[..];
+    let h_poly = evaluate_h_gates(
+        &device,
+        &pk,
+        fixed_ref,
+        advice_ref,
+        instance_ref,
+        y,
+        beta,
+        gamma,
+        theta,
+    );
+    end_timer!(timer);
 
     Ok(())
+}
+
+struct EvalHContext<F: FieldExt> {
+    y: Vec<F>,
+    unit_cache: Cache<CudaDeviceBufRaw>,
+    allocator: Vec<CudaDeviceBufRaw>,
+    extended_k: usize,
+    size: usize,
+    extended_size: usize,
+    rot_scale: i32,
+    extended_omegas_buf: CudaDeviceBufRaw,
+    extended_pq_buf: CudaDeviceBufRaw,
+    coset_powers_buf: CudaDeviceBufRaw,
+}
+
+fn evaluate_h_gates<C: CurveAffine>(
+    device: &CudaDevice,
+    pk: &ProvingKey<C>,
+    fixed: &[&[C::ScalarExt]],
+    advice: &[&[C::ScalarExt]],
+    instance: &[&[C::ScalarExt]],
+    y: C::ScalarExt,
+    beta: C::ScalarExt,
+    gamma: C::ScalarExt,
+    theta: C::ScalarExt,
+) -> DeviceResult<Vec<C::ScalarExt, HugePageAllocator>> {
+    let k = pk.get_vk().domain.k() as usize;
+    let size = 1 << pk.get_vk().domain.k();
+    let extended_k = pk.get_vk().domain.extended_k() as usize;
+    let extended_size = 1 << extended_k;
+    let mut allocator = vec![];
+
+    let cache_size = 16;
+    let mut unit_cache = Cache::new(cache_size);
+    crate::device::cuda::gen_cache_policy(&pk.ev.gpu_gates_expr[0], &mut unit_cache);
+    unit_cache.analyze();
+
+    let (extended_omegas_buf, extended_pq_buf) = ntt_prepare::<C::ScalarExt>(device, extended_k)?;
+    let coset_powers_buf = device.alloc_device_buffer_from_slice(&[
+        pk.get_vk().domain.g_coset,
+        pk.get_vk().domain.g_coset_inv,
+    ])?;
+    let mut ctx = EvalHContext {
+        y: vec![],
+        unit_cache,
+        allocator,
+        extended_k,
+        size,
+        extended_size,
+        rot_scale: 1 << (extended_k - k),
+        extended_omegas_buf,
+        extended_pq_buf,
+        coset_powers_buf,
+    };
+
+    let mut res = Vec::new_in(HugePageAllocator);
+    res.resize(extended_size, C::ScalarExt::zero());
+    evaluate_prove_expr(
+        device,
+        &mut res,
+        &pk.ev.gpu_gates_expr[0],
+        fixed,
+        advice,
+        instance,
+        &mut ctx,
+    );
+    Ok(res)
+}
+
+fn evaluate_prove_expr<F: FieldExt>(
+    device: &CudaDevice,
+    res: &mut Vec<F, HugePageAllocator>,
+    expr: &ProveExpression<F>,
+    fixed: &[&[F]],
+    advice: &[&[F]],
+    instance: &[&[F]],
+    ctx: &mut EvalHContext<F>,
+) {
+}
+
+fn do_extended_fft<F: FieldExt>(
+    device: &CudaDevice,
+    ctx: &mut EvalHContext<F>,
+) -> DeviceResult<CudaDeviceBufRaw> {
+    let buf = ctx.allocator.pop();
+    let mut buf = if buf.is_none() {
+        device.alloc_device_buffer::<F>(ctx.extended_size)?
+    } else {
+        buf.unwrap()
+    };
+    let tmp = ctx.allocator.pop();
+    let mut tmp = if tmp.is_none() {
+        device.alloc_device_buffer::<F>(ctx.extended_size)?
+    } else {
+        tmp.unwrap()
+    };
+    extended_prepare(
+        device,
+        &buf,
+        &ctx.coset_powers_buf,
+        2,
+        ctx.size,
+        ctx.extended_size,
+    )?;
+    ntt_raw(
+        device,
+        &mut buf,
+        &mut tmp,
+        &ctx.extended_pq_buf,
+        &ctx.extended_omegas_buf,
+        ctx.extended_k,
+    )?;
+    ctx.allocator.push(tmp);
+
+    Ok(buf)
+}
+
+fn _evaluate_prove_expr<F: FieldExt>(
+    device: &CudaDevice,
+    expr: &ProveExpression<F>,
+    fixed: &[&[F]],
+    advice: &[&[F]],
+    instance: &[&[F]],
+    ctx: &mut EvalHContext<F>,
+) -> DeviceResult<(Option<(Rc<CudaDeviceBufRaw>, i32)>, Option<F>)> {
+    match expr {
+        ProveExpression::Unit(u) => {
+            let group = u.get_group();
+            let (cache, cache_action) = ctx.unit_cache.get(group);
+            let (values, rotation) = if let Some(cached_values) = cache {
+                match u {
+                    ProveExpressionUnit::Fixed { rotation, .. }
+                    | ProveExpressionUnit::Advice { rotation, .. }
+                    | ProveExpressionUnit::Instance { rotation, .. } => (cached_values, *rotation),
+                }
+            } else {
+                let (origin_values, rotation) = match u {
+                    ProveExpressionUnit::Fixed {
+                        column_index,
+                        rotation,
+                    } => (&fixed[*column_index], rotation),
+                    ProveExpressionUnit::Advice {
+                        column_index,
+                        rotation,
+                    } => (&advice[*column_index], rotation),
+                    ProveExpressionUnit::Instance {
+                        column_index,
+                        rotation,
+                    } => (&instance[*column_index], rotation),
+                };
+
+                let buffer = do_extended_fft(device, ctx)?;
+
+                let value = if cache_action == CacheAction::Cache {
+                    ctx.unit_cache
+                        .update(group, buffer, |buffer| ctx.allocator.push(buffer))
+                } else {
+                    Rc::new(buffer)
+                };
+
+                let res = (value, *rotation);
+                res
+            };
+            Ok((Some((values, rotation.0 * ctx.rot_scale)), None))
+        }
+        ProveExpression::Op(l, r, op) => {
+            let (l, l_c) = _evaluate_prove_expr(device, l, fixed, advice, instance, ctx)?;
+            let (r, r_c) = _evaluate_prove_expr(device, r, fixed, advice, instance, ctx)?;
+
+            match (l, r) {
+                (Some((l_buf, l_rot)), Some((r_buf, r_rot))) => {
+                    let res = if l_rot == 0 {
+                        l_buf.clone()
+                    } else if r_rot == 0 {
+                        r_buf.clone()
+                    } else {
+                        let mut buf = ctx.allocator.pop();
+                        if buf.is_none() {
+                            Rc::new(device.alloc_device_buffer::<F>(ctx.size)?)
+                        } else {
+                            Rc::new(buf.unwrap())
+                        }
+                    };
+
+                    let op = match op {
+                        Bop::Sum => FieldOp::Sum,
+                        Bop::Product => FieldOp::Mul,
+                    };
+
+                    field_op(
+                        device,
+                        &res,
+                        Some(&l_buf),
+                        l_rot,
+                        l_c,
+                        Some(&r_buf),
+                        r_rot,
+                        r_c,
+                        ctx.size,
+                        op,
+                    )?;
+
+                    if Rc::strong_count(&l_buf) == 1 {
+                        ctx.allocator.push(Rc::try_unwrap(l_buf).unwrap())
+                    }
+
+                    if Rc::strong_count(&r_buf) == 1 {
+                        ctx.allocator.push(Rc::try_unwrap(r_buf).unwrap())
+                    }
+
+                    Ok((Some((res, 0)), None))
+                }
+                (None, None) => match op {
+                    Bop::Sum => Ok((None, Some(l_c.unwrap() + r_c.unwrap()))),
+                    Bop::Product => Ok((None, Some(l_c.unwrap() * r_c.unwrap()))),
+                },
+                (None, Some(b)) | (Some(b), None) => match op {
+                    Bop::Sum => Ok((Some(b), Some(l_c.unwrap() + r_c.unwrap()))),
+                    Bop::Product => Ok((Some(b), Some(l_c.unwrap() * r_c.unwrap()))),
+                },
+            }
+        }
+        ProveExpression::Y(ys) => {
+            let max_y_order = *ys.keys().max().unwrap();
+            for _ in (ctx.y.len() as u32)..=max_y_order {
+                ctx.y.push(ctx.y[1] * ctx.y.last().unwrap());
+            }
+            let c = ys.iter().fold(F::zero(), |acc, (y_order, f)| {
+                acc + ctx.y[*y_order as usize] * f
+            });
+            Ok((None, Some(c)))
+        }
+        ProveExpression::Scale(l, ys) => {
+            let max_y_order = *ys.keys().max().unwrap();
+            for _ in (ctx.y.len() as u32)..=max_y_order {
+                ctx.y.push(ctx.y[1] * ctx.y.last().unwrap());
+            }
+            let c = ys.iter().fold(F::zero(), |acc, (y_order, f)| {
+                acc + ctx.y[*y_order as usize] * f
+            });
+
+            let (l, l_c) = _evaluate_prove_expr(device, l, fixed, advice, instance, ctx)?;
+
+            match l {
+                Some((l_buf, l_rot)) => {
+                    let res = if l_rot == 0 {
+                        l_buf.clone()
+                    } else {
+                        let mut buf = ctx.allocator.pop();
+                        if buf.is_none() {
+                            Rc::new(device.alloc_device_buffer::<F>(ctx.size)?)
+                        } else {
+                            Rc::new(buf.unwrap())
+                        }
+                    };
+
+                    field_op(
+                        device,
+                        &res,
+                        Some(&l_buf),
+                        l_rot,
+                        l_c,
+                        None,
+                        0,
+                        Some(c),
+                        ctx.size,
+                        FieldOp::Mul,
+                    )?;
+
+                    if Rc::strong_count(&l_buf) == 1 {
+                        ctx.allocator.push(Rc::try_unwrap(l_buf).unwrap());
+                    }
+
+                    Ok((Some((res, 0)), None))
+                }
+                None => Ok((None, Some(l_c.unwrap() * c))),
+            }
+        }
+    }
 }

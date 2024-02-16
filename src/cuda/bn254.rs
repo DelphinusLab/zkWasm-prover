@@ -28,6 +28,98 @@ mod cuda_c {
             max_deg: i32,
             swap: *mut c_void,
         ) -> cudaError;
+
+        pub fn field_op(
+            res: *mut c_void,
+            l: *mut c_void,
+            l_rot: i32,
+            l_c: *mut c_void,
+            r: *mut c_void,
+            r_rot: i32,
+            r_c: *mut c_void,
+            size: i32,
+            op: i32,
+        ) -> cudaError;
+
+        pub fn extended_prepare(
+            s: *mut c_void,
+            coset_powers: *mut c_void,
+            coset_powers_n: i32,
+            size: i32,
+            extended_size: i32,
+        ) -> cudaError;
+    }
+}
+
+pub(crate) fn extended_prepare(
+    device: &CudaDevice,
+    s: &CudaDeviceBufRaw,
+    coset_powers: &CudaDeviceBufRaw,
+    coset_powers_n: usize,
+    size: usize,
+    extended_size: usize,
+) -> Result<(), Error> {
+    unsafe {
+        device.acitve_ctx()?;
+        let err = cuda_c::extended_prepare(
+            s.ptr(),
+            coset_powers.ptr(),
+            coset_powers_n as i32,
+            size as i32,
+            extended_size as i32,
+        );
+        to_result((), err, "fail to run extended_prepare")?;
+        Ok(())
+    }
+}
+
+pub(crate) enum FieldOp {
+    Sum = 0,
+    Mul = 1,
+    Neg = 2,
+}
+
+pub(crate) fn field_op<F: FieldExt>(
+    device: &CudaDevice,
+    res: &CudaDeviceBufRaw,
+    l: Option<&CudaDeviceBufRaw>,
+    l_rot: i32,
+    l_c: Option<F>,
+    r: Option<&CudaDeviceBufRaw>,
+    r_rot: i32,
+    r_c: Option<F>,
+    size: usize,
+    op: FieldOp,
+) -> Result<(), Error> {
+    let l_c = if l_c.is_none() {
+        0usize as *mut _
+    } else {
+        device
+            .alloc_device_buffer_from_slice([l_c.unwrap()].as_slice())?
+            .ptr()
+    };
+    let r_c = if r_c.is_none() {
+        0usize as *mut _
+    } else {
+        device
+            .alloc_device_buffer_from_slice([r_c.unwrap()].as_slice())?
+            .ptr()
+    };
+    unsafe {
+        device.acitve_ctx()?;
+        let err = cuda_c::field_op(
+            res.ptr(),
+            l.map_or(0usize as *mut _, |x| x.ptr()),
+            l_rot,
+            l_c,
+            r.map_or(0usize as *mut _, |x| x.ptr()),
+            r_rot,
+            r_c,
+            size as i32,
+            op as i32,
+        );
+        to_result((), err, "fail to run field_op")?;
+        Ok(())
     }
 }
 
@@ -53,6 +145,7 @@ pub fn msm_with_groups<C: CurveAffine>(
     let mut tmp = vec![C::Curve::identity(); msm_groups * windows];
     let res_buf = device.alloc_device_buffer_from_slice(&tmp[..])?;
     unsafe {
+        device.acitve_ctx()?;
         let err = cuda_c::msm(
             msm_groups as i32,
             threads,
@@ -117,13 +210,12 @@ pub fn ntt_prepare<F: FieldExt>(
     Ok((omegas_buf, pq_buf))
 }
 
-pub fn ntt<F: FieldExt>(
+pub fn ntt_raw(
     device: &CudaDevice,
     s_buf: &mut CudaDeviceBufRaw,
     tmp_buf: &mut CudaDeviceBufRaw,
     pq_buf: &CudaDeviceBufRaw,
     omegas_buf: &CudaDeviceBufRaw,
-    result: &mut [F],
     len_log: usize,
 ) -> Result<(), Error> {
     let mut swap = false;
@@ -142,6 +234,19 @@ pub fn ntt<F: FieldExt>(
     if swap {
         std::mem::swap(s_buf, tmp_buf);
     }
+    Ok(())
+}
+
+pub fn ntt<F: FieldExt>(
+    device: &CudaDevice,
+    s_buf: &mut CudaDeviceBufRaw,
+    tmp_buf: &mut CudaDeviceBufRaw,
+    pq_buf: &CudaDeviceBufRaw,
+    omegas_buf: &CudaDeviceBufRaw,
+    result: &mut [F],
+    len_log: usize,
+) -> Result<(), Error> {
+    ntt_raw(device, s_buf, tmp_buf, pq_buf, omegas_buf, len_log)?;
     device.copy_from_device_to_host(result, s_buf)?;
     Ok(())
 }
@@ -154,7 +259,6 @@ mod test {
 
     use crate::device::cuda::{to_result, CudaBuffer as _, CudaDevice};
     use crate::device::{Device, DeviceBuf};
-    use crate::hugetlb::HUGE_PAGE_ALLOCATOR;
     use ark_std::rand::rngs::OsRng;
     use ark_std::{end_timer, start_timer};
     use cuda_runtime_sys::cudaError;
