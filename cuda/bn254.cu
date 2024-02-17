@@ -255,8 +255,53 @@ __global__ void _extended_prepare(
     }
 }
 
+__global__ void _field_sum(
+    Bn254FrField *res,
+    Bn254FrField **v,
+    int v_len,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int worker = blockDim.x * gridDim.x;
+    int size_per_worker = (n + worker - 1) / worker;
+    int start = gid * size_per_worker;
+    int end = start + size_per_worker;
+    end = end > n ? n : end;
+
+    __shared__ Bn254FrField value[256];
+
+    for (int i = gid; i < n; i += size_per_worker)
+    {
+        Bn254FrField tmp = v[0][i];
+
+        /*
+        for (int j = 1; j < v_len; j++)
+        {
+            tmp += v[j][i];
+        }
+        */
+       value[threadIdx.x * 2] = res[i];
+       value[threadIdx.x * 2 + 1] = v[0][i];
+       value[threadIdx.x * 2] += value[threadIdx.x * 2 + 1];
+    //res[i] = value[threadIdx.x * 2];
+    }
+}
+
 extern "C"
 {
+    cudaError_t field_sum(
+        Bn254FrField *res,
+        Bn254FrField **v,
+        int v_len,
+        int n)
+    {
+        int threads = n >= 128 ? 128 : 1;
+        int blocks = n / threads;
+        blocks = blocks > 32 ? 32 : blocks;
+        _field_sum<<<blocks, threads>>>(res, v, v_len, n);
+        return cudaGetLastError();
+    }
+
     cudaError_t extended_prepare(
         Bn254FrField *s,
         Bn254FrField *coset_powers,

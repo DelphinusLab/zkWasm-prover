@@ -2,7 +2,7 @@ use crate::device::cuda::{to_result, CudaBuffer, CudaDevice, CudaDeviceBufRaw};
 use crate::device::Error;
 use crate::device::{Device, DeviceResult};
 use ark_std::{end_timer, start_timer};
-use halo2_proofs::arithmetic::{CurveAffine, FieldExt};
+use halo2_proofs::arithmetic::{BaseExt, CurveAffine, FieldExt};
 use halo2_proofs::pairing::group::Curve;
 use halo2_proofs::pairing::group::Group;
 
@@ -49,6 +49,61 @@ mod cuda_c {
             size: i32,
             extended_size: i32,
         ) -> cudaError;
+
+        pub fn field_sum(res: *mut c_void, v: *mut c_void, v_len: i32, size: i32) -> cudaError;
+    }
+}
+
+pub(crate) fn field_sum(
+    device: &CudaDevice,
+    res_buf: &CudaDeviceBufRaw,
+    v: &[&CudaDeviceBufRaw],
+    size: usize,
+) -> Result<(), Error> {
+    unsafe {
+        device.acitve_ctx()?;
+        let v_ = v.iter().map(|x| x.ptr()).collect::<Vec<_>>();
+        let v_buf = device.alloc_device_buffer_from_slice(&v_[..]).unwrap();
+        let err = cuda_c::field_sum(res_buf.ptr(), v_buf.ptr(), v.len() as i32, size as i32);
+        to_result((), err, "fail to run field_sum")?;
+        Ok(())
+    }
+}
+
+#[test]
+fn bench_field_sum() {
+    use halo2_proofs::pairing::bn256::Fr;
+    let len = 1 << 22;
+    let mut res = vec![];
+
+    let mut v1 = vec![];
+    let mut v2 = vec![];
+    let mut v3 = vec![];
+
+    let mut r = Fr::rand();
+
+    for i in 0..len {
+        v1.push(r);
+        r += Fr::one();
+        v2.push(r);
+        r += Fr::one();
+        v3.push(r);
+        r += Fr::one();
+        res.push(r);
+        r += Fr::one();
+    }
+
+    let device = CudaDevice::get_device(0).unwrap();
+    let res_buf = device.alloc_device_buffer_from_slice(&res[..]).unwrap();
+    let v1_buf = device.alloc_device_buffer_from_slice(&v1[..]).unwrap();
+    let v2_buf = device.alloc_device_buffer_from_slice(&v2[..]).unwrap();
+    let v3_buf = device.alloc_device_buffer_from_slice(&v3[..]).unwrap();
+
+    for _ in 0..3 {
+        let timer = start_timer!(|| format!("field sum {:?}", 3));
+        field_sum(&device, &res_buf, &vec![&v1_buf, &v2_buf][..], len).unwrap();
+        device.synchronize();
+        end_timer!(timer);
     }
 }
 
@@ -74,6 +129,7 @@ pub(crate) fn extended_prepare(
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub(crate) enum FieldOp {
     Sum = 0,
     Mul = 1,
@@ -120,8 +176,9 @@ pub(crate) fn field_op<F: FieldExt>(
             op as i32,
         );
         to_result((), err, "fail to run field_op")?;
-        Ok(())
     }
+    device.synchronize()?;
+    Ok(())
 }
 
 pub fn msm<C: CurveAffine>(

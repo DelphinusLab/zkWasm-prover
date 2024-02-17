@@ -1,3 +1,4 @@
+use ark_std::{end_timer, start_timer};
 use core::cell::RefCell;
 use core::mem;
 use halo2_proofs::{arithmetic::FieldExt, plonk::evaluation_gpu::ProveExpression};
@@ -128,11 +129,12 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
     fn copy_from_host_to_device<T>(&self, dst: &CudaDeviceBufRaw, src: &[T]) -> DeviceResult<()> {
         self.acitve_ctx()?;
         unsafe {
-            let res = cuda_runtime_sys::cudaMemcpy(
+            let res = cuda_runtime_sys::cudaMemcpyAsync(
                 dst.ptr(),
                 src.as_ptr() as _,
                 src.len() * mem::size_of::<T>(),
                 cuda_runtime_sys::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                0usize as *mut _,
             );
             to_result((), res, "fail to copy memory from host to device")
         }
@@ -152,6 +154,26 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
                 cuda_runtime_sys::cudaMemcpyKind::cudaMemcpyDeviceToHost,
             );
             to_result((), res, "fail to copy memory from device to host")
+        }
+    }
+
+    fn copy_from_device_to_device<T>(
+        &self,
+        dst: &CudaDeviceBufRaw,
+        dst_offset: usize,
+        src: &CudaDeviceBufRaw,
+        src_offset: usize,
+        len: usize,
+    ) -> DeviceResult<()> {
+        self.acitve_ctx()?;
+        unsafe {
+            let res = cuda_runtime_sys::cudaMemcpy(
+                (dst.ptr()).offset((dst_offset * mem::size_of::<T>()) as isize),
+                (src.ptr()).offset((src_offset * mem::size_of::<T>()) as isize),
+                len * mem::size_of::<T>(),
+                cuda_runtime_sys::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+            );
+            to_result((), res, "fail to copy memory from device to device")
         }
     }
 

@@ -389,7 +389,7 @@ pub fn create_proof_from_advices<
         let [single_unit_lookups, single_comp_lookups, tuple_lookups] =
             lookup_classify(&pk, lookups);
 
-        let timer = start_timer!(|| format!("permute lookup unit {}", single_unit_lookups.len()));
+        //let timer = start_timer!(|| format!("permute lookup unit {}", single_unit_lookups.len()));
         let single_unit_lookups = single_unit_lookups
             .into_par_iter()
             .map(|(i, (mut input, mut table, z))| {
@@ -423,7 +423,7 @@ pub fn create_proof_from_advices<
                 (i, (permuted_input, permuted_table, input, table, z))
             })
             .collect::<Vec<_>>();
-        end_timer!(timer);
+        //end_timer!(timer);
 
         let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
         let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
@@ -491,7 +491,7 @@ pub fn create_proof_from_advices<
         let pk = sub_pk;
         let advices = sub_advices;
         let instance = sub_instance;
-        let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
+        //let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
 
         let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
         let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
@@ -530,7 +530,7 @@ pub fn create_proof_from_advices<
                 (i, (permuted_input, permuted_table, input, table, z))
             })
             .collect::<Vec<_>>();
-        end_timer!(timer);
+        //end_timer!(timer);
 
         tuple_lookups
     });
@@ -834,6 +834,7 @@ struct EvalHContext<F: FieldExt> {
     y: Vec<F>,
     unit_cache: Cache<CudaDeviceBufRaw>,
     allocator: Vec<Rc<CudaDeviceBufRaw>>,
+    extended_allocator: Vec<Rc<CudaDeviceBufRaw>>,
     extended_k: usize,
     size: usize,
     extended_size: usize,
@@ -858,7 +859,6 @@ fn evaluate_h_gates<C: CurveAffine>(
     let size = 1 << pk.get_vk().domain.k();
     let extended_k = pk.get_vk().domain.extended_k() as usize;
     let extended_size = 1 << extended_k;
-    let allocator = vec![];
 
     let cache_size = 16;
     let mut unit_cache = Cache::new(cache_size);
@@ -873,7 +873,8 @@ fn evaluate_h_gates<C: CurveAffine>(
     let mut ctx = EvalHContext {
         y: vec![C::ScalarExt::one(), y],
         unit_cache,
-        allocator,
+        allocator: vec![],
+        extended_allocator: vec![],
         extended_k,
         size,
         extended_size,
@@ -885,16 +886,230 @@ fn evaluate_h_gates<C: CurveAffine>(
 
     let mut res = Vec::new_in(HugePageAllocator);
     res.resize(extended_size, C::ScalarExt::zero());
-    evaluate_prove_expr(
+
+    let timer = start_timer!(|| "prepare buffer");
+    let fixed_buf = fixed
+        .iter()
+        .map(|x| device.alloc_device_buffer_from_slice(x))
+        .collect::<Result<Vec<_>, _>>()?;
+    let advice_buf = advice
+        .iter()
+        .map(|x| device.alloc_device_buffer_from_slice(x))
+        .collect::<Result<Vec<_>, _>>()?;
+    let instance_buf = instance
+        .iter()
+        .map(|x| device.alloc_device_buffer_from_slice(x))
+        .collect::<Result<Vec<_>, _>>()?;
+    end_timer!(timer);
+
+    let timer = start_timer!(|| "evaluate_prove_expr_v2");
+    let ((buf, c), _) = evaluate_prove_expr_v2(
         device,
-        &mut res,
         &pk.ev.gpu_gates_expr[0],
-        fixed,
-        advice,
-        instance,
+        &fixed_buf[..],
+        &advice_buf[..],
+        &instance_buf[..],
         &mut ctx,
     )?;
+    assert!(c.is_none());
+    device.copy_from_device_to_host(&mut res[..], buf.as_ref().unwrap())?;
+    end_timer!(timer);
+
+    //analysis(&pk.ev.gpu_gates_expr[0]);
+
     Ok(res)
+}
+
+fn do_extended_fft_v2<F: FieldExt>(
+    device: &CudaDevice,
+    ctx: &mut EvalHContext<F>,
+    data: &CudaDeviceBufRaw,
+) -> DeviceResult<CudaDeviceBufRaw> {
+    let buf = ctx.extended_allocator.pop();
+    let mut buf = if buf.is_none() {
+        device.alloc_device_buffer::<F>(ctx.extended_size)?
+    } else {
+        Rc::try_unwrap(buf.unwrap()).unwrap()
+    };
+    let tmp = ctx.allocator.pop();
+    let mut tmp = if tmp.is_none() {
+        device.alloc_device_buffer::<F>(ctx.extended_size)?
+    } else {
+        Rc::try_unwrap(tmp.unwrap()).unwrap()
+    };
+    device.copy_from_device_to_device::<F>(&buf, 0, data, 0, ctx.size)?;
+    extended_prepare(
+        device,
+        &buf,
+        &ctx.coset_powers_buf,
+        2,
+        ctx.size,
+        ctx.extended_size,
+    )?;
+    ntt_raw(
+        device,
+        &mut buf,
+        &mut tmp,
+        &ctx.extended_pq_buf,
+        &ctx.extended_omegas_buf,
+        ctx.extended_k,
+    )?;
+    ctx.allocator.push(Rc::new(tmp));
+
+    Ok(buf)
+}
+
+fn evaluate_prove_expr_v2<F: FieldExt>(
+    device: &CudaDevice,
+    expr: &ProveExpression<F>,
+    fixed_buf: &[CudaDeviceBufRaw],
+    advice_buf: &[CudaDeviceBufRaw],
+    instance_buf: &[CudaDeviceBufRaw],
+    ctx: &mut EvalHContext<F>,
+) -> DeviceResult<((Option<CudaDeviceBufRaw>, Option<F>), usize)> {
+    match expr {
+        ProveExpression::Unit(u) => {
+            let (src, rotation) = match u {
+                ProveExpressionUnit::Fixed {
+                    column_index,
+                    rotation,
+                } => (&fixed_buf[*column_index], rotation),
+                ProveExpressionUnit::Advice {
+                    column_index,
+                    rotation,
+                } => (&advice_buf[*column_index], rotation),
+                ProveExpressionUnit::Instance {
+                    column_index,
+                    rotation,
+                } => (&instance_buf[*column_index], rotation),
+            };
+
+            let rot = rotation.0 as isize;
+
+            let res = ctx.allocator.pop();
+            let res = if res.is_none() {
+                device.alloc_device_buffer::<F>(ctx.size)?
+            } else {
+                Rc::try_unwrap(res.unwrap()).unwrap()
+            };
+            device.synchronize()?;
+            if rot == 0 {
+                device.copy_from_device_to_device::<F>(&res, 0, src, 0, ctx.size)?;
+                device.synchronize()?;
+            } else if rotation.0 > 0 {
+                let rot = rot as usize;
+                let len = ctx.size - rot as usize;
+                device.copy_from_device_to_device::<F>(&res, 0, src, rot as usize, len)?;
+                device.synchronize()?;
+                device.copy_from_device_to_device::<F>(&res, len, src, 0, rot as usize)?;
+                device.synchronize()?;
+            } else {
+                let rot = -rot as usize;
+                let len = ctx.size - rot;
+                device.copy_from_device_to_device::<F>(&res, 0, src, rot, len)?;
+                device.synchronize()?;
+                device.copy_from_device_to_device::<F>(&res, len, src, 0, rot)?;
+                device.synchronize()?;
+            }
+            Ok(((Some(res), None), 1))
+        }
+        ProveExpression::Op(l, r, op) => {
+            let ((mut l_buf, l_c), mut l_deg) =
+                evaluate_prove_expr_v2(device, l, fixed_buf, advice_buf, instance_buf, ctx)?;
+            let ((mut r_buf, r_c), mut r_deg) =
+                evaluate_prove_expr_v2(device, r, fixed_buf, advice_buf, instance_buf, ctx)?;
+
+            if l_deg != r_deg || *op == Bop::Product {
+                if l_deg == 1 && l_buf.is_some() {
+                    let l_extended_buf = do_extended_fft_v2(device, ctx, l_buf.as_ref().unwrap())?;
+                    ctx.allocator.push(Rc::new(l_buf.unwrap()));
+                    l_buf = Some(l_extended_buf);
+                    l_deg = 4;
+                }
+                if r_deg == 1 && r_buf.is_some() {
+                    let r_extended_buf = do_extended_fft_v2(device, ctx, l_buf.as_ref().unwrap())?;
+                    ctx.allocator.push(Rc::new(r_buf.unwrap()));
+                    r_buf = Some(r_extended_buf);
+                    r_deg = 4;
+                }
+            }
+
+            let res = if l_buf.is_some() {
+                l_buf.as_ref().unwrap()
+            } else {
+                r_buf.as_ref().unwrap()
+            };
+            field_op::<F>(
+                device,
+                res,
+                l_buf.as_ref(),
+                0,
+                l_c,
+                r_buf.as_ref(),
+                0,
+                r_c,
+                if l_deg == 1 {
+                    ctx.size
+                } else {
+                    ctx.extended_size
+                },
+                if *op == Bop::Sum {
+                    FieldOp::Sum
+                } else {
+                    FieldOp::Mul
+                },
+            )?;
+            let (res, other) = if l_buf.is_some() {
+                (l_buf.unwrap(), r_buf)
+            } else {
+                (r_buf.unwrap(), l_buf)
+            };
+            if other.is_some() {
+                ctx.allocator.push(Rc::new(other.unwrap()));
+            }
+            Ok(((Some(res), None), l_deg))
+        }
+        ProveExpression::Y(ys) => {
+            let max_y_order = *ys.keys().max().unwrap();
+            for _ in (ctx.y.len() as u32)..=max_y_order {
+                ctx.y.push(ctx.y[1] * ctx.y.last().unwrap());
+            }
+            let c = ys.iter().fold(F::zero(), |acc, (y_order, f)| {
+                acc + ctx.y[*y_order as usize] * f
+            });
+
+            Ok(((None, Some(c)), 1))
+        }
+        ProveExpression::Scale(l, ys) => {
+            let ((l_buf, l_c), l_deg) =
+                evaluate_prove_expr_v2(device, l, fixed_buf, advice_buf, instance_buf, ctx)?;
+            assert!(l_c.is_none());
+            let max_y_order = *ys.keys().max().unwrap();
+            for _ in (ctx.y.len() as u32)..=max_y_order {
+                ctx.y.push(ctx.y[1] * ctx.y.last().unwrap());
+            }
+            let c = ys.iter().fold(F::zero(), |acc, (y_order, f)| {
+                acc + ctx.y[*y_order as usize] * f
+            });
+            field_op(
+                device,
+                l_buf.as_ref().unwrap(),
+                l_buf.as_ref(),
+                0,
+                None,
+                None,
+                0,
+                Some(c),
+                if l_deg == 1 {
+                    ctx.size
+                } else {
+                    ctx.extended_size
+                },
+                FieldOp::Mul,
+            )?;
+            Ok(((l_buf, None), l_deg))
+        }
+    }
 }
 
 fn evaluate_prove_expr<F: FieldExt>(
@@ -906,8 +1121,12 @@ fn evaluate_prove_expr<F: FieldExt>(
     instance: &[&[F]],
     ctx: &mut EvalHContext<F>,
 ) -> DeviceResult<()> {
+    analysis(expr);
+    assert!(false);
     let buf = _evaluate_prove_expr(device, expr, fixed, advice, instance, ctx)?;
+    let timer = start_timer!(|| "copy back");
     device.copy_from_device_to_host(&mut res[..], &buf.0.unwrap().0)?;
+    end_timer!(timer);
     //TODO: check rot and constant
     Ok(())
 }
@@ -951,6 +1170,72 @@ fn do_extended_fft<F: FieldExt>(
     Ok(buf)
 }
 
+fn analysis<F: FieldExt>(expr: &ProveExpression<F>) -> usize {
+    match expr {
+        ProveExpression::Unit(u) => {
+            let rotation = match u {
+                ProveExpressionUnit::Fixed {
+                    column_index,
+                    rotation,
+                } => rotation,
+                ProveExpressionUnit::Advice {
+                    column_index,
+                    rotation,
+                } => rotation,
+                ProveExpressionUnit::Instance {
+                    column_index,
+                    rotation,
+                } => rotation,
+            };
+            println!("handle unit {:?}", rotation);
+            return 1;
+        }
+        ProveExpression::Op(l, r, op) => {
+            let l_dep = analysis(l);
+            let r_dep = analysis(r);
+
+            if l_dep != r_dep {
+                println!(
+                    "handle deep upgrade {} {}",
+                    l_dep.min(r_dep),
+                    l_dep.max(r_dep)
+                );
+            }
+
+            match op {
+                Bop::Sum => {
+                    println!("handle sum {}", l_dep.max(r_dep));
+                    return l_dep.max(r_dep);
+                }
+                Bop::Product => {
+                    println!("handle mul {}", l_dep.max(r_dep));
+                    if l_dep == 1 && r_dep == 1 {
+                        println!("handle deep upgrade 2 from 1");
+                        return 2;
+                    } else {
+                        if l_dep < 4 {
+                            println!("handle deep upgrade 4 from {}", l_dep);
+                        }
+                        if r_dep < 4 {
+                            println!("handle deep upgrade 4 from {}", r_dep);
+                        }
+                        return 4;
+                    }
+                }
+            }
+        }
+        ProveExpression::Y(_) => {
+            println!("handle y");
+            return 1;
+        }
+        ProveExpression::Scale(l, _) => {
+            let l_dep = analysis(l);
+            println!("handle scale {}", l_dep);
+            return 1;
+        }
+    }
+}
+
 fn _evaluate_prove_expr<F: FieldExt>(
     device: &CudaDevice,
     expr: &ProveExpression<F>,
@@ -961,6 +1246,7 @@ fn _evaluate_prove_expr<F: FieldExt>(
 ) -> DeviceResult<(Option<(Rc<CudaDeviceBufRaw>, i32)>, Option<F>)> {
     match expr {
         ProveExpression::Unit(u) => {
+            let timer = start_timer!(|| "handle unit");
             let group = u.get_group();
             let (cache, cache_action) = ctx.unit_cache.get(group);
             let (values, rotation) = if let Some(cached_values) = cache {
@@ -987,7 +1273,6 @@ fn _evaluate_prove_expr<F: FieldExt>(
 
                 let timer = start_timer!(|| "do extended fft");
                 let buffer = do_extended_fft(device, ctx, origin_values)?;
-                end_timer!(timer);
 
                 let value = if cache_action == CacheAction::Cache {
                     ctx.unit_cache
@@ -997,15 +1282,18 @@ fn _evaluate_prove_expr<F: FieldExt>(
                 };
 
                 let res = (value, *rotation);
+                end_timer!(timer);
                 res
             };
+            end_timer!(timer);
             Ok((Some((values, rotation.0 * ctx.rot_scale)), None))
         }
         ProveExpression::Op(l, r, op) => {
             let (l, l_c) = _evaluate_prove_expr(device, l, fixed, advice, instance, ctx)?;
             let (r, r_c) = _evaluate_prove_expr(device, r, fixed, advice, instance, ctx)?;
 
-            match (l, r) {
+            let timer = start_timer!(|| "handle op");
+            let res = match (l, r) {
                 (Some((l_buf, l_rot)), Some((r_buf, r_rot))) => {
                     let res = if l_rot == 0 {
                         l_buf.clone()
@@ -1062,9 +1350,12 @@ fn _evaluate_prove_expr<F: FieldExt>(
                         Some(l_c.unwrap_or(F::one()) * r_c.unwrap_or(F::one())),
                     )),
                 },
-            }
+            };
+            end_timer!(timer);
+            res
         }
         ProveExpression::Y(ys) => {
+            let timer = start_timer!(|| "handle ys");
             let max_y_order = *ys.keys().max().unwrap();
             for _ in (ctx.y.len() as u32)..=max_y_order {
                 ctx.y.push(ctx.y[1] * ctx.y.last().unwrap());
@@ -1072,9 +1363,11 @@ fn _evaluate_prove_expr<F: FieldExt>(
             let c = ys.iter().fold(F::zero(), |acc, (y_order, f)| {
                 acc + ctx.y[*y_order as usize] * f
             });
+            end_timer!(timer);
             Ok((None, Some(c)))
         }
         ProveExpression::Scale(l, ys) => {
+            let timer = start_timer!(|| "handle scale");
             let max_y_order = *ys.keys().max().unwrap();
             for _ in (ctx.y.len() as u32)..=max_y_order {
                 ctx.y.push(ctx.y[1] * ctx.y.last().unwrap());
@@ -1085,7 +1378,7 @@ fn _evaluate_prove_expr<F: FieldExt>(
 
             let (l, l_c) = _evaluate_prove_expr(device, l, fixed, advice, instance, ctx)?;
 
-            match l {
+            let res = match l {
                 Some((l_buf, l_rot)) => {
                     let res = if l_rot == 0 {
                         l_buf.clone()
@@ -1118,7 +1411,10 @@ fn _evaluate_prove_expr<F: FieldExt>(
                     Ok((Some((res, 0)), None))
                 }
                 None => Ok((None, Some(l_c.unwrap() * c))),
-            }
+            };
+
+            end_timer!(timer);
+            res
         }
     }
 }
