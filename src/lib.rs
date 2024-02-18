@@ -38,6 +38,7 @@ use rayon::iter::IntoParallelRefMutIterator as _;
 use rayon::iter::ParallelIterator as _;
 use rayon::slice::ParallelSlice as _;
 
+use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::msm;
 use crate::cuda::bn254::msm_with_groups;
 use crate::cuda::bn254::ntt;
@@ -655,6 +656,7 @@ pub fn create_proof_from_advices<
 
     let timer = start_timer!(|| "prepare ntt");
     let (omegas_buf, pq_buf) = ntt_prepare::<C::ScalarExt>(&device, k)?;
+    let divisor_buf = device.alloc_device_buffer_from_slice(&[pk.get_vk().domain.ifft_divisor])?;
     end_timer!(timer);
 
     let chunk_len = &pk.vk.cs.degree() - 2;
@@ -738,44 +740,47 @@ pub fn create_proof_from_advices<
     });
     end_timer!(timer);
 
-    let timer = start_timer!(|| "lookup ntt and z msm");
+    let timer = start_timer!(|| "lookup intt and z msm");
     let mut tmp_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
     let mut ntt_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
     for (permuted_input, permuted_table, z) in lookups.iter_mut() {
         device.copy_from_host_to_device(&ntt_buf, &z[..])?;
         let commitment = msm_with_groups(&device, &g_lagrange_buf, &ntt_buf, size, 1)?;
         transcript.write_point(commitment).unwrap();
-        ntt(
+        intt_raw(
             &device,
             &mut ntt_buf,
             &mut tmp_buf,
             &pq_buf,
             &omegas_buf,
-            z,
+            &divisor_buf,
             k,
         )?;
+        device.copy_from_device_to_host(&mut z[..], &ntt_buf)?;
 
         device.copy_from_host_to_device(&ntt_buf, &permuted_input[..])?;
-        ntt(
+        intt_raw(
             &device,
             &mut ntt_buf,
             &mut tmp_buf,
             &pq_buf,
             &omegas_buf,
-            permuted_input,
+            &divisor_buf,
             k,
         )?;
+        device.copy_from_device_to_host(&mut permuted_input[..], &ntt_buf)?;
 
         device.copy_from_host_to_device(&ntt_buf, &permuted_table[..])?;
-        ntt(
+        intt_raw(
             &device,
             &mut ntt_buf,
             &mut tmp_buf,
             &pq_buf,
             &omegas_buf,
-            permuted_table,
+            &divisor_buf,
             k,
         )?;
+        device.copy_from_device_to_host(&mut permuted_table[..], &ntt_buf)?;
     }
     end_timer!(timer);
 
@@ -788,15 +793,16 @@ pub fn create_proof_from_advices<
         device.copy_from_host_to_device(&ntt_buf, &z[..])?;
         let commitment = msm_with_groups(&device, &g_lagrange_buf, &ntt_buf, size, 1)?;
         transcript.write_point(commitment).unwrap();
-        ntt(
+        intt_raw(
             &device,
             &mut ntt_buf,
             &mut tmp_buf,
             &pq_buf,
             &omegas_buf,
-            z,
+            &divisor_buf,
             k,
         )?;
+        device.copy_from_device_to_host(&mut z[..], &ntt_buf)?;
     }
     end_timer!(timer);
     let vanishing =
@@ -925,6 +931,7 @@ fn do_extended_fft_v2<F: FieldExt>(
     ctx: &mut EvalHContext<F>,
     data: &CudaDeviceBufRaw,
 ) -> DeviceResult<CudaDeviceBufRaw> {
+    println!("do_extended_fft_v2");
     let buf = ctx.extended_allocator.pop();
     let mut buf = if buf.is_none() {
         device.alloc_device_buffer::<F>(ctx.extended_size)?
@@ -1214,10 +1221,10 @@ fn analysis<F: FieldExt>(expr: &ProveExpression<F>) -> usize {
                         return 2;
                     } else {
                         if l_dep < 4 {
-                            println!("handle deep upgrade 4 from {}", l_dep);
+                            println!("handle deep upgrade 4 from {}", 1);
                         }
                         if r_dep < 4 {
-                            println!("handle deep upgrade 4 from {}", r_dep);
+                            println!("handle deep upgrade 4 from {}", 1);
                         }
                         return 4;
                     }

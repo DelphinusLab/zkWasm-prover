@@ -296,6 +296,34 @@ pub fn ntt_raw(
     Ok(())
 }
 
+pub fn intt_raw(
+    device: &CudaDevice,
+    s_buf: &mut CudaDeviceBufRaw,
+    tmp_buf: &mut CudaDeviceBufRaw,
+    pq_buf: &CudaDeviceBufRaw,
+    omegas_buf: &CudaDeviceBufRaw,
+    divisor: &CudaDeviceBufRaw,
+    len_log: usize,
+) -> Result<(), Error> {
+    ntt_raw(device, s_buf, tmp_buf, pq_buf, omegas_buf, len_log)?;
+    unsafe {
+        device.acitve_ctx()?;
+        let err = cuda_c::field_op(
+            s_buf.ptr(),
+            s_buf.ptr(),
+            0,
+            0usize as *mut _,
+            0usize as *mut _,
+            0,
+            divisor.ptr(),
+            (1 << len_log) as i32,
+            FieldOp::Mul as i32,
+        );
+        to_result((), err, "fail to run field_op in intt_raw")?;
+    }
+    Ok(())
+}
+
 pub fn ntt<F: FieldExt>(
     device: &CudaDevice,
     s_buf: &mut CudaDeviceBufRaw,
