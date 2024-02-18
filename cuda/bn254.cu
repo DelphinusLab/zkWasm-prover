@@ -225,6 +225,10 @@ __global__ void _field_op(
         {
             res[i] = -fl;
         }
+        else if (op == 3)
+        {
+            res[i] = fl - fr;
+        }
         else
         {
             assert(0);
@@ -255,10 +259,13 @@ __global__ void _extended_prepare(
     }
 }
 
-__global__ void _field_sum(
+__global__ void _permutation_eval_h_p1(
     Bn254FrField *res,
-    Bn254FrField **v,
-    int v_len,
+    const Bn254FrField *first_set,
+    const Bn254FrField *last_set,
+    const Bn254FrField *l0,
+    const Bn254FrField *l_last,
+    const Bn254FrField *y,
     int n)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -268,40 +275,124 @@ __global__ void _field_sum(
     int end = start + size_per_worker;
     end = end > n ? n : end;
 
-    __shared__ Bn254FrField value[256];
+    Bn254FrField t1, t2;
 
-    for (int i = gid; i < n; i += size_per_worker)
+    for (int i = start; i < end; i++)
     {
-        Bn254FrField tmp = v[0][i];
+        t1 = res[i];
 
-        /*
-        for (int j = 1; j < v_len; j++)
+        // l_0(X) * (1 - z_0(X)) = 0
+        t1 = t1 * y[0];
+        t2 = Bn254FrField(1);
+        t2 -= first_set[i];
+        t2 = t2 * l0[i];
+        t1 += t2;
+
+        // l_last(X) * (z_l(X)^2 - z_l(X)) = 0
+        t1 = t1 * y[0];
+        t2 = last_set[i].sqr();
+        t2 -= last_set[i];
+        t2 = t2 * l_last[i];
+        t1 += t2;
+
+        res[i] = t1;
+    }
+}
+
+__global__ void _permutation_eval_h_p2(
+    Bn254FrField *res,
+    const Bn254FrField **set,
+    const Bn254FrField *l0,
+    const Bn254FrField *l_last,
+    const Bn254FrField *y,
+    int n_set,
+    int rot,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int worker = blockDim.x * gridDim.x;
+    int size_per_worker = (n + worker - 1) / worker;
+    int start = gid * size_per_worker;
+    int end = start + size_per_worker;
+    end = end > n ? n : end;
+
+    Bn254FrField t1, t2;
+
+    for (int i = start; i < end; i++)
+    {
+        int r_prev = (i + n + rot) & (n - 1);
+        t1 = res[i];
+
+        for (int j = 1; j < n_set; j++)
         {
-            tmp += v[j][i];
+            // l_0(X) * (z_i(X) - z_{i-1}(\omega^(last) X)) = 0
+            t1 = t1 * y[0];
+            t2 = set[j][i] - set[j - 1][r_prev];
+            t2 = t2 * l0[i];
+            t1 += t2;
         }
-        */
-       value[threadIdx.x * 2] = res[i];
-       value[threadIdx.x * 2 + 1] = v[0][i];
-       value[threadIdx.x * 2] += value[threadIdx.x * 2 + 1];
-    //res[i] = value[threadIdx.x * 2];
+    }
+}
+
+__global__ void _permutation_eval_h_l(
+    Bn254FrField *res,
+    const Bn254FrField *beta,
+    const Bn254FrField *gamma,
+    const Bn254FrField *p,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int worker = blockDim.x * gridDim.x;
+    int size_per_worker = (n + worker - 1) / worker;
+    int start = gid * size_per_worker;
+    int end = start + size_per_worker;
+    end = end > n ? n : end;
+
+    for (int i = start; i < end; i++)
+    {
+        Bn254FrField t = p[i];
+        t = t * beta[0];
+        if (i == 0)
+        {
+            t += gamma[0];
+        }
+        res[i] += t;
+    }
+}
+
+__global__ void _permutation_eval_h_r(
+    Bn254FrField *res,
+    const Bn254FrField *delta,
+    const Bn254FrField *gamma,
+    const Bn254FrField *value,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int worker = blockDim.x * gridDim.x;
+    int size_per_worker = (n + worker - 1) / worker;
+    int start = gid * size_per_worker;
+    int end = start + size_per_worker;
+    end = end > n ? n : end;
+
+    for (int i = start; i < end; i++)
+    {
+        Bn254FrField t = value[i];
+        if (i == 0)
+        {
+            t += gamma[0];
+        }
+
+        if (i == 1)
+        {
+            t += delta[0];
+        }
+
+        res[i] = t;
     }
 }
 
 extern "C"
 {
-    cudaError_t field_sum(
-        Bn254FrField *res,
-        Bn254FrField **v,
-        int v_len,
-        int n)
-    {
-        int threads = n >= 128 ? 128 : 1;
-        int blocks = n / threads;
-        blocks = blocks > 32 ? 32 : blocks;
-        _field_sum<<<blocks, threads>>>(res, v, v_len, n);
-        return cudaGetLastError();
-    }
-
     cudaError_t extended_prepare(
         Bn254FrField *s,
         Bn254FrField *coset_powers,
@@ -332,6 +423,64 @@ extern "C"
         int blocks = n / threads;
         blocks = blocks > 32 ? 32 : blocks;
         _field_op<<<blocks, threads>>>(res, l, l_rot, l_c, r, r_rot, r_c, n, op);
+        return cudaGetLastError();
+    }
+
+    cudaError_t permutation_eval_h_p1(
+        Bn254FrField *res,
+        const Bn254FrField *first_set,
+        const Bn254FrField *last_set,
+        const Bn254FrField *l0,
+        const Bn254FrField *l_last,
+        const Bn254FrField *y,
+        int n)
+    {
+        int threads = n >= 128 ? 128 : 1;
+        int blocks = n / threads;
+        blocks = blocks > 32 ? 32 : blocks;
+        _permutation_eval_h_p1<<<blocks, threads>>>(res, first_set, last_set, l0, l_last, y, n);
+        return cudaGetLastError();
+    }
+
+    cudaError_t permutation_eval_h_p2(
+        Bn254FrField *res,
+        const Bn254FrField **set,
+        const Bn254FrField *l0,
+        const Bn254FrField *l_last,
+        const Bn254FrField *y,
+        int n_set,
+        int rot,
+        int n)
+    {
+        int threads = n >= 128 ? 128 : 1;
+        int blocks = n / threads;
+        blocks = blocks > 32 ? 32 : blocks;
+        _permutation_eval_h_p2<<<blocks, threads>>>(res, set, l0, l_last, y, n_set, rot, n);
+        return cudaGetLastError();
+    }
+
+    cudaError_t permutation_eval_h_l(
+        Bn254FrField *res,
+        const Bn254FrField *beta,
+        const Bn254FrField *gamma,
+        const Bn254FrField *p,
+        int n)
+    {
+        int threads = n >= 128 ? 128 : 1;
+        int blocks = n / threads;
+        blocks = blocks > 32 ? 32 : blocks;
+        _permutation_eval_h_l<<<blocks, threads>>>(res, beta, gamma, p, n);
+        return cudaGetLastError();
+    }
+
+    cudaError_t permutation_eval_h_r(
+        Bn254FrField *res,
+        const Bn254FrField *delta,
+        const Bn254FrField *gamma,
+        const Bn254FrField *p,
+        int n)
+    {
+        _permutation_eval_h_r<<<1, 2>>>(res, delta, gamma, p, n);
         return cudaGetLastError();
     }
 
