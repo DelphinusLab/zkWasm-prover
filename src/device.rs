@@ -37,4 +37,6 @@ pub trait Device<B: DeviceBuf>: Sized {
 
     fn pin_memory<T>(&self, dst: &mut [T]) -> DeviceResult<()>;
     fn unpin_memory<T>(&self, dst: &mut [T]) -> DeviceResult<()>;
+    
+    fn print_memory_info(&self) -> DeviceResult<()>;
 }

@@ -275,6 +275,7 @@ pub fn permutation_eval_h_p1(
             n as i32,
         );
         to_result((), err, "fail to run permutation_eval_h_p1")?;
+        device.synchronize()?;
     }
     Ok(())
 }
@@ -304,6 +305,7 @@ pub fn permutation_eval_h_p2(
             n as i32,
         );
         to_result((), err, "fail to run permutation_eval_h_p2")?;
+        device.synchronize()?;
     }
     Ok(())
 }
@@ -321,6 +323,7 @@ pub fn permutation_eval_h_l(
         let err =
             bn254_c::permutation_eval_h_l(res.ptr(), beta.ptr(), gamma.ptr(), p.ptr(), n as i32);
         to_result((), err, "fail to run permutation_eval_h_l")?;
+        device.synchronize()?;
     }
     Ok(())
 }
@@ -331,7 +334,6 @@ pub fn permutation_eval_h_r(
     delta: &CudaDeviceBufRaw,
     gamma: &CudaDeviceBufRaw,
     value: &CudaDeviceBufRaw,
-    n: usize,
 ) -> Result<(), Error> {
     unsafe {
         device.acitve_ctx()?;
@@ -340,9 +342,10 @@ pub fn permutation_eval_h_r(
             delta.ptr(),
             gamma.ptr(),
             value.ptr(),
-            n as i32,
+            2,
         );
         to_result((), err, "fail to run permutation_eval_h_r")?;
+        device.synchronize()?;
     }
     Ok(())
 }
