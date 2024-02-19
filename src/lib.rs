@@ -608,7 +608,7 @@ pub fn create_proof_from_advices<
     let timer = start_timer!(|| "generate lookup z");
     lookups
         .par_iter_mut()
-        .for_each(|(_, (permuted_input, permuted_table, z, input, table))| {
+        .for_each(|(_, (permuted_input, permuted_table, input, table, z))| {
             for ((z, permuted_input_value), permuted_table_value) in z
                 .iter_mut()
                 .zip(permuted_input.iter())
@@ -625,21 +625,25 @@ pub fn create_proof_from_advices<
             }
 
             let mut tmp = C::ScalarExt::one();
-            for i in 0..unusable_rows_start {
+            for i in 0..=unusable_rows_start {
                 std::mem::swap(&mut tmp, &mut z[i]);
                 tmp = tmp * z[i];
             }
 
             if ADD_RANDOM {
-                for cell in &mut z[unusable_rows_start..] {
+                for cell in &mut z[unusable_rows_start + 1..] {
                     *cell = C::Scalar::random(&mut OsRng);
+                }
+            } else {
+                for cell in &mut z[unusable_rows_start + 1..] {
+                    *cell = C::Scalar::zero();
                 }
             }
         });
 
     let mut lookups = lookups
         .into_iter()
-        .map(|(_, (permuted_input, permuted_table, z, _, _))| (permuted_input, permuted_table, z))
+        .map(|(_, (permuted_input, permuted_table, _, _, z))| (permuted_input, permuted_table, z))
         .collect::<Vec<_>>();
     end_timer!(timer);
 
@@ -794,7 +798,6 @@ pub fn create_proof_from_advices<
     for (i, z) in permutation_products.iter_mut().enumerate() {
         device.copy_from_host_to_device(&ntt_buf, &z[..])?;
         let commitment = msm_with_groups(&device, &g_lagrange_buf, &ntt_buf, size, 1)?;
-        println!("prover permutation commitment {} c is {:?}", i, commitment);
         transcript.write_point(commitment).unwrap();
         intt_raw(
             &device,
@@ -809,7 +812,6 @@ pub fn create_proof_from_advices<
     }
 
     for (i, commitment) in lookup_z_commitments.into_iter().enumerate() {
-        println!("prover lookup z commitment {} c is {:?}", i, commitment);
         transcript.write_point(commitment).unwrap();
     }
 
