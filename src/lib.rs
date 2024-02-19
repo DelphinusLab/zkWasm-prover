@@ -464,15 +464,6 @@ pub fn create_proof_from_advices<
                     evaluate_expr(expr, size, 1, fixed_ref, advice_ref, instance_ref, target)
                 };
 
-                println!(
-                    "comp {} input expr is {:?}",
-                    i, &pk.vk.cs.lookups[i].input_expressions
-                );
-                println!(
-                    "comp {} table expr is {:?}",
-                    i, &pk.vk.cs.lookups[i].table_expressions
-                );
-
                 f(
                     &pk.vk.cs.lookups[i].input_expressions[0],
                     &mut input[0..unusable_rows_start],
@@ -562,45 +553,21 @@ pub fn create_proof_from_advices<
     let mut lookup_permuted_commitments = vec![C::identity(); pk.vk.cs.lookups.len() * 2];
 
     let timer = start_timer!(|| format!(
-        "single lookup copy {} {}",
-        single_unit_lookups.len(),
-        single_comp_lookups.len()
-    ));
-    let single_unit_buffers = single_unit_lookups
-        .iter_mut()
-        .map(|x| {
-            let input_buf = device.alloc_device_buffer_from_slice(&x.1 .0[..])?;
-            let table_buf = device.alloc_device_buffer_from_slice(&x.1 .1[..])?;
-            Ok((x.0, input_buf, table_buf))
-        })
-        .collect::<DeviceResult<Vec<_>>>()?;
-
-    let single_comp_buffers = single_comp_lookups
-        .iter_mut()
-        .map(|x| {
-            let input_buf = device.alloc_device_buffer_from_slice(&x.1 .0[..])?;
-            let table_buf = device.alloc_device_buffer_from_slice(&x.1 .1[..])?;
-            Ok((x.0, input_buf, table_buf))
-        })
-        .collect::<DeviceResult<Vec<_>>>()?;
-    end_timer!(timer);
-
-    let timer = start_timer!(|| format!(
         "single lookup msm {} {}",
         single_unit_lookups.len(),
         single_comp_lookups.len()
     ));
-
-    for (i, permuted_input_buf, permuted_table_buf) in single_unit_buffers.iter() {
-        println!("single lookup index {}", i);
+    for (i, (permuted_input, permuted_table, _, _, _)) in single_unit_lookups.iter() {
+        let permuted_input_buf = device.alloc_device_buffer_from_slice(&permuted_input[..])?;
+        let permuted_table_buf = device.alloc_device_buffer_from_slice(&permuted_table[..])?;
         lookup_permuted_commitments[i * 2] =
             msm(&device, &g_lagrange_buf, &permuted_input_buf, size)?;
         lookup_permuted_commitments[i * 2 + 1] =
             msm(&device, &g_lagrange_buf, &permuted_table_buf, size)?;
     }
-
-    for (i, permuted_input_buf, permuted_table_buf) in single_comp_buffers.iter() {
-        println!("comp lookup index {}", i);
+    for (i, (permuted_input, permuted_table, _, _, _)) in single_comp_lookups.iter() {
+        let permuted_input_buf = device.alloc_device_buffer_from_slice(&permuted_input[..])?;
+        let permuted_table_buf = device.alloc_device_buffer_from_slice(&permuted_table[..])?;
         lookup_permuted_commitments[i * 2] =
             msm(&device, &g_lagrange_buf, &permuted_input_buf, size)?;
         lookup_permuted_commitments[i * 2 + 1] =
@@ -613,9 +580,7 @@ pub fn create_proof_from_advices<
     end_timer!(timer);
 
     let timer = start_timer!(|| format!("tuple lookup msm {}", tuple_lookups.len(),));
-
     for (i, (permuted_input, permuted_table, _, _, _)) in tuple_lookups.iter() {
-        println!("tuple lookup index {}", i);
         let permuted_input_buf = device.alloc_device_buffer_from_slice(&permuted_input[..])?;
         let permuted_table_buf = device.alloc_device_buffer_from_slice(&permuted_table[..])?;
         lookup_permuted_commitments[i * 2] =
@@ -625,8 +590,7 @@ pub fn create_proof_from_advices<
     }
     end_timer!(timer);
 
-    for (i, commitment) in lookup_permuted_commitments.into_iter().enumerate() {
-        println!("prover {} lookup commitment {:?}", i, commitment);
+    for commitment in lookup_permuted_commitments.into_iter() {
         transcript.write_point(commitment).unwrap();
     }
 
@@ -706,7 +670,7 @@ pub fn create_proof_from_advices<
             .iter()
             .map(|x| &x[..])
             .collect::<Vec<_>>()[..];
-        (&pk)
+        let mut p_z = pk
             .vk
             .cs
             .permutation
@@ -753,17 +717,30 @@ pub fn create_proof_from_advices<
                     delta_omega *= &C::Scalar::DELTA;
                 }
 
-                let mut tmp = C::ScalarExt::one();
-                for i in 0..unusable_rows_start {
-                    std::mem::swap(&mut tmp, &mut modified_values[i]);
-                    tmp = tmp * modified_values[i];
-                }
-
                 modified_values
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+
+        let mut tmp = C::ScalarExt::one();
+        for z in p_z.iter_mut() {
+            for i in 0..size {
+                std::mem::swap(&mut tmp, &mut z[i]);
+                tmp = tmp * z[i];
+            }
+
+            tmp = z[unusable_rows_start];
+
+            for v in z[unusable_rows_start + 1..].iter_mut() {
+                if ADD_RANDOM {
+                    *v = C::Scalar::random(&mut OsRng);
+                }
+            }
+        }
+        p_z
     });
     end_timer!(timer);
+
+    let mut lookup_z_commitments = vec![];
 
     let timer = start_timer!(|| "lookup intt and z msm");
     let mut tmp_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
@@ -771,7 +748,7 @@ pub fn create_proof_from_advices<
     for (permuted_input, permuted_table, z) in lookups.iter_mut() {
         device.copy_from_host_to_device(&ntt_buf, &z[..])?;
         let commitment = msm_with_groups(&device, &g_lagrange_buf, &ntt_buf, size, 1)?;
-        transcript.write_point(commitment).unwrap();
+        lookup_z_commitments.push(commitment);
         intt_raw(
             &device,
             &mut ntt_buf,
@@ -813,10 +790,11 @@ pub fn create_proof_from_advices<
     let mut permutation_products = permutation_products_handler.join().unwrap();
     end_timer!(timer);
 
-    let timer = start_timer!(|| "permutation z msm and ntt");
-    for z in permutation_products.iter_mut() {
+    let timer = start_timer!(|| "permutation z msm and intt");
+    for (i, z) in permutation_products.iter_mut().enumerate() {
         device.copy_from_host_to_device(&ntt_buf, &z[..])?;
         let commitment = msm_with_groups(&device, &g_lagrange_buf, &ntt_buf, size, 1)?;
+        println!("prover permutation commitment {} c is {:?}", i, commitment);
         transcript.write_point(commitment).unwrap();
         intt_raw(
             &device,
@@ -829,6 +807,12 @@ pub fn create_proof_from_advices<
         )?;
         device.copy_from_device_to_host(&mut z[..], &ntt_buf)?;
     }
+
+    for (i, commitment) in lookup_z_commitments.into_iter().enumerate() {
+        println!("prover lookup z commitment {} c is {:?}", i, commitment);
+        transcript.write_point(commitment).unwrap();
+    }
+
     end_timer!(timer);
     let vanishing =
         halo2_proofs::plonk::vanishing::Argument::commit(params, &pk.vk.domain, OsRng, transcript)
