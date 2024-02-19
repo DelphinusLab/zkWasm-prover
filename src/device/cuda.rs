@@ -122,16 +122,13 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
     }
 
     fn alloc_device_buffer<T>(&self, size: usize) -> DeviceResult<CudaDeviceBufRaw> {
+        //println!("alloc device memory {}", size * mem::size_of::<T>());
+        //self.print_memory_info()?;
         self.acitve_ctx()?;
         let mut ptr = 0 as *mut c_void;
         unsafe {
-            if false {
-                let mut free = 0;
-                let mut total = 0;
-                cuda_runtime_sys::cudaMemGetInfo(&mut free, &mut total);
-                println!("free is {},total is {}", free, total);
-            }
             let res = cuda_runtime_sys::cudaMalloc(&mut ptr, size * mem::size_of::<T>());
+            //self.print_memory_info()?;
             to_result(
                 CudaDeviceBufRaw {
                     ptr,

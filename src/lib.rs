@@ -59,6 +59,8 @@ pub mod cuda;
 pub mod device;
 mod hugetlb;
 
+const ADD_RANDOM: bool = false;
+
 pub fn prepare_advice_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
 ) -> Vec<Vec<C::Scalar, HugePageAllocator>> {
@@ -128,8 +130,8 @@ fn lookup_classify<'a, 'b, C: CurveAffine, T>(
 }
 
 fn handle_lookup_pair<F: FieldExt>(
-    input: &mut Vec<F, HugePageAllocator>,
-    table: &mut Vec<F, HugePageAllocator>,
+    input: &Vec<F, HugePageAllocator>,
+    table: &Vec<F, HugePageAllocator>,
     unusable_rows_start: usize,
 ) -> (Vec<F, HugePageAllocator>, Vec<F, HugePageAllocator>) {
     let compare = |a: &_, b: &_| unsafe {
@@ -187,10 +189,24 @@ fn handle_lookup_pair<F: FieldExt>(
     }
 
     if true {
-        for cell in &mut input[unusable_rows_start..] {
+        let mut last = None;
+        for (a, b) in permuted_input
+            .iter()
+            .zip(permuted_table.iter())
+            .take(unusable_rows_start)
+        {
+            if *a != *b {
+                assert_eq!(*a, last.unwrap());
+            }
+            last = Some(*a);
+        }
+    }
+
+    if ADD_RANDOM {
+        for cell in &mut permuted_input[unusable_rows_start..] {
             *cell = F::random(&mut OsRng);
         }
-        for cell in &mut table[unusable_rows_start..] {
+        for cell in &mut permuted_table[unusable_rows_start..] {
             *cell = F::random(&mut OsRng);
         }
     }
@@ -328,7 +344,7 @@ pub fn create_proof_from_advices<
     end_timer!(timer);
 
     // add random value
-    if true {
+    if ADD_RANDOM {
         let named = &pk.vk.cs.named_advices;
         unsafe { Arc::get_mut_unchecked(&mut advices) }
             .par_iter_mut()
@@ -426,7 +442,7 @@ pub fn create_proof_from_advices<
                     &mut table[0..unusable_rows_start],
                 );
                 let (permuted_input, permuted_table) =
-                    handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
+                    handle_lookup_pair(&input, &table, unusable_rows_start);
                 (i, (permuted_input, permuted_table, input, table, z))
             })
             .collect::<Vec<_>>();
@@ -445,16 +461,17 @@ pub fn create_proof_from_advices<
             .into_par_iter()
             .map(|(i, (mut input, mut table, z))| {
                 let f = |expr: &Expression<_>, target: &mut [_]| {
-                    evaluate_expr(
-                        expr,
-                        size,
-                        rot_scale as i32,
-                        fixed_ref,
-                        advice_ref,
-                        instance_ref,
-                        target,
-                    )
+                    evaluate_expr(expr, size, 1, fixed_ref, advice_ref, instance_ref, target)
                 };
+
+                println!(
+                    "comp {} input expr is {:?}",
+                    i, &pk.vk.cs.lookups[i].input_expressions
+                );
+                println!(
+                    "comp {} table expr is {:?}",
+                    i, &pk.vk.cs.lookups[i].table_expressions
+                );
 
                 f(
                     &pk.vk.cs.lookups[i].input_expressions[0],
@@ -465,13 +482,13 @@ pub fn create_proof_from_advices<
                     &mut table[0..unusable_rows_start],
                 );
                 let (permuted_input, permuted_table) =
-                    handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
+                    handle_lookup_pair(&input, &table, unusable_rows_start);
                 (i, (permuted_input, permuted_table, input, table, z))
             })
             .collect::<Vec<_>>();
         end_timer!(timer);
 
-        return (single_unit_lookups, single_comp_lookups, tuple_lookups);
+        (single_unit_lookups, single_comp_lookups, tuple_lookups)
     });
 
     // Advice MSM
@@ -515,7 +532,7 @@ pub fn create_proof_from_advices<
                     evaluate_exprs(
                         expr,
                         size,
-                        rot_scale as i32,
+                        1,
                         fixed_ref,
                         advice_ref,
                         instance_ref,
@@ -533,7 +550,7 @@ pub fn create_proof_from_advices<
                     &mut table[0..unusable_rows_start],
                 );
                 let (permuted_input, permuted_table) =
-                    handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
+                    handle_lookup_pair(&input, &table, unusable_rows_start);
                 (i, (permuted_input, permuted_table, input, table, z))
             })
             .collect::<Vec<_>>();
@@ -552,7 +569,6 @@ pub fn create_proof_from_advices<
     let single_unit_buffers = single_unit_lookups
         .iter_mut()
         .map(|x| {
-            // FIXME: handle error
             let input_buf = device.alloc_device_buffer_from_slice(&x.1 .0[..])?;
             let table_buf = device.alloc_device_buffer_from_slice(&x.1 .1[..])?;
             Ok((x.0, input_buf, table_buf))
@@ -562,7 +578,6 @@ pub fn create_proof_from_advices<
     let single_comp_buffers = single_comp_lookups
         .iter_mut()
         .map(|x| {
-            // FIXME: handle error
             let input_buf = device.alloc_device_buffer_from_slice(&x.1 .0[..])?;
             let table_buf = device.alloc_device_buffer_from_slice(&x.1 .1[..])?;
             Ok((x.0, input_buf, table_buf))
@@ -577,6 +592,7 @@ pub fn create_proof_from_advices<
     ));
 
     for (i, permuted_input_buf, permuted_table_buf) in single_unit_buffers.iter() {
+        println!("single lookup index {}", i);
         lookup_permuted_commitments[i * 2] =
             msm(&device, &g_lagrange_buf, &permuted_input_buf, size)?;
         lookup_permuted_commitments[i * 2 + 1] =
@@ -584,6 +600,7 @@ pub fn create_proof_from_advices<
     }
 
     for (i, permuted_input_buf, permuted_table_buf) in single_comp_buffers.iter() {
+        println!("comp lookup index {}", i);
         lookup_permuted_commitments[i * 2] =
             msm(&device, &g_lagrange_buf, &permuted_input_buf, size)?;
         lookup_permuted_commitments[i * 2 + 1] =
@@ -598,6 +615,7 @@ pub fn create_proof_from_advices<
     let timer = start_timer!(|| format!("tuple lookup msm {}", tuple_lookups.len(),));
 
     for (i, (permuted_input, permuted_table, _, _, _)) in tuple_lookups.iter() {
+        println!("tuple lookup index {}", i);
         let permuted_input_buf = device.alloc_device_buffer_from_slice(&permuted_input[..])?;
         let permuted_table_buf = device.alloc_device_buffer_from_slice(&permuted_table[..])?;
         lookup_permuted_commitments[i * 2] =
@@ -607,7 +625,8 @@ pub fn create_proof_from_advices<
     }
     end_timer!(timer);
 
-    for commitment in lookup_permuted_commitments {
+    for (i, commitment) in lookup_permuted_commitments.into_iter().enumerate() {
+        println!("prover {} lookup commitment {:?}", i, commitment);
         transcript.write_point(commitment).unwrap();
     }
 
@@ -647,7 +666,7 @@ pub fn create_proof_from_advices<
                 tmp = tmp * z[i];
             }
 
-            if true {
+            if ADD_RANDOM {
                 for cell in &mut z[unusable_rows_start..] {
                     *cell = C::Scalar::random(&mut OsRng);
                 }
@@ -926,7 +945,11 @@ fn evaluate_h_gates<C: CurveAffine>(
     let h_buf = buf.unwrap();
     assert!(c.is_none());
     device.print_memory_info()?;
-    println!("xixi {} {}", ctx.allocator.len(), ctx.extended_allocator.len());
+    println!(
+        "xixi {} {}",
+        ctx.allocator.len(),
+        ctx.extended_allocator.len()
+    );
     //device.copy_from_device_to_host(&mut res[..], buf.as_ref().unwrap())?;
     end_timer!(timer);
 
@@ -957,7 +980,6 @@ fn evaluate_h_gates<C: CurveAffine>(
             .collect::<Result<Vec<_>, _>>()?;
 
         {
-            let timer = start_timer!(|| "p1");
             permutation_eval_h_p1(
                 device,
                 &h_buf,
@@ -979,7 +1001,6 @@ fn evaluate_h_gates<C: CurveAffine>(
                 last_rotation,
                 ctx.extended_size,
             )?;
-            end_timer!(timer);
 
             let mut curr_delta = beta * &C::Scalar::ZETA;
             for ((extended_p_buf, columns), polys) in extended_p_buf
@@ -987,7 +1008,6 @@ fn evaluate_h_gates<C: CurveAffine>(
                 .zip(pk.vk.cs.permutation.columns.chunks(chunk_len))
                 .zip(pk.permutation.polys.chunks(chunk_len))
             {
-                let timer = start_timer!(|| "p2");
                 let buf = ctx.extended_allocator.pop();
                 let l = if buf.is_none() {
                     device.alloc_device_buffer::<C::ScalarExt>(ctx.extended_size)?
@@ -1015,7 +1035,6 @@ fn evaluate_h_gates<C: CurveAffine>(
                     0,
                     ctx.extended_size,
                 )?;
-                end_timer!(timer);
 
                 for (value_buf, permutation) in columns
                     .iter()
@@ -1026,20 +1045,20 @@ fn evaluate_h_gates<C: CurveAffine>(
                     })
                     .zip(polys.iter())
                 {
-                    let timer_all = start_timer!(|| "p3");
-                    let timer = start_timer!(|| "alloc");
                     let buf = ctx.extended_allocator.pop();
                     let tmp = if buf.is_none() {
                         device.alloc_device_buffer::<C::ScalarExt>(ctx.extended_size)?
                     } else {
                         buf.unwrap()
                     };
+                    let buf = ctx.allocator.pop();
+                    let p_coset_buf = if buf.is_none() {
+                        device.alloc_device_buffer::<C::ScalarExt>(ctx.extended_size)?
+                    } else {
+                        buf.unwrap()
+                    };
+                    device.copy_from_host_to_device(&p_coset_buf, &permutation.values[..])?;
 
-                    let p_coset_buf =
-                        device.alloc_device_buffer_from_slice(&permutation.values[..])?;
-                    end_timer!(timer);
-
-                    let timer = start_timer!(|| "l");
                     permutation_eval_h_l(
                         &device,
                         &tmp,
@@ -1048,13 +1067,9 @@ fn evaluate_h_gates<C: CurveAffine>(
                         &p_coset_buf,
                         ctx.size,
                     )?;
-                    end_timer!(timer);
-                    
-                    let timer = start_timer!(|| "extended");
-                    do_extended_fft(&device, &mut ctx, &tmp)?;
-                    end_timer!(timer);
 
-                    let timer = start_timer!(|| "field_op_v2");
+                    do_extended_fft(&device, &mut ctx, &tmp)?;
+
                     field_op_v2::<C::ScalarExt>(
                         &device,
                         &l,
@@ -1065,24 +1080,12 @@ fn evaluate_h_gates<C: CurveAffine>(
                         ctx.extended_size,
                         FieldOp::Mul,
                     )?;
-                    end_timer!(timer);
 
                     let curr_delta_buf =
                         device.alloc_device_buffer_from_slice(&[curr_delta][..])?;
-                        
-                    let timer = start_timer!(|| "permutation_eval_h_r");
-                    permutation_eval_h_r(
-                        &device,
-                        &tmp,
-                        &curr_delta_buf,
-                        &gamma_buf,
-                        &value_buf
-                    )?;
-                    end_timer!(timer);
-                    let timer = start_timer!(|| "extended");
+
+                    permutation_eval_h_r(&device, &tmp, &curr_delta_buf, &gamma_buf, &value_buf)?;
                     do_extended_fft(&device, &mut ctx, &tmp)?;
-                    end_timer!(timer);
-                    let timer = start_timer!(|| "field_op_v2");
                     field_op_v2::<C::ScalarExt>(
                         &device,
                         &r,
@@ -1093,10 +1096,7 @@ fn evaluate_h_gates<C: CurveAffine>(
                         ctx.extended_size,
                         FieldOp::Mul,
                     )?;
-                    end_timer!(timer);
-
                     curr_delta *= &C::Scalar::DELTA;
-                    let timer = start_timer!(|| "field_op_v2");
                     field_op_v2::<C::ScalarExt>(
                         &device,
                         &l,
@@ -1107,8 +1107,6 @@ fn evaluate_h_gates<C: CurveAffine>(
                         ctx.extended_size,
                         FieldOp::Sub,
                     )?;
-                    end_timer!(timer);
-                    let timer = start_timer!(|| "field_op_v2");
                     field_op_v2::<C::ScalarExt>(
                         &device,
                         &l,
@@ -1119,8 +1117,6 @@ fn evaluate_h_gates<C: CurveAffine>(
                         ctx.extended_size,
                         FieldOp::Mul,
                     )?;
-                    end_timer!(timer);
-                    let timer = start_timer!(|| "field_op_v2");
                     field_op_v2::<C::ScalarExt>(
                         &device,
                         &h_buf,
@@ -1131,8 +1127,6 @@ fn evaluate_h_gates<C: CurveAffine>(
                         ctx.extended_size,
                         FieldOp::Mul,
                     )?;
-                    end_timer!(timer);
-                    let timer = start_timer!(|| "field_op_v2");
                     field_op_v2::<C::ScalarExt>(
                         &device,
                         &h_buf,
@@ -1143,8 +1137,6 @@ fn evaluate_h_gates<C: CurveAffine>(
                         ctx.extended_size,
                         FieldOp::Sum,
                     )?;
-                    end_timer!(timer);
-                    end_timer!(timer_all);
                 }
 
                 ctx.extended_allocator.push(l);
