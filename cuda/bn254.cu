@@ -193,38 +193,42 @@ __global__ void _field_op(
     int end = start + size_per_worker;
     end = end > n ? n : end;
 
-    Bn254FrField fl(0), fr(0);
+    Bn254FrField fl, fr;
 
     for (int i = start; i < end; i++)
     {
         if (l)
-            fl += l[(i + l_rot) & (n - 1)];
-
-        if (l_c)
-            fl += l_c[0];
+            if (l_c)
+                fl = l[(i + l_rot) & (n - 1)] * l_c[0];
+            else
+                fl = l[(i + l_rot) & (n - 1)];
+        else
+            fl = l_c[0];
 
         if (r)
-            fr += r[(i + r_rot) & (n - 1)];
-
-        if (r_c)
-            fr += r_c[0];
+            if (r_c)
+                fr = r[(i + r_rot) & (n - 1)] * r_c[0];
+            else
+                fr = r[(i + r_rot) & (n - 1)];
+        else
+            fr = r_c[0];
 
         // add
         if (op == 0)
         {
             res[i] = fl + fr;
-
-            // mul
         }
+        // mul
         else if (op == 1)
         {
             res[i] = fl * fr;
-            // neg
         }
+        // neg
         else if (op == 2)
         {
             res[i] = -fl;
         }
+        // sub
         else if (op == 3)
         {
             res[i] = fl - fr;

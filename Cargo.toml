@@ -22,4 +22,5 @@ cc = "1.0.83"
 halo2_proofs = { path = "../halo2-gpu-specific/halo2_proofs", default-features = true }
 
 [features]
+default = ["halo2_proofs/cuda"]
 hugetlb = []

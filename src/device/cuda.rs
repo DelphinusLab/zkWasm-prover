@@ -1,4 +1,3 @@
-use ark_std::{end_timer, start_timer};
 use core::cell::RefCell;
 use core::mem;
 use halo2_proofs::{arithmetic::FieldExt, plonk::evaluation_gpu::ProveExpression};

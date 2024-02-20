@@ -2,7 +2,6 @@ use super::bn254_c;
 use crate::device::cuda::{to_result, CudaBuffer, CudaDevice, CudaDeviceBufRaw};
 use crate::device::Error;
 use crate::device::{Device, DeviceResult};
-use ark_std::{end_timer, start_timer};
 use halo2_proofs::arithmetic::{CurveAffine, FieldExt};
 use halo2_proofs::pairing::group::Curve;
 use halo2_proofs::pairing::group::Group;
@@ -151,13 +150,9 @@ pub const MAX_DEG: usize = 8;
 
 pub fn ntt_prepare<F: FieldExt>(
     device: &CudaDevice,
+    omega: F,
     len_log: usize,
 ) -> DeviceResult<(CudaDeviceBufRaw, CudaDeviceBufRaw)> {
-    let mut omega = F::ROOT_OF_UNITY_INV.invert().unwrap();
-    for _ in len_log..F::S as usize {
-        omega = omega.square();
-    }
-
     let len = 1 << len_log;
     let mut omegas = vec![F::one()];
     for _ in 1..len {
@@ -221,7 +216,6 @@ pub fn intt_raw(
 ) -> Result<(), Error> {
     ntt_raw(device, s_buf, tmp_buf, pq_buf, omegas_buf, len_log)?;
     unsafe {
-        device.acitve_ctx()?;
         let err = bn254_c::field_op(
             s_buf.ptr(),
             s_buf.ptr(),
