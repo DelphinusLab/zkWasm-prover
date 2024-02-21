@@ -182,6 +182,7 @@ pub(crate) fn field_mul_sum_vec<F: FieldExt>(
     device: &CudaDevice,
     res: &CudaDeviceBufRaw,
     rhs: &Vec<(&CudaDeviceBufRaw, isize, Option<F>)>,
+    omegas: &CudaDeviceBufRaw,
     size: usize,
 ) -> Result<(), Error> {
     //println!("start field_mul_sum_vec {}", rhs.len());
@@ -238,6 +239,7 @@ pub(crate) fn field_mul_sum_vec<F: FieldExt>(
             v_buf.ptr(),
             v_c_ptr_buf.ptr(),
             v_rot_buf.ptr(),
+            omegas.ptr(),
             rhs.len() as i32,
             size as i32,
         );

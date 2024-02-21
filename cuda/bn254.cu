@@ -180,6 +180,7 @@ __global__ void _field_sum(
     Bn254FrField **v,
     Bn254FrField **v_c,
     int *v_rot,
+    Bn254FrField *omegas,
     int v_n,
     int n)
 {
@@ -195,8 +196,12 @@ __global__ void _field_sum(
         Bn254FrField fl(0), fr;
         for (int j = 0; j < v_n; j++)
         {
-            int v_i = (i + v_rot[j] + n) & (n - 1);
-            fr = v[j][v_i];
+            int v_i = i;
+
+            int omega_exp = ((n + v_rot[j]) * i) & (n - 1);
+
+            fr = v[j][v_i] * omegas[omega_exp];
+
             if (v_c[j])
             {
                 fr = fr * *v_c[j];
@@ -443,13 +448,14 @@ extern "C"
         Bn254FrField **v,
         Bn254FrField **v_c,
         int *v_rot,
+        Bn254FrField *omegas,
         int v_n,
         int n)
     {
         int threads = n >= 128 ? 128 : 1;
         int blocks = n / threads;
         blocks = blocks > 32 ? 32 : blocks;
-        _field_sum<<<blocks, threads>>>(res, v, v_c, v_rot, v_n, n);
+        _field_sum<<<blocks, threads>>>(res, v, v_c, v_rot, omegas, v_n, n);
         return cudaGetLastError();
     }
 
