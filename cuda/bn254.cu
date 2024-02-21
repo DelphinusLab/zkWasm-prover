@@ -175,6 +175,47 @@ __global__ void _ntt_core(
     }
 }
 
+__global__ void _field_sum(
+    Bn254FrField *res,
+    Bn254FrField **v,
+    Bn254FrField **v_c,
+    int *v_rot,
+    int v_n,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int worker = blockDim.x * gridDim.x;
+    int size_per_worker = (n + worker - 1) / worker;
+    int start = gid * size_per_worker;
+    int end = start + size_per_worker;
+    end = end > n ? n : end;
+
+    for (int i = start; i < end; i++)
+    {
+        Bn254FrField fl(0), fr;
+        for (int j = 0; j < v_n; j++)
+        {
+            int v_i = (i + v_rot[j] + n) & (n - 1);
+            fr = v[j][v_i];
+            if (v_c[j])
+            {
+                fr = fr * *v_c[j];
+            }
+
+            if (j == 0)
+            {
+                fl = fr;
+            }
+            else
+            {
+                fl += fr;
+            }
+        }
+
+        res[i] = fl;
+    }
+}
+
 __global__ void _field_op(
     Bn254FrField *res,
     Bn254FrField *l,
@@ -258,7 +299,7 @@ __global__ void _extended_prepare(
         int index = i % coset_powers_n;
         if (index != 0)
         {
-            s[i] = s[i] * coset_powers[index];
+            s[i] = s[i] * coset_powers[index - 1];
         }
     }
 }
@@ -397,6 +438,21 @@ __global__ void _permutation_eval_h_r(
 
 extern "C"
 {
+    cudaError_t field_sum(
+        Bn254FrField *res,
+        Bn254FrField **v,
+        Bn254FrField **v_c,
+        int *v_rot,
+        int v_n,
+        int n)
+    {
+        int threads = n >= 128 ? 128 : 1;
+        int blocks = n / threads;
+        blocks = blocks > 32 ? 32 : blocks;
+        _field_sum<<<blocks, threads>>>(res, v, v_c, v_rot, v_n, n);
+        return cudaGetLastError();
+    }
+
     cudaError_t extended_prepare(
         Bn254FrField *s,
         Bn254FrField *coset_powers,

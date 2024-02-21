@@ -126,7 +126,8 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
         self.acitve_ctx()?;
         let mut ptr = 0 as *mut c_void;
         unsafe {
-            let res = cuda_runtime_sys::cudaMalloc(&mut ptr, size * mem::size_of::<T>());
+            let size = size * mem::size_of::<T>();
+            let res = cuda_runtime_sys::cudaMalloc(&mut ptr, size);
             //self.print_memory_info()?;
             to_result(
                 CudaDeviceBufRaw {

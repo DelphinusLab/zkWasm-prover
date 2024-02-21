@@ -1038,6 +1038,7 @@ dependencies = [
  "halo2_proofs",
  "lazy_static",
  "libc",
+ "rand",
  "rayon",
  "thread_local",
 ]

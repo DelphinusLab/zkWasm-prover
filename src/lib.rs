@@ -9,7 +9,9 @@ use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
 use cuda::bn254::buffer_copy_with_shift;
 use cuda::bn254::extended_prepare;
+use cuda::bn254::field_mul;
 use cuda::bn254::field_op;
+use cuda::bn254::field_sum;
 use cuda::bn254::FieldOp;
 use device::cuda::CudaDeviceBufRaw;
 use halo2_proofs::arithmetic::CurveAffine;
@@ -33,6 +35,7 @@ use rayon::iter::IntoParallelRefMutIterator as _;
 use rayon::iter::ParallelIterator as _;
 use rayon::slice::ParallelSlice as _;
 
+use crate::cuda::bn254::field_mul_sum_vec;
 use crate::cuda::bn254::field_op_v2;
 use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::msm;
@@ -44,6 +47,7 @@ use crate::cuda::bn254::permutation_eval_h_l;
 use crate::cuda::bn254::permutation_eval_h_p1;
 use crate::cuda::bn254::permutation_eval_h_p2;
 use crate::cuda::bn254::permutation_eval_h_r;
+use crate::cuda::bn254::pick_from_buf;
 use crate::device::cuda::CudaDevice;
 use crate::device::Device as _;
 use crate::device::DeviceResult;
@@ -952,7 +956,7 @@ fn evaluate_h_gates<C: CurveAffine>(
 
     device.print_memory_info()?;
     let timer = start_timer!(|| "evaluate_h gates");
-    let ((buf, c), _) = evaluate_prove_expr(
+    let buf = evaluate_prove_expr(
         device,
         &pk.ev.gpu_gates_expr[0],
         &fixed_buf[..],
@@ -960,8 +964,10 @@ fn evaluate_h_gates<C: CurveAffine>(
         &instance_buf[..],
         &mut ctx,
     )?;
-    let h_buf = buf.unwrap();
-    assert!(c.is_none());
+    let h_buf = match buf {
+        EvalResult::SumBorrow(_, _, _) => unreachable!(),
+        EvalResult::Single(_, buf) => buf,
+    };
     device.print_memory_info()?;
     println!(
         "xixi {} {}",
@@ -973,7 +979,7 @@ fn evaluate_h_gates<C: CurveAffine>(
     end_timer!(timer);
 
     assert!(pk.ev.gpu_gates_expr.len() == 1);
-    analysis_v2(&pk.ev.gpu_gates_expr[0], 0);
+    //analysis_v2(&pk.ev.gpu_gates_expr[0], 0);
 
     /*
        let y_buf = device.alloc_device_buffer_from_slice(&[y][..])?;
@@ -1181,30 +1187,8 @@ fn do_extended_fft_v2<F: FieldExt>(
     } else {
         buf.unwrap()
     };
-    let tmp = ctx.extended_allocator.pop();
-    let mut tmp = if tmp.is_none() {
-        device.alloc_device_buffer::<F>(ctx.extended_size)?
-    } else {
-        tmp.unwrap()
-    };
     device.copy_from_host_to_device::<F>(&buf, data)?;
-    extended_prepare(
-        device,
-        &buf,
-        &ctx.coset_powers_buf,
-        2,
-        ctx.size,
-        ctx.extended_size,
-    )?;
-    ntt_raw(
-        device,
-        &mut buf,
-        &mut tmp,
-        &ctx.extended_ntt_pq_buf,
-        &ctx.extended_ntt_omegas_buf,
-        ctx.extended_k,
-    )?;
-    ctx.extended_allocator.push(tmp);
+    do_extended_fft(device, ctx, &mut buf)?;
 
     Ok(buf)
 }
@@ -1229,7 +1213,7 @@ fn do_extended_fft<F: FieldExt>(
         device,
         data,
         &ctx.coset_powers_buf,
-        2,
+        3,
         ctx.size,
         ctx.extended_size,
     )?;
@@ -1251,20 +1235,147 @@ fn do_extended_fft<F: FieldExt>(
     Ok(())
 }
 
-enum EvalResult<F>
-{
-    Single(usize, CudaDeviceBufRaw, Option<F>),
-    Sum(usize, Vec<(CudaDeviceBufRaw, isize, Option<F>)>),
+enum EvalResult<'a, F: FieldExt> {
+    SumBorrow(
+        usize,
+        Vec<(&'a CudaDeviceBufRaw, isize, Option<F>)>,
+        Option<F>,
+    ),
+    Single(usize, CudaDeviceBufRaw),
 }
 
-fn evaluate_prove_expr<F: FieldExt>(
+impl<'a, F: FieldExt> EvalResult<'a, F> {
+    fn deg(&self) -> &usize {
+        match self {
+            EvalResult::SumBorrow(deg, _, _) => deg,
+            EvalResult::Single(deg, _) => deg,
+        }
+    }
+
+    fn eval(
+        self,
+        device: &CudaDevice,
+        target_deg: usize,
+        ctx: &mut EvalHContext<F>,
+    ) -> DeviceResult<CudaDeviceBufRaw> {
+        let (mut buf, deg) = match self {
+            EvalResult::SumBorrow(deg, arr, c) => {
+                assert!(deg == 1);
+                let buf = ctx.extended_allocator.pop();
+                let res = if buf.is_none() {
+                    device.alloc_device_buffer::<F>(ctx.extended_size)?
+                } else {
+                    buf.unwrap()
+                };
+                field_mul_sum_vec(device, &res, &arr, ctx.size)?;
+                if c.is_some() {
+                    assert!(deg == 1);
+                    let mut v = [F::zero()];
+                    device.copy_from_device_to_host(&mut v[..], &res)?;
+                    v[0] += c.unwrap();
+                    device.copy_from_host_to_device(&res, &v[..])?;
+                }
+                (res, deg)
+            }
+            EvalResult::Single(deg, buf) => (buf, deg),
+        };
+
+        // switch to lagrange coeff
+        if deg != target_deg {
+            assert!(target_deg == 4);
+            do_extended_fft(device, ctx, &mut buf)?;
+        }
+        Ok(buf)
+    }
+
+    fn is_borrow(&self) -> bool {
+        match self {
+            EvalResult::SumBorrow(_, _, _) => true,
+            EvalResult::Single(_, _) => false,
+        }
+    }
+
+    fn is_const(&self) -> Option<F> {
+        match self {
+            EvalResult::SumBorrow(_, arr, c) => {
+                if arr.is_empty() {
+                    c.clone()
+                } else {
+                    None
+                }
+            }
+            EvalResult::Single(_, _) => None,
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (
+                EvalResult::SumBorrow(deg, mut l, mut l_c),
+                EvalResult::SumBorrow(r_deg, mut r, r_c),
+            ) => {
+                assert!(deg == r_deg);
+                l.append(&mut r);
+                if r_c.is_some() {
+                    if l_c.is_some() {
+                        l_c = Some(l_c.unwrap() + r_c.unwrap());
+                    } else {
+                        l_c = r_c;
+                    }
+                }
+                EvalResult::SumBorrow(deg, l, l_c)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn scale(&mut self, device: &CudaDevice, v: F, ctx: &mut EvalHContext<F>) -> DeviceResult<()> {
+        match self {
+            EvalResult::SumBorrow(_, arr, c) => {
+                *c = c.map(|x| v * x);
+                for (_, _, c) in arr {
+                    *c = if c.is_some() {
+                        Some(c.unwrap() * v)
+                    } else {
+                        Some(v)
+                    }
+                }
+            }
+            EvalResult::Single(deg, buf) => {
+                field_op_v2(
+                    device,
+                    &buf,
+                    Some(&buf),
+                    None,
+                    None,
+                    Some(v),
+                    ctx.size * *deg,
+                    FieldOp::Mul,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn eval_ys<F: FieldExt>(ys: &std::collections::BTreeMap<u32, F>, ctx: &mut EvalHContext<F>) -> F {
+    let max_y_order = *ys.keys().max().unwrap();
+    for _ in (ctx.y.len() as u32)..=max_y_order {
+        ctx.y.push(ctx.y[1] * ctx.y.last().unwrap());
+    }
+    ys.iter().fold(F::zero(), |acc, (y_order, f)| {
+        acc + ctx.y[*y_order as usize] * f
+    })
+}
+
+fn evaluate_prove_expr<'a, F: FieldExt>(
     device: &CudaDevice,
     expr: &ProveExpression<F>,
-    fixed_buf: &[CudaDeviceBufRaw],
-    advice_buf: &[CudaDeviceBufRaw],
-    instance_buf: &[CudaDeviceBufRaw],
+    fixed_buf: &'a [CudaDeviceBufRaw],
+    advice_buf: &'a [CudaDeviceBufRaw],
+    instance_buf: &'a [CudaDeviceBufRaw],
     ctx: &mut EvalHContext<F>,
-) -> DeviceResult<((Option<CudaDeviceBufRaw>, Option<F>), usize)> {
+) -> DeviceResult<EvalResult<'a, F>> {
     match expr {
         ProveExpression::Unit(u) => {
             //let timer = start_timer!(|| "handle unit");
@@ -1285,149 +1396,56 @@ fn evaluate_prove_expr<F: FieldExt>(
 
             let rot = rotation.0 as isize;
 
-            let res = ctx.extended_allocator.pop();
-            let res = if res.is_none() {
-                device.alloc_device_buffer::<F>(ctx.extended_size)?
-            } else {
-                res.unwrap()
-            };
-            buffer_copy_with_shift::<F>(device, &res, src, rot, ctx.size)?;
-            device.synchronize()?;
-            //end_timer!(timer);
-            Ok(((Some(res), None), 1))
+            Ok(EvalResult::SumBorrow(1, vec![(src, rot, None)], None))
         }
         ProveExpression::Op(l, r, op) => {
-            let ((mut l_buf, l_c), mut l_deg) =
-                evaluate_prove_expr(device, l, fixed_buf, advice_buf, instance_buf, ctx)?;
-            let ((mut r_buf, r_c), r_deg) =
-                evaluate_prove_expr(device, r, fixed_buf, advice_buf, instance_buf, ctx)?;
+            let l = evaluate_prove_expr(device, l, fixed_buf, advice_buf, instance_buf, ctx)?;
+            let r = evaluate_prove_expr(device, r, fixed_buf, advice_buf, instance_buf, ctx)?;
 
-            //let timer = start_timer!(|| format!("handle op {:?} {} {}", op, l_deg, r_deg));
-            // align degree
-            if l_deg != r_deg || *op == Bop::Product && l_c.is_none() && r_c.is_none() {
-                if l_deg == 1 && l_buf.is_some() {
-                    do_extended_fft(device, ctx, l_buf.as_mut().unwrap())?;
-                    l_deg = 4;
+            let l_deg = *l.deg();
+            let r_deg = *r.deg();
+
+            match op {
+                Bop::Sum => {
+                    if l_deg == r_deg && l.is_borrow() && r.is_borrow() {
+                        assert!(l_deg == 1);
+                        return Ok(l.merge(r));
+                    }
+                    if true || l_deg.max(r_deg) == 4 {
+                        let l = l.eval(device, 4, ctx)?;
+                        let r = r.eval(device, 4, ctx)?;
+                        field_sum::<F>(device, &l, &r, ctx.extended_size)?;
+                        ctx.extended_allocator.push(r);
+                        return Ok(EvalResult::Single(4, l));
+                    }
+                    unreachable!()
+                    /* else {
+                        let l = l.eval(device, l_deg, ctx)?;
+                        let r = r.eval(device, r_deg, ctx)?;
+                        let (res, other) = if l_deg >= r_deg { (l, r) } else { (r, l) };
+                        field_sum::<F>(device, &res, &other, ctx.size)?;
+                        ctx.extended_allocator.push(other);
+                        Ok(EvalResult::Single(l_deg.max(r_deg), res))
+                    } */
                 }
-                if r_deg == 1 && r_buf.is_some() {
-                    do_extended_fft(device, ctx, r_buf.as_mut().unwrap())?;
+                Bop::Product => {
+                    let l = l.eval(device, 4, ctx)?;
+                    let r = r.eval(device, 4, ctx)?;
+                    field_mul::<F>(device, &l, &r, ctx.extended_size)?;
+                    ctx.extended_allocator.push(r);
+                    Ok(EvalResult::Single(4, l))
                 }
             }
-
-            // special case for add constant on poly coset
-            if *op == Bop::Sum && l_deg == 1 && l_buf.is_some() && r_buf.is_none() && r_c.is_some()
-            {
-                let mut coset0 = vec![F::zero()];
-                device.copy_from_device_to_host(&mut coset0[..], l_buf.as_ref().unwrap())?;
-                coset0[0] += if l_c.is_some() {
-                    r_c.unwrap() * l_c.unwrap().invert().unwrap()
-                } else {
-                    r_c.unwrap()
-                };
-                device.copy_from_host_to_device(l_buf.as_ref().unwrap(), &coset0[..])?;
-            } else if *op == Bop::Sum
-                && r_deg == 1
-                && l_buf.is_none()
-                && l_c.is_some()
-                && r_buf.is_some()
-            {
-                let mut coset0 = vec![F::zero()];
-                device.copy_from_device_to_host(&mut coset0[..], r_buf.as_ref().unwrap())?;
-                coset0[0] += if r_c.is_some() {
-                    l_c.unwrap() * r_c.unwrap().invert().unwrap()
-                } else {
-                    l_c.unwrap()
-                };
-                device.copy_from_host_to_device(r_buf.as_ref().unwrap(), &coset0[..])?;
-            } else {
-                let res = if l_buf.is_some() {
-                    l_buf.as_ref().unwrap()
-                } else {
-                    r_buf.as_ref().unwrap()
-                };
-                field_op::<F>(
-                    device,
-                    res,
-                    l_buf.as_ref(),
-                    0,
-                    l_c,
-                    r_buf.as_ref(),
-                    0,
-                    r_c,
-                    if l_deg == 1 {
-                        ctx.size
-                    } else {
-                        ctx.extended_size
-                    },
-                    if *op == Bop::Sum {
-                        FieldOp::Sum
-                    } else {
-                        FieldOp::Mul
-                    },
-                )?;
-            }
-
-            let (res, other) = if l_buf.is_some() {
-                (l_buf.unwrap(), r_buf)
-            } else {
-                (r_buf.unwrap(), l_buf)
-            };
-
-            if other.is_some() {
-                ctx.extended_allocator.push(other.unwrap());
-            }
-            device.synchronize()?;
-            //end_timer!(timer);
-
-            Ok(((Some(res), None), l_deg))
         }
         ProveExpression::Y(ys) => {
-            //let timer = start_timer!(|| "handle y");
-            let max_y_order = *ys.keys().max().unwrap();
-            for _ in (ctx.y.len() as u32)..=max_y_order {
-                ctx.y.push(ctx.y[1] * ctx.y.last().unwrap());
-            }
-            let c = ys.iter().fold(F::zero(), |acc, (y_order, f)| {
-                acc + ctx.y[*y_order as usize] * f
-            });
-            device.synchronize()?;
-            // end_timer!(timer);
-
-            Ok(((None, Some(c)), 1))
+            let c = eval_ys(ys, ctx);
+            Ok(EvalResult::SumBorrow(1, vec![], Some(c)))
         }
         ProveExpression::Scale(l, ys) => {
-            let ((l_buf, l_c), l_deg) =
-                evaluate_prove_expr(device, l, fixed_buf, advice_buf, instance_buf, ctx)?;
-            //let timer = start_timer!(|| "handle scale {}");
-            let max_y_order = *ys.keys().max().unwrap();
-            for _ in (ctx.y.len() as u32)..=max_y_order {
-                ctx.y.push(ctx.y[1] * ctx.y.last().unwrap());
-            }
-            let c = ys.iter().fold(F::zero(), |acc, (y_order, f)| {
-                acc + ctx.y[*y_order as usize] * f
-            });
-            /*
-            field_op(
-                device,
-                l_buf.as_ref().unwrap(),
-                l_buf.as_ref(),
-                0,
-                None,
-                None,
-                0,
-                Some(c),
-                if l_deg == 1 {
-                    ctx.size
-                } else {
-                    ctx.extended_size
-                },
-                FieldOp::Mul,
-            )?;
-            device.synchronize()?;
-             */
-            //end_timer!(timer);
-
-            Ok(((l_buf, l_c.map_or(Some(c), |x| Some(x * c))), l_deg))
+            let mut l = evaluate_prove_expr(device, l, fixed_buf, advice_buf, instance_buf, ctx)?;
+            let c = eval_ys(ys, ctx);
+            l.scale(device, c, ctx)?;
+            Ok(l)
         }
     }
 }
