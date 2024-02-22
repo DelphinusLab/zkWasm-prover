@@ -46,44 +46,7 @@ pub(crate) fn field_op_v2<F: FieldExt>(
     size: usize,
     op: FieldOp,
 ) -> Result<(), Error> {
-    let mut expect = vec![];
-    for _ in 0..CHECK_COUNT {
-        let i = rand::random::<usize>() % size;
-        let mut x = F::zero();
-        if l.is_some() {
-            x = pick_from_buf::<F>(device, l.unwrap(), 0, i as isize, size).unwrap();
-        }
-        if l_c.is_some() {
-            x += l_c.unwrap();
-        }
-
-        let mut y = F::zero();
-        if r.is_some() {
-            y = pick_from_buf::<F>(device, r.unwrap(), 0, i as isize, size).unwrap();
-        }
-        if r_c.is_some() {
-            y += r_c.unwrap();
-        }
-
-        let v = match op {
-            FieldOp::Sum => x + y,
-            FieldOp::Mul => x * y,
-            FieldOp::Neg => todo!(),
-            FieldOp::Sub => todo!(),
-        };
-
-        expect.push((i, v));
-    }
-
     field_op(device, res, l, 0, l_c, r, 0, r_c, size, op)?;
-
-    for (i, expect) in expect {
-        let res = pick_from_buf::<F>(device, res, 0, i as isize, size).unwrap();
-        if expect != res {
-            println!("wrong at {}", i);
-            assert_eq!(expect, res);
-        }
-    }
 
     Ok(())
 }
@@ -222,35 +185,31 @@ pub(crate) fn field_op<F: FieldExt>(
     op: FieldOp,
 ) -> Result<(), Error> {
     let l_c = if l_c.is_none() {
-        0usize as *mut _
+        None
     } else {
-        device
-            .alloc_device_buffer_from_slice([l_c.unwrap()].as_slice())?
-            .ptr()
+        Some(device.alloc_device_buffer_from_slice([l_c.unwrap()].as_slice())?)
     };
     let r_c = if r_c.is_none() {
-        0usize as *mut _
+        None
     } else {
-        device
-            .alloc_device_buffer_from_slice([r_c.unwrap()].as_slice())?
-            .ptr()
+        Some(device.alloc_device_buffer_from_slice([r_c.unwrap()].as_slice())?)
     };
+
     unsafe {
         device.acitve_ctx()?;
         let err = bn254_c::field_op(
             res.ptr(),
             l.map_or(0usize as *mut _, |x| x.ptr()),
             l_rot,
-            l_c,
+            l_c.as_ref().map_or(0usize as *mut _, |x| x.ptr()),
             r.map_or(0usize as *mut _, |x| x.ptr()),
             r_rot,
-            r_c,
+            r_c.as_ref().map_or(0usize as *mut _, |x| x.ptr()),
             size as i32,
             op as i32,
         );
         to_result((), err, "fail to run field_op")?;
     }
-    device.synchronize()?;
     Ok(())
 }
 

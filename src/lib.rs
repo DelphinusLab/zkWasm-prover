@@ -1,6 +1,7 @@
 #![feature(allocator_api)]
 #![feature(get_mut_unchecked)]
 
+use std::iter;
 use std::sync::Arc;
 use std::thread;
 
@@ -16,6 +17,9 @@ use halo2_proofs::plonk::Any;
 use halo2_proofs::plonk::Expression;
 use halo2_proofs::plonk::ProvingKey;
 use halo2_proofs::poly::commitment::Params;
+use halo2_proofs::poly::multiopen::ProverQueryGeneral;
+use halo2_proofs::poly::multiopen::Query;
+use halo2_proofs::poly::Rotation;
 use halo2_proofs::transcript::EncodedChallenge;
 use halo2_proofs::transcript::TranscriptWrite;
 use rayon::iter::IndexedParallelIterator as _;
@@ -25,10 +29,13 @@ use rayon::iter::IntoParallelRefMutIterator as _;
 use rayon::iter::ParallelIterator as _;
 use rayon::slice::ParallelSlice as _;
 
+use crate::cuda::bn254::field_op_v2;
+use crate::cuda::bn254::field_sum;
 use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::msm;
 use crate::cuda::bn254::msm_with_groups;
 use crate::cuda::bn254::ntt_prepare;
+use crate::cuda::bn254::FieldOp;
 use crate::device::cuda::CudaDevice;
 use crate::device::Device as _;
 use crate::device::DeviceResult;
@@ -300,7 +307,6 @@ pub fn create_proof_from_advices<
     let k = pk.get_vk().domain.k() as usize;
     let size = 1 << pk.get_vk().domain.k();
     let extended_k = pk.get_vk().domain.extended_k() as usize;
-    let rot_scale = 1 << (extended_k - k);
     let meta = &pk.vk.cs;
     let unusable_rows_start = params.n as usize - (meta.blinding_factors() + 1);
     let omega = pk.get_vk().domain.get_omega();
@@ -369,11 +375,11 @@ pub fn create_proof_from_advices<
             .par_iter()
             .map(|_| {
                 let mut permuted_input = Vec::new_in(HugePageAllocator);
-                permuted_input.resize(size, C::ScalarExt::zero());
+                permuted_input.resize(size, C::Scalar::zero());
                 let mut permuted_table = Vec::new_in(HugePageAllocator);
-                permuted_table.resize(size, C::ScalarExt::zero());
+                permuted_table.resize(size, C::Scalar::zero());
                 let mut z = Vec::new_in(HugePageAllocator);
-                z.resize(size, C::ScalarExt::zero());
+                z.resize(size, C::Scalar::zero());
                 (permuted_input, permuted_table, z)
             })
             .collect::<Vec<_>>();
@@ -460,7 +466,7 @@ pub fn create_proof_from_advices<
     }
     end_timer!(timer);
 
-    let theta: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
+    let theta: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
     println!("theta is {:?}", theta);
 
     let timer = start_timer!(|| "wait single lookups");
@@ -564,9 +570,9 @@ pub fn create_proof_from_advices<
         transcript.write_point(commitment).unwrap();
     }
 
-    let beta: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
+    let beta: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
     println!("beta is {:?}", beta);
-    let gamma: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
+    let gamma: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
     println!("gamma is {:?}", gamma);
 
     let mut lookups = vec![];
@@ -594,7 +600,7 @@ pub fn create_proof_from_advices<
                 *z *= (beta + input_value) * &(gamma + table_value);
             }
 
-            let mut tmp = C::ScalarExt::one();
+            let mut tmp = C::Scalar::one();
             for i in 0..=unusable_rows_start {
                 std::mem::swap(&mut tmp, &mut z[i]);
                 tmp = tmp * z[i];
@@ -622,8 +628,8 @@ pub fn create_proof_from_advices<
     let timer = start_timer!(|| "prepare ntt");
     let (intt_omegas_buf, intt_pq_buf) =
         ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
-    let intt_divisor_buf = device
-        .alloc_device_buffer_from_slice::<C::ScalarExt>(&[pk.get_vk().domain.ifft_divisor])?;
+    let intt_divisor_buf =
+        device.alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
     end_timer!(timer);
 
     let chunk_len = &pk.vk.cs.degree() - 2;
@@ -660,7 +666,7 @@ pub fn create_proof_from_advices<
                 let mut delta_omega = C::Scalar::DELTA.pow_vartime([i as u64 * chunk_len as u64]);
 
                 let mut modified_values = Vec::new_in(HugePageAllocator);
-                modified_values.resize(size, C::ScalarExt::one());
+                modified_values.resize(size, C::Scalar::one());
 
                 // Iterate over each column of the permutation
                 for (&column, permuted_column_values) in columns.iter().zip(permutations.iter()) {
@@ -699,7 +705,7 @@ pub fn create_proof_from_advices<
             })
             .collect::<Vec<_>>();
 
-        let mut tmp = C::ScalarExt::one();
+        let mut tmp = C::Scalar::one();
         for z in p_z.iter_mut() {
             for i in 0..size {
                 std::mem::swap(&mut tmp, &mut z[i]);
@@ -721,9 +727,9 @@ pub fn create_proof_from_advices<
     let mut lookup_z_commitments = vec![];
 
     let timer = start_timer!(|| "lookup intt and z msm");
-    let mut tmp_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
-    let mut ntt_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
-    for (permuted_input, permuted_table, input, table, z) in lookups.iter_mut() {
+    let mut tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+    let mut ntt_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+    for (permuted_input, permuted_table, _, _, z) in lookups.iter_mut() {
         device.copy_from_host_to_device(&ntt_buf, &z[..])?;
         let commitment = msm_with_groups(&device, &g_lagrange_buf, &ntt_buf, size, 1)?;
         lookup_z_commitments.push(commitment);
@@ -769,7 +775,7 @@ pub fn create_proof_from_advices<
     end_timer!(timer);
 
     let timer = start_timer!(|| "permutation z msm and intt");
-    for (i, z) in permutation_products.iter_mut().enumerate() {
+    for (_i, z) in permutation_products.iter_mut().enumerate() {
         device.copy_from_host_to_device(&ntt_buf, &z[..])?;
         let commitment = msm_with_groups(&device, &g_lagrange_buf, &ntt_buf, size, 1)?;
         transcript.write_point(commitment).unwrap();
@@ -785,7 +791,7 @@ pub fn create_proof_from_advices<
         device.copy_from_device_to_host(&mut z[..], &ntt_buf)?;
     }
 
-    for (i, commitment) in lookup_z_commitments.into_iter().enumerate() {
+    for (_i, commitment) in lookup_z_commitments.into_iter().enumerate() {
         transcript.write_point(commitment).unwrap();
     }
 
@@ -794,7 +800,7 @@ pub fn create_proof_from_advices<
         halo2_proofs::plonk::vanishing::Argument::commit(params, &pk.vk.domain, OsRng, transcript)
             .unwrap();
 
-    let y: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
+    let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
     println!("y is {:?}", y);
 
     let timer = start_timer!(|| "h_poly");
@@ -826,8 +832,7 @@ pub fn create_proof_from_advices<
         .collect::<Vec<_>>()[..];
 
     let mut h = Vec::new_in(HugePageAllocator);
-    h.resize(1 << extended_k, C::ScalarExt::zero());
-    end_timer!(timer);
+    h.resize(1 << extended_k, C::Scalar::zero());
 
     evaluate_h_gates(
         &device,
@@ -862,7 +867,7 @@ pub fn create_proof_from_advices<
         .construct_general(params, domain, &mut h[..], transcript)
         .unwrap();
 
-    let x: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
+    let x: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
     let xn = x.pow_vartime(&[params.n as u64]);
     println!("x {:?}", x);
     end_timer!(timer);
@@ -896,23 +901,17 @@ pub fn create_proof_from_advices<
     let permutation_products_len = permutation_products.len();
     for (i, poly) in permutation_products.iter().enumerate() {
         inputs.push((&poly, x));
-        inputs.push((
-            &poly,
-            domain.rotate_omega(x, halo2_proofs::poly::Rotation::next()),
-        ));
+        inputs.push((&poly, domain.rotate_omega(x, Rotation::next())));
         if i != permutation_products_len - 1 {
             inputs.push((
                 &poly,
-                domain.rotate_omega(
-                    x,
-                    halo2_proofs::poly::Rotation(-((meta.blinding_factors() + 1) as i32)),
-                ),
+                domain.rotate_omega(x, Rotation(-((meta.blinding_factors() + 1) as i32))),
             ));
         }
     }
 
-    let x_inv = domain.rotate_omega(x, halo2_proofs::poly::Rotation::prev());
-    let x_next = domain.rotate_omega(x, halo2_proofs::poly::Rotation::next());
+    let x_inv = domain.rotate_omega(x, Rotation::prev());
+    let x_next = domain.rotate_omega(x, Rotation::next());
 
     for (permuted_input, permuted_table, _, _, z) in lookups.iter() {
         inputs.push((z, x));
@@ -931,8 +930,240 @@ pub fn create_proof_from_advices<
     }
     end_timer!(timer);
 
-    let fake: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
-    println!("fake {:?}", fake);
+    let timer = start_timer!(|| "multi open");
+    let h_pieces = vanishing
+        .h_pieces
+        .iter()
+        .rev()
+        .fold(domain.empty_coeff(), |acc, eval| acc * xn + eval);
+
+    let advices_arr = [advices];
+    let permutation_products_arr = [permutation_products];
+    let lookups_arr = [lookups];
+
+    let instances =
+        instance
+            .iter()
+            .zip(advices_arr.iter())
+            .zip(permutation_products_arr.iter())
+            .zip(lookups_arr.iter())
+            .flat_map(|(((instance, advice), permutation), lookups)| {
+                iter::empty()
+                    .chain((&pk).vk.cs.instance_queries.iter().map(|&(column, at)| {
+                        ProverQueryGeneral {
+                            point: domain.rotate_omega(x, at),
+                            rotation: at,
+                            poly: &instance.instance_polys[column.index()].values[..],
+                        }
+                    }))
+                    .chain((&pk).vk.cs.advice_queries.iter().map(|&(column, at)| {
+                        ProverQueryGeneral {
+                            point: domain.rotate_omega(x, at),
+                            rotation: at,
+                            poly: &advice[column.index()],
+                        }
+                    }))
+                    .chain(permutation_product_open(&pk, &permutation[..], x))
+                    .chain(
+                        lookups
+                            .iter()
+                            .flat_map(|lookup| {
+                                lookup_open(&pk, (&lookup.0[..], &lookup.1[..], &lookup.4[..]), x)
+                            })
+                            .into_iter(),
+                    )
+            })
+            .chain(
+                (&pk)
+                    .vk
+                    .cs
+                    .fixed_queries
+                    .iter()
+                    .map(|&(column, at)| ProverQueryGeneral {
+                        point: domain.rotate_omega(x, at),
+                        rotation: at,
+                        poly: &pk.fixed_polys[column.index()],
+                    }),
+            )
+            .chain(
+                (&pk)
+                    .permutation
+                    .polys
+                    .iter()
+                    .map(move |poly| ProverQueryGeneral {
+                        point: x,
+                        rotation: Rotation::cur(),
+                        poly: &poly.values[..],
+                    }),
+            )
+            // We query the h(X) polynomial at x
+            .chain(
+                iter::empty()
+                    .chain(Some(ProverQueryGeneral {
+                        point: x,
+                        rotation: Rotation::cur(),
+                        poly: &h_pieces,
+                    }))
+                    .chain(Some(ProverQueryGeneral {
+                        point: x,
+                        rotation: Rotation::cur(),
+                        poly: &vanishing.committed.random_poly,
+                    })),
+            );
+
+    multiopen(&device, params, transcript, instances)?;
+    end_timer!(timer);
 
     Ok(())
+}
+
+fn multiopen<'a, I, C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
+    device: &CudaDevice,
+    params: &Params<C>,
+    transcript: &mut T,
+    queries: I,
+) -> DeviceResult<()>
+where
+    I: IntoIterator<Item = ProverQueryGeneral<'a, C>>,
+{
+    let v: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
+    println!("v is {:?}", v);
+
+    let commitment_data = halo2_proofs::poly::multiopen::construct_intermediate_sets(queries);
+
+    // Sort by len to compute large batch first
+    let ws = commitment_data
+        .into_par_iter()
+        .map(|commitment_at_a_point| -> DeviceResult<_> {
+            println!("queries {}", commitment_at_a_point.queries.len());
+            let poly_batch_buf = device.alloc_device_buffer::<C::Scalar>(params.n as usize)?;
+            let tmp_buf = device.alloc_device_buffer::<C::Scalar>(params.n as usize)?;
+
+            let mut poly_batch = Vec::new_in(HugePageAllocator);
+            poly_batch.resize(params.n as usize, C::Scalar::zero());
+
+            let z = commitment_at_a_point.point;
+
+            device.copy_from_host_to_device(
+                &poly_batch_buf,
+                commitment_at_a_point.queries[0].get_commitment(),
+            )?;
+
+            for query in commitment_at_a_point.queries.iter().skip(1) {
+                assert_eq!(query.get_point(), z);
+                device.copy_from_host_to_device(&tmp_buf, query.get_commitment())?;
+
+                field_op_v2(
+                    device,
+                    &poly_batch_buf,
+                    Some(&poly_batch_buf),
+                    Some(v),
+                    Some(&tmp_buf),
+                    None,
+                    params.n as usize,
+                    FieldOp::Sum,
+                )?;
+            }
+
+            device.copy_from_device_to_host(&mut poly_batch[..], &poly_batch_buf)?;
+            let eval_batch = halo2_proofs::arithmetic::eval_polynomial_st(
+                &poly_batch,
+                commitment_at_a_point.queries[0].get_point(),
+            );
+            poly_batch[0] -= eval_batch;
+            let witness_poly = halo2_proofs::arithmetic::kate_division(&poly_batch, z);
+            Ok(witness_poly)
+        })
+        .collect::<DeviceResult<Vec<_>>>()?;
+
+    let timer = start_timer!(|| "msm");
+    let s_buf = device.alloc_device_buffer::<C::Scalar>(params.n as usize)?;
+    let p_buf = device.alloc_device_buffer_from_slice(&params.g[..])?;
+    for witness_poly in ws {
+        device.copy_from_host_to_device(&s_buf, &witness_poly[..])?;
+        let commitment = msm_with_groups(&device, &p_buf, &s_buf, params.n as usize, 1)?;
+        println!("commitment is {:?}", commitment);
+        transcript.write_point(commitment).unwrap();
+    }
+    end_timer!(timer);
+
+    Ok(())
+}
+
+fn permutation_product_open<'a, C: CurveAffine>(
+    pk: &'a ProvingKey<C>,
+    products: &'a [Vec<C::Scalar, HugePageAllocator>],
+    x: C::Scalar,
+) -> impl Iterator<Item = ProverQueryGeneral<'a, C>> + Clone {
+    let blinding_factors = pk.vk.cs.blinding_factors();
+    let x_next = pk.vk.domain.rotate_omega(x, Rotation::next());
+    let x_last = pk
+        .vk
+        .domain
+        .rotate_omega(x, Rotation(-((blinding_factors + 1) as i32)));
+
+    iter::empty()
+        .chain(products.iter().flat_map(move |product| {
+            iter::empty()
+                .chain(Some(ProverQueryGeneral {
+                    point: x,
+                    rotation: Rotation::cur(),
+                    poly: &product,
+                }))
+                .chain(Some(ProverQueryGeneral {
+                    point: x_next,
+                    rotation: Rotation::next(),
+                    poly: &product,
+                }))
+        }))
+        .chain(products.iter().rev().skip(1).flat_map(move |product| {
+            Some(ProverQueryGeneral {
+                point: x_last,
+                rotation: Rotation(-((blinding_factors + 1) as i32)),
+                poly: &product,
+            })
+        }))
+}
+
+pub fn lookup_open<'a, C: CurveAffine>(
+    pk: &'a ProvingKey<C>,
+    lookup: (&'a [C::Scalar], &'a [C::Scalar], &'a [C::Scalar]),
+    x: C::Scalar,
+) -> impl Iterator<Item = ProverQueryGeneral<'a, C>> + Clone {
+    let x_inv = pk.vk.domain.rotate_omega(x, Rotation::prev());
+    let x_next = pk.vk.domain.rotate_omega(x, Rotation::next());
+
+    let (permuted_input, permuted_table, z) = lookup;
+
+    iter::empty()
+        // Open lookup product commitments at x
+        .chain(Some(ProverQueryGeneral {
+            point: x,
+            rotation: Rotation::cur(),
+            poly: z,
+        }))
+        // Open lookup input commitments at x
+        .chain(Some(ProverQueryGeneral {
+            point: x,
+            rotation: Rotation::cur(),
+            poly: permuted_input,
+        }))
+        // Open lookup table commitments at x
+        .chain(Some(ProverQueryGeneral {
+            point: x,
+            rotation: Rotation::cur(),
+            poly: permuted_table,
+        }))
+        // Open lookup input commitments at x_inv
+        .chain(Some(ProverQueryGeneral {
+            point: x_inv,
+            rotation: Rotation::prev(),
+            poly: permuted_input,
+        }))
+        // Open lookup product commitments at x_next
+        .chain(Some(ProverQueryGeneral {
+            point: x_next,
+            rotation: Rotation::next(),
+            poly: z,
+        }))
 }

@@ -257,8 +257,8 @@ __global__ void _field_mul_unaligned(
     Bn254FrField *l,
     Bn254FrField *r,
     int r_n,
-    int n
-) {
+    int n)
+{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
     l[i] = l[i] * r[i % r_n];
@@ -275,57 +275,48 @@ __global__ void _field_op(
     int n,
     int op)
 {
-    int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    int worker = blockDim.x * gridDim.x;
-    int size_per_worker = (n + worker - 1) / worker;
-    int start = gid * size_per_worker;
-    int end = start + size_per_worker;
-    end = end > n ? n : end;
-
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
     Bn254FrField fl, fr;
 
-    for (int i = start; i < end; i++)
+    if (l)
+        if (l_c)
+            fl = l[(i + l_rot) & (n - 1)] * l_c[0];
+        else
+            fl = l[(i + l_rot) & (n - 1)];
+    else
+        fl = l_c[0];
+
+    if (r)
+        if (r_c)
+            fr = r[(i + r_rot) & (n - 1)] * r_c[0];
+        else
+            fr = r[(i + r_rot) & (n - 1)];
+    else
+        fr = r_c[0];
+
+    // add
+    if (op == 0)
     {
-        if (l)
-            if (l_c)
-                fl = l[(i + l_rot) & (n - 1)] * l_c[0];
-            else
-                fl = l[(i + l_rot) & (n - 1)];
-        else
-            fl = l_c[0];
-
-        if (r)
-            if (r_c)
-                fr = r[(i + r_rot) & (n - 1)] * r_c[0];
-            else
-                fr = r[(i + r_rot) & (n - 1)];
-        else
-            fr = r_c[0];
-
-        // add
-        if (op == 0)
-        {
-            res[i] = fl + fr;
-        }
-        // mul
-        else if (op == 1)
-        {
-            res[i] = fl * fr;
-        }
-        // neg
-        else if (op == 2)
-        {
-            res[i] = -fl;
-        }
-        // sub
-        else if (op == 3)
-        {
-            res[i] = fl - fr;
-        }
-        else
-        {
-            assert(0);
-        }
+        res[i] = fl + fr;
+    }
+    // mul
+    else if (op == 1)
+    {
+        res[i] = fl * fr;
+    }
+    // neg
+    else if (op == 2)
+    {
+        res[i] = -fl;
+    }
+    // sub
+    else if (op == 3)
+    {
+        res[i] = fl - fr;
+    }
+    else
+    {
+        assert(0);
     }
 }
 
@@ -708,6 +699,7 @@ extern "C"
         _msm_mont_unmont<<<blocks, threads>>>(p, s, false, n);
         _msm_core<<<dim3(32, msm_blocks), threads>>>(res, p, s, n);
         _msm_mont_unmont<<<blocks, threads>>>(p, s, true, n);
+        cudaDeviceSynchronize();
         return cudaGetLastError();
     }
 

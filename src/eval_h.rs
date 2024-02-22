@@ -93,7 +93,6 @@ pub(crate) fn analyze_expr_tree<F: FieldExt>(
             v_new_clean.insert(unit.get_group());
             muls_new += exp;
         }
-        muls_new -= 1;
 
         if v_new.len() > limit {
             v = v_new_clean;
@@ -186,7 +185,6 @@ pub(crate) fn evaluate_h_gates<C: CurveAffine>(
     let timer = start_timer!(|| "evaluate_h setup");
     let k = pk.get_vk().domain.k() as usize;
     let size = 1 << pk.get_vk().domain.k();
-    let omega = pk.vk.domain.get_omega();
     let extended_k = pk.get_vk().domain.extended_k() as usize;
     let extended_size = 1 << extended_k;
     let extended_omega = pk.vk.domain.get_extended_omega();
@@ -209,6 +207,7 @@ pub(crate) fn evaluate_h_gates<C: CurveAffine>(
         extended_ntt_pq_buf,
         coset_powers_buf,
     };
+    end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h gates");
     assert!(pk.ev.gpu_gates_expr.len() == 1);
@@ -345,7 +344,7 @@ pub(crate) fn evaluate_h_gates<C: CurveAffine>(
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h lookup");
-    for (i, (lookup, (permuted_input, permuted_table, input, table, z))) in pk
+    for (_i, (lookup, (permuted_input, permuted_table, input, table, z))) in pk
         .vk
         .cs
         .lookups

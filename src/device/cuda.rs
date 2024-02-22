@@ -77,13 +77,11 @@ pub struct CudaDeviceBufRaw {
 
 impl Drop for CudaDeviceBufRaw {
     fn drop(&mut self) {
-        //std::thread::spawn(move || {
-            self.device().acitve_ctx().unwrap();
-            unsafe {
-                let res = cudaFree(self.ptr());
-                to_result((), res, "fail to free device memory").unwrap();
-            }
-        //});
+        self.device().acitve_ctx().unwrap();
+        unsafe {
+            let res = cudaFree(self.ptr());
+            to_result((), res, "fail to free device memory").unwrap();
+        }
     }
 }
 
