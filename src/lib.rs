@@ -893,8 +893,22 @@ pub fn create_proof_from_advices<
         inputs.push((&poly, x));
     }
 
-    for poly in permutation_products.iter() {
+    let permutation_products_len = permutation_products.len();
+    for (i, poly) in permutation_products.iter().enumerate() {
         inputs.push((&poly, x));
+        inputs.push((
+            &poly,
+            domain.rotate_omega(x, halo2_proofs::poly::Rotation::next()),
+        ));
+        if i != permutation_products_len - 1 {
+            inputs.push((
+                &poly,
+                domain.rotate_omega(
+                    x,
+                    halo2_proofs::poly::Rotation(-((meta.blinding_factors() + 1) as i32)),
+                ),
+            ));
+        }
     }
 
     let x_inv = domain.rotate_omega(x, halo2_proofs::poly::Rotation::prev());

@@ -253,6 +253,17 @@ __global__ void _field_op_batch_mul_sum(
     res[i] += fl;
 }
 
+__global__ void _field_mul_unaligned(
+    Bn254FrField *l,
+    Bn254FrField *r,
+    int r_n,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    l[i] = l[i] * r[i % r_n];
+}
+
 __global__ void _field_op(
     Bn254FrField *res,
     Bn254FrField *l,
