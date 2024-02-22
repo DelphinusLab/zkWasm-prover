@@ -38,20 +38,18 @@ use rayon::iter::ParallelIterator as _;
 use rayon::slice::ParallelSlice as _;
 use std::collections::BTreeMap;
 
-use crate::cuda::bn254::field_mul_sum_vec;
 use crate::cuda::bn254::field_op_v2;
 use crate::cuda::bn254::field_sub;
 use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::msm;
 use crate::cuda::bn254::msm_with_groups;
-use crate::cuda::bn254::ntt;
 use crate::cuda::bn254::ntt_prepare;
 use crate::cuda::bn254::ntt_raw;
 use crate::cuda::bn254::permutation_eval_h_l;
 use crate::cuda::bn254::permutation_eval_h_p1;
 use crate::cuda::bn254::permutation_eval_h_p2;
-use crate::cuda::bn254::permutation_eval_h_r;
 use crate::cuda::bn254::pick_from_buf;
+use crate::cuda::bn254_c::lookup_eval_h;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaDevice;
 use crate::device::Device as _;
@@ -655,7 +653,7 @@ pub fn create_proof_from_advices<
     let timer = start_timer!(|| "prepare ntt");
     let (intt_omegas_buf, intt_pq_buf) =
         ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
-    let divisor_buf = device
+    let intt_divisor_buf = device
         .alloc_device_buffer_from_slice::<C::ScalarExt>(&[pk.get_vk().domain.ifft_divisor])?;
     end_timer!(timer);
 
@@ -766,7 +764,7 @@ pub fn create_proof_from_advices<
             &mut tmp_buf,
             &intt_pq_buf,
             &intt_omegas_buf,
-            &divisor_buf,
+            &intt_divisor_buf,
             k,
         )?;
         device.copy_from_device_to_host(&mut z[..], &ntt_buf)?;
@@ -778,7 +776,7 @@ pub fn create_proof_from_advices<
             &mut tmp_buf,
             &intt_pq_buf,
             &intt_omegas_buf,
-            &divisor_buf,
+            &intt_divisor_buf,
             k,
         )?;
         device.copy_from_device_to_host(&mut permuted_input[..], &ntt_buf)?;
@@ -790,7 +788,7 @@ pub fn create_proof_from_advices<
             &mut tmp_buf,
             &intt_pq_buf,
             &intt_omegas_buf,
-            &divisor_buf,
+            &intt_divisor_buf,
             k,
         )?;
         device.copy_from_device_to_host(&mut permuted_table[..], &ntt_buf)?;
@@ -812,7 +810,7 @@ pub fn create_proof_from_advices<
             &mut tmp_buf,
             &intt_pq_buf,
             &intt_omegas_buf,
-            &divisor_buf,
+            &intt_divisor_buf,
             k,
         )?;
         device.copy_from_device_to_host(&mut z[..], &ntt_buf)?;
@@ -844,7 +842,7 @@ pub fn create_proof_from_advices<
                 &mut tmp_buf,
                 &intt_pq_buf,
                 &intt_omegas_buf,
-                &divisor_buf,
+                &intt_divisor_buf,
                 k,
             )?;
             device.copy_from_device_to_host(&mut advices[..], &ntt_buf)?;
@@ -878,6 +876,9 @@ pub fn create_proof_from_advices<
         beta,
         gamma,
         theta,
+        intt_pq_buf,
+        intt_omegas_buf,
+        intt_divisor_buf,
     )?;
     end_timer!(timer);
 
@@ -927,6 +928,9 @@ fn evaluate_h_gates<C: CurveAffine>(
     beta: C::ScalarExt,
     gamma: C::ScalarExt,
     theta: C::ScalarExt,
+    intt_pq_buf: CudaDeviceBufRaw,
+    intt_omegas_buf: CudaDeviceBufRaw,
+    intt_divisor_buf: CudaDeviceBufRaw,
 ) -> DeviceResult<Vec<C::ScalarExt, HugePageAllocator>> {
     let timer = start_timer!(|| "evaluate_h setup");
     let k = pk.get_vk().domain.k() as usize;
@@ -959,11 +963,6 @@ fn evaluate_h_gates<C: CurveAffine>(
 
     let mut res = Vec::new_in(HugePageAllocator);
     res.resize(extended_size, C::ScalarExt::zero());
-
-    let l0 = &pk.l0;
-    let l_last = &pk.l_last;
-    let l0_buf = do_extended_ntt_v2(device, &mut ctx, &l0.values[..])?;
-    let l_last_buf = do_extended_ntt_v2(device, &mut ctx, &l_last.values[..])?;
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h gates");
@@ -985,19 +984,25 @@ fn evaluate_h_gates<C: CurveAffine>(
     println!("after gates res[0..4] is {:?}", &res[0..4]);
     end_timer!(timer);
 
+    let timer = start_timer!(|| "evaluate_h prepare buffers for constants");
     let y_buf = device.alloc_device_buffer_from_slice(&[y][..])?;
     let beta_buf = device.alloc_device_buffer_from_slice(&[beta][..])?;
     let gamma_buf = device.alloc_device_buffer_from_slice(&[gamma][..])?;
     let theta_buf = device.alloc_device_buffer_from_slice(&[theta][..])?;
+
+    let l0 = &pk.l0;
+    let l_last = &pk.l_last;
+    let l_active_row = &pk.l_active_row;
+    let l0_buf = do_extended_ntt_v2(device, &mut ctx, &l0.values[..])?;
+    let l_last_buf = do_extended_ntt_v2(device, &mut ctx, &l_last.values[..])?;
+    let l_active_buf = device.alloc_device_buffer_from_slice(&l_active_row.values[..])?;
+    end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h permutation");
     if permutation_products.len() > 0 {
         let blinding_factors = pk.vk.cs.blinding_factors();
         let last_rotation = (ctx.size - (blinding_factors + 1)) << (extended_k - k);
         let chunk_len = pk.vk.cs.degree() - 2;
-
-        let l_active_row = &pk.l_active_row;
-        let l_active_buf = device.alloc_device_buffer_from_slice(&l_active_row.values[..])?;
 
         let extended_p_buf = permutation_products
             .iter()
@@ -1029,7 +1034,7 @@ fn evaluate_h_gates<C: CurveAffine>(
 
             let mut curr_delta = beta * &C::Scalar::ZETA;
             for ((extended_p_buf, columns), polys) in extended_p_buf
-                .iter()
+                .into_iter()
                 .zip(pk.vk.cs.permutation.columns.chunks(chunk_len))
                 .zip(pk.permutation.polys.chunks(chunk_len))
             {
@@ -1037,19 +1042,12 @@ fn evaluate_h_gates<C: CurveAffine>(
                 buffer_copy_with_shift::<C::ScalarExt>(
                     &device,
                     &l,
-                    extended_p_buf,
+                    &extended_p_buf,
                     1 << (extended_k - k),
                     ctx.extended_size,
                 )?;
 
-                let r = ctx.alloc(device)?;
-                buffer_copy_with_shift::<C::ScalarExt>(
-                    &device,
-                    &r,
-                    extended_p_buf,
-                    0,
-                    ctx.extended_size,
-                )?;
+                let r = extended_p_buf;
 
                 for (value, permutation) in columns
                     .iter()
@@ -1126,6 +1124,7 @@ fn evaluate_h_gates<C: CurveAffine>(
         .lookups
         .iter()
         .zip(lookup_products.iter())
+        .take(1)
         .enumerate()
     {
         let input_deg = get_expr_degree(&lookup.input_expressions);
@@ -1146,30 +1145,91 @@ fn evaluate_h_gates<C: CurveAffine>(
         end_timer!(timer);
 
         let timer = start_timer!(|| format!("evaluate_h lookup compress {}", i));
-        let input = if input_deg > 1 {
+        let input_buf = if input_deg > 1 {
             evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx)?
         } else {
             let mut buf = ctx.alloc(device)?;
             device.copy_from_host_to_device(&buf, &input)?;
+
+            let mut tmp_buf = ctx.alloc(device)?;
+            intt_raw(
+                &device,
+                &mut buf,
+                &mut tmp_buf,
+                &intt_pq_buf,
+                &intt_omegas_buf,
+                &intt_divisor_buf,
+                k,
+            )?;
+            ctx.extended_allocator.push(tmp_buf);
+
             let short = vec![input[0] + beta];
             device.copy_from_host_to_device(&buf, &short[..])?;
             do_extended_ntt(device, &mut ctx, &mut buf)?;
             buf
         };
-        let table = if table_deg > 1 {
+        let table_buf = if table_deg > 1 {
             evaluate_prove_expr(device, &vec![e2], fixed, advice, instance, &mut ctx)?
         } else {
             let mut buf = ctx.alloc(device)?;
             device.copy_from_host_to_device(&buf, &table)?;
+            
+            let mut tmp_buf = ctx.alloc(device)?;
+            intt_raw(
+                &device,
+                &mut buf,
+                &mut tmp_buf,
+                &intt_pq_buf,
+                &intt_omegas_buf,
+                &intt_divisor_buf,
+                k,
+            )?;
+            ctx.extended_allocator.push(tmp_buf);
+            
             let short = vec![table[0] + gamma];
             device.copy_from_host_to_device(&buf, &short[..])?;
             do_extended_ntt(device, &mut ctx, &mut buf)?;
             buf
         };
-        ctx.extended_allocator.push(input);
-        ctx.extended_allocator.push(table);
+
+        let permuted_input_buf = do_extended_ntt_v2(device, &mut ctx, permuted_input)?;
+        let permuted_table_buf = do_extended_ntt_v2(device, &mut ctx, permuted_table)?;
+        let z_buf = do_extended_ntt_v2(device, &mut ctx, z)?;
+
+        unsafe {
+            let timer = start_timer!(|| format!("evaluate_h lookup_eval_h core {}", i));
+            let err = lookup_eval_h(
+                h_buf.ptr(),
+                input_buf.ptr(),
+                table_buf.ptr(),
+                permuted_input_buf.ptr(),
+                table_buf.ptr(),
+                z_buf.ptr(),
+                l0_buf.ptr(),
+                l_last_buf.ptr(),
+                l_active_buf.ptr(),
+                y_buf.ptr(),
+                beta_buf.ptr(),
+                gamma_buf.ptr(),
+                1 << (extended_k - k),
+                ctx.extended_size as i32,
+            );
+
+            to_result((), err, "fail to run field_op_batch_mul_sum")?;
+            device.synchronize()?;
+            end_timer!(timer);
+        }
+
+        ctx.extended_allocator.push(input_buf);
+        ctx.extended_allocator.push(table_buf);
+        ctx.extended_allocator.push(permuted_input_buf);
+        ctx.extended_allocator.push(permuted_table_buf);
+        ctx.extended_allocator.push(z_buf);
         end_timer!(timer);
     }
+
+    device.copy_from_device_to_host(&mut res[..], &h_buf)?;
+    println!("after lookup res[0..4] is {:?}", &res[0..4]);
     end_timer!(timer);
 
     Ok(res)

@@ -561,23 +561,6 @@ pub fn permutation_eval_h_l(
     Ok(())
 }
 
-pub fn permutation_eval_h_r(
-    device: &CudaDevice,
-    res: &CudaDeviceBufRaw,
-    delta: &CudaDeviceBufRaw,
-    gamma: &CudaDeviceBufRaw,
-    value: &CudaDeviceBufRaw,
-) -> Result<(), Error> {
-    unsafe {
-        device.acitve_ctx()?;
-        let err =
-            bn254_c::permutation_eval_h_r(res.ptr(), delta.ptr(), gamma.ptr(), value.ptr(), 2);
-        to_result((), err, "fail to run permutation_eval_h_r")?;
-        device.synchronize()?;
-    }
-    Ok(())
-}
-
 pub fn buffer_copy_with_shift<F: FieldExt>(
     device: &CudaDevice,
     dst: &CudaDeviceBufRaw,

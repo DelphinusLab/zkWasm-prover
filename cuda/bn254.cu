@@ -475,6 +475,65 @@ __global__ void _permutation_eval_h_r(
     }
 }
 
+__global__ void _lookup_eval_h(
+    Bn254FrField *res,
+    const Bn254FrField *input,
+    const Bn254FrField *table,
+    const Bn254FrField *permuted_input,
+    const Bn254FrField *permuted_table,
+    const Bn254FrField *z,
+    const Bn254FrField *l0,
+    const Bn254FrField *l_last,
+    const Bn254FrField *l_active_row,
+    const Bn254FrField *y,
+    const Bn254FrField *beta,
+    const Bn254FrField *gamma,
+    int rot,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = gid;
+    int r_next = (i + rot) & (n - 1);
+    int r_prev = (i + n - rot) & (n - 1);
+
+    Bn254FrField t, u, p;
+    t = res[i];
+
+    // l_0(X) * (1 - z(X)) = 0
+    t = t * *y;
+    u = l0[i] * (Bn254FrField(1) - z[i]);
+    t += u;
+
+    // l_last(X) * (z(X)^2 - z(X)) = 0
+    t = t * *y;
+    u = l_last[i] * (z[i].sqr() - z[i]);
+    t += u;
+
+    // (1 - (l_last(X) + l_blind(X))) * (
+    //   z(\omega X) (a'(X) + \beta) (s'(X) + \gamma)
+    //   - z(X) (\theta^{m-1} a_0(X) + ... + a_{m-1}(X) + \beta)
+    //          (\theta^{m-1} s_0(X) + ... + s_{m-1}(X) + \gamma)
+    // ) = 0
+    t = t * *y;
+    u = z[r_next] * (permuted_input[i] + *beta) * (permuted_table[i] + *gamma);
+    u -= z[i] * (input[i] * table[i]);
+    u = u * l_active_row[i];
+    t += u;
+
+    // l_0(X) * (a'(X) - s'(X)) = 0
+    t = t * *y;
+    p = permuted_input[i] - permuted_table[i];
+    u = l0[i] * p;
+    t += u;
+
+    // (1 - (l_last + l_blind)) * (a′(X) − s′(X))⋅(a′(X) − a′(\omega^{-1} X)) = 0
+    t = t * *y;
+    u = l_active_row[i] * (permuted_input[i] - permuted_input[r_prev]) * p;
+    t += u;
+
+    res[i] = t;
+}
+
 extern "C"
 {
     cudaError_t field_sum(
@@ -580,17 +639,6 @@ extern "C"
         return cudaGetLastError();
     }
 
-    cudaError_t permutation_eval_h_r(
-        Bn254FrField *res,
-        const Bn254FrField *delta,
-        const Bn254FrField *gamma,
-        const Bn254FrField *p,
-        int n)
-    {
-        _permutation_eval_h_r<<<1, 2>>>(res, delta, gamma, p, n);
-        return cudaGetLastError();
-    }
-
     cudaError_t ntt(
         Bn254FrField *buf,
         Bn254FrField *tmp,
@@ -642,9 +690,36 @@ extern "C"
         _msm_mont_unmont<<<blocks, threads>>>(p, s, true, n);
         return cudaGetLastError();
     }
-}
-// Tests
 
+    cudaError_t lookup_eval_h(
+        Bn254FrField *res,
+        const Bn254FrField *input,
+        const Bn254FrField *table,
+        const Bn254FrField *permuted_input,
+        const Bn254FrField *permuted_table,
+        const Bn254FrField *z,
+        const Bn254FrField *l0,
+        const Bn254FrField *l_last,
+        const Bn254FrField *l_active_row,
+        const Bn254FrField *y,
+        const Bn254FrField *beta,
+        const Bn254FrField *gamma,
+        int rot,
+        int n)
+    {
+        int threads = n >= 64 ? 64 : 1;
+        int blocks = n / threads;
+        _lookup_eval_h<<<blocks, threads>>>(
+            res,
+            input, table, permuted_input, permuted_table, z,
+            l0, l_last, l_active_row, y,
+            beta, gamma,
+            rot, n);
+        return cudaGetLastError();
+    }
+}
+
+// Tests
 __global__ void _test_bn254_ec(
     const Bn254FrField *a,
     const Bn254FrField *b,
@@ -844,11 +919,5 @@ extern "C"
     {
         _test_bn254_ec<<<blocks, threads>>>(a, b, x, add, sub, _double, n);
         return cudaGetLastError();
-    }
-
-    cudaError_t free_async(
-        void *x)
-    {
-        cudaFreeAsync(x, 0);
     }
 }
