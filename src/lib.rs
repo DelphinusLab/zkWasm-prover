@@ -39,6 +39,7 @@ use std::collections::BTreeMap;
 
 use crate::cuda::bn254::field_mul_sum_vec;
 use crate::cuda::bn254::field_op_v2;
+use crate::cuda::bn254::field_sub;
 use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::msm;
 use crate::cuda::bn254::msm_with_groups;
@@ -50,6 +51,7 @@ use crate::cuda::bn254::permutation_eval_h_p1;
 use crate::cuda::bn254::permutation_eval_h_p2;
 use crate::cuda::bn254::permutation_eval_h_r;
 use crate::cuda::bn254::pick_from_buf;
+use crate::device::cuda::to_result;
 use crate::device::cuda::CudaDevice;
 use crate::device::Device as _;
 use crate::device::DeviceResult;
@@ -891,6 +893,17 @@ struct EvalHContext<F: FieldExt> {
     omegas_buf: CudaDeviceBufRaw,
 }
 
+impl<F: FieldExt> EvalHContext<F> {
+    fn alloc(&mut self, device: &CudaDevice) -> DeviceResult<CudaDeviceBufRaw> {
+        let buf = self.extended_allocator.pop();
+        if buf.is_none() {
+            device.alloc_device_buffer::<F>(self.extended_size)
+        } else {
+            Ok(buf.unwrap())
+        }
+    }
+}
+
 fn evaluate_h_gates<C: CurveAffine>(
     device: &CudaDevice,
     pk: &ProvingKey<C>,
@@ -935,49 +948,7 @@ fn evaluate_h_gates<C: CurveAffine>(
     res.resize(extended_size, C::ScalarExt::zero());
 
     device.print_memory_info()?;
-    /*
-    for (i, v) in fixed.iter().enumerate() {
-        println!("prover fixed {} [0..4] is {:?}", i, &v[0..4]);
-    }
-    for (i, v) in advice.iter().enumerate() {
-        println!("prover advice {} [0..4] is {:?}", i, &v[0..4]);
-    }
-    for (i, v) in instance.iter().enumerate() {
-        println!("prover instance {} [0..4] is {:?}", i, &v[0..4]);
-    }
-    */
-
-    let timer = start_timer!(|| "prepare buffer");
-    let fixed_buf = fixed
-        .iter()
-        .map(|x| device.alloc_device_buffer_from_slice(x))
-        .collect::<Result<Vec<_>, _>>()?;
-    let advice_buf = advice
-        .iter()
-        .map(|x| device.alloc_device_buffer_from_slice(x))
-        .collect::<Result<Vec<_>, _>>()?;
-    let instance_buf = instance
-        .iter()
-        .map(|x| device.alloc_device_buffer_from_slice(x))
-        .collect::<Result<Vec<_>, _>>()?;
-    end_timer!(timer);
-
-    device.print_memory_info()?;
     let timer = start_timer!(|| "evaluate_h gates");
-    /*
-    let buf = evaluate_prove_expr(
-        device,
-        &pk.ev.gpu_gates_expr[0],
-        &fixed_buf[..],
-        &advice_buf[..],
-        &instance_buf[..],
-        &mut ctx,
-    )?;
-    let h_buf = match buf {
-        EvalResult::SumBorrow(_, _, _) => unreachable!(),
-        EvalResult::Single(_, buf) => buf,
-    };
-    */
     let h_buf = evaluate_prove_expr_v2(
         device,
         &pk.ev.analyze_result,
@@ -988,16 +959,13 @@ fn evaluate_h_gates<C: CurveAffine>(
     )?;
     device.print_memory_info()?;
     println!(
-        "xixi {} {}",
+        "ctx free buffers {} {}",
         ctx.allocator.len(),
         ctx.extended_allocator.len()
     );
     device.copy_from_device_to_host(&mut res[..], &h_buf)?;
     println!("after gates res[0..4] is {:?}", &res[0..4]);
     end_timer!(timer);
-
-    assert!(pk.ev.gpu_gates_expr.len() == 1);
-    //analysis_v2(&pk.ev.gpu_gates_expr[0], 0);
 
     let y_buf = device.alloc_device_buffer_from_slice(&[y][..])?;
     let beta_buf = device.alloc_device_buffer_from_slice(&[beta][..])?;
@@ -1014,16 +982,17 @@ fn evaluate_h_gates<C: CurveAffine>(
         let l_last = &pk.l_last;
         let l_active_row = &pk.l_active_row;
 
-        let l0_buf = do_extended_fft_v2(device, &mut ctx, &l0.values[..])?;
-        let l_last_buf = do_extended_fft_v2(device, &mut ctx, &l_last.values[..])?;
+        let l0_buf = do_extended_ntt_v2(device, &mut ctx, &l0.values[..])?;
+        let l_last_buf = do_extended_ntt_v2(device, &mut ctx, &l_last.values[..])?;
         let l_active_buf = device.alloc_device_buffer_from_slice(&l_active_row.values[..])?;
 
         let extended_p_buf = permutation_products
             .iter()
-            .map(|x| do_extended_fft_v2(device, &mut ctx, x))
+            .map(|x| do_extended_ntt_v2(device, &mut ctx, x))
             .collect::<Result<Vec<_>, _>>()?;
 
         {
+            let timer = start_timer!(|| "p1");
             permutation_eval_h_p1(
                 device,
                 &h_buf,
@@ -1034,7 +1003,9 @@ fn evaluate_h_gates<C: CurveAffine>(
                 &y_buf,
                 ctx.extended_size,
             )?;
+            end_timer!(timer);
 
+            let timer = start_timer!(|| "p2");
             permutation_eval_h_p2(
                 device,
                 &h_buf,
@@ -1045,6 +1016,7 @@ fn evaluate_h_gates<C: CurveAffine>(
                 last_rotation,
                 ctx.extended_size,
             )?;
+            end_timer!(timer);
 
             let mut curr_delta = beta * &C::Scalar::ZETA;
             for ((extended_p_buf, columns), polys) in extended_p_buf
@@ -1052,12 +1024,7 @@ fn evaluate_h_gates<C: CurveAffine>(
                 .zip(pk.vk.cs.permutation.columns.chunks(chunk_len))
                 .zip(pk.permutation.polys.chunks(chunk_len))
             {
-                let buf = ctx.extended_allocator.pop();
-                let l = if buf.is_none() {
-                    device.alloc_device_buffer::<C::ScalarExt>(ctx.extended_size)?
-                } else {
-                    buf.unwrap()
-                };
+                let l = ctx.alloc(device)?;
                 buffer_copy_with_shift::<C::ScalarExt>(
                     &device,
                     &l,
@@ -1066,134 +1033,86 @@ fn evaluate_h_gates<C: CurveAffine>(
                     ctx.extended_size,
                 )?;
 
-                let buf = ctx.extended_allocator.pop();
-                let r = if buf.is_none() {
-                    device.alloc_device_buffer::<C::ScalarExt>(ctx.extended_size)?
-                } else {
-                    buf.unwrap()
-                };
+                let r = ctx.alloc(device)?;
                 buffer_copy_with_shift::<C::ScalarExt>(
                     &device,
-                    &l,
+                    &r,
                     extended_p_buf,
                     0,
                     ctx.extended_size,
                 )?;
 
-                for (value_buf, permutation) in columns
+                for (value, permutation) in columns
                     .iter()
                     .map(|&column| match column.column_type() {
-                        Any::Advice => &advice_buf[column.index()],
-                        Any::Fixed => &fixed_buf[column.index()],
-                        Any::Instance => &instance_buf[column.index()],
+                        Any::Advice => &advice[column.index()],
+                        Any::Fixed => &fixed[column.index()],
+                        Any::Instance => &instance[column.index()],
                     })
                     .zip(polys.iter())
                 {
-                    let buf = ctx.extended_allocator.pop();
-                    let mut tmp = if buf.is_none() {
-                        device.alloc_device_buffer::<C::ScalarExt>(ctx.extended_size)?
-                    } else {
-                        buf.unwrap()
-                    };
-                    let buf = ctx.allocator.pop();
-                    let p_coset_buf = if buf.is_none() {
-                        device.alloc_device_buffer::<C::ScalarExt>(ctx.extended_size)?
-                    } else {
-                        buf.unwrap()
-                    };
+                    let mut l_res = ctx.alloc(device)?;
+                    let mut r_res = ctx.alloc(device)?;
+                    let p_coset_buf = ctx.alloc(device)?;
                     device.copy_from_host_to_device(&p_coset_buf, &permutation.values[..])?;
 
+                    device.copy_from_host_to_device(&l_res, value)?;
+                    device
+                        .copy_from_device_to_device::<C::Scalar>(&r_res, 0, &l_res, 0, ctx.size)?;
                     permutation_eval_h_l(
                         &device,
-                        &tmp,
+                        &l_res,
                         &beta_buf,
                         &gamma_buf,
                         &p_coset_buf,
                         ctx.size,
                     )?;
+                    do_extended_ntt(&device, &mut ctx, &mut l_res)?;
+                    field_mul::<C::ScalarExt>(&device, &l, &l_res, ctx.extended_size)?;
 
-                    do_extended_fft(&device, &mut ctx, &mut tmp)?;
+                    do_extended_prepare(device, &mut ctx, &mut r_res)?;
+                    let coeff =
+                        pick_from_buf::<C::ScalarExt>(device, &r_res, 0, 1, ctx.extended_size)?;
+                    let short = vec![value[0] + gamma, coeff + curr_delta];
+                    device.copy_from_host_to_device(&r_res, &short[..])?;
+                    do_extended_ntt_pure(device, &mut ctx, &mut r_res)?;
 
-                    field_op_v2::<C::ScalarExt>(
-                        &device,
-                        &l,
-                        Some(&l),
-                        None,
-                        Some(&tmp),
-                        None,
-                        ctx.extended_size,
-                        FieldOp::Mul,
-                    )?;
-
-                    let curr_delta_buf =
-                        device.alloc_device_buffer_from_slice(&[curr_delta][..])?;
-
-                    permutation_eval_h_r(&device, &tmp, &curr_delta_buf, &gamma_buf, &value_buf)?;
-                    do_extended_fft(&device, &mut ctx, &mut tmp)?;
-                    field_op_v2::<C::ScalarExt>(
-                        &device,
-                        &r,
-                        Some(&r),
-                        None,
-                        Some(&tmp),
-                        None,
-                        ctx.extended_size,
-                        FieldOp::Mul,
-                    )?;
+                    field_mul::<C::ScalarExt>(&device, &r, &r_res, ctx.extended_size)?;
                     curr_delta *= &C::Scalar::DELTA;
-                    field_op_v2::<C::ScalarExt>(
-                        &device,
-                        &l,
-                        Some(&l),
-                        None,
-                        Some(&r),
-                        None,
-                        ctx.extended_size,
-                        FieldOp::Sub,
-                    )?;
-                    field_op_v2::<C::ScalarExt>(
-                        &device,
-                        &l,
-                        Some(&l),
-                        None,
-                        Some(&l_active_buf),
-                        None,
-                        ctx.extended_size,
-                        FieldOp::Mul,
-                    )?;
-                    field_op_v2::<C::ScalarExt>(
-                        &device,
-                        &h_buf,
-                        Some(&h_buf),
-                        None,
-                        None,
-                        Some(y),
-                        ctx.extended_size,
-                        FieldOp::Mul,
-                    )?;
-                    field_op_v2::<C::ScalarExt>(
-                        &device,
-                        &h_buf,
-                        Some(&h_buf),
-                        None,
-                        Some(&l),
-                        None,
-                        ctx.extended_size,
-                        FieldOp::Sum,
-                    )?;
+
+                    ctx.extended_allocator.push(l_res);
+                    ctx.extended_allocator.push(r_res);
+                    ctx.extended_allocator.push(p_coset_buf);
                 }
+
+                field_sub::<C::ScalarExt>(&device, &l, &r, ctx.extended_size)?;
+                field_mul::<C::ScalarExt>(&device, &l, &l_active_buf, ctx.extended_size)?;
+                field_op_v2::<C::ScalarExt>(
+                    &device,
+                    &h_buf,
+                    Some(&h_buf),
+                    None,
+                    None,
+                    Some(y),
+                    ctx.extended_size,
+                    FieldOp::Mul,
+                )?;
+                field_sum::<C::ScalarExt>(&device, &h_buf, &l, ctx.extended_size)?;
 
                 ctx.extended_allocator.push(l);
                 ctx.extended_allocator.push(r);
             }
         }
     }
+
+    device.copy_from_device_to_host(&mut res[..], &h_buf)?;
+    println!("after permutation res[0..4] is {:?}", &res[0..4]);
     end_timer!(timer);
 
     Ok(res)
 }
 
-fn do_extended_fft_v2<F: FieldExt>(
+fn do_extended_ntt_v2<F: FieldExt>(
     device: &CudaDevice,
     ctx: &mut EvalHContext<F>,
     data: &[F],
@@ -1205,12 +1124,37 @@ fn do_extended_fft_v2<F: FieldExt>(
         buf.unwrap()
     };
     device.copy_from_host_to_device::<F>(&buf, data)?;
-    do_extended_fft(device, ctx, &mut buf)?;
+    do_extended_ntt(device, ctx, &mut buf)?;
 
     Ok(buf)
 }
 
-fn do_extended_fft<F: FieldExt>(
+fn do_extended_prepare<F: FieldExt>(
+    device: &CudaDevice,
+    ctx: &mut EvalHContext<F>,
+    data: &mut CudaDeviceBufRaw,
+) -> DeviceResult<()> {
+    extended_prepare(
+        device,
+        data,
+        &ctx.coset_powers_buf,
+        3,
+        ctx.size,
+        ctx.extended_size,
+    )
+}
+
+fn do_extended_ntt<F: FieldExt>(
+    device: &CudaDevice,
+    ctx: &mut EvalHContext<F>,
+    data: &mut CudaDeviceBufRaw,
+) -> DeviceResult<()> {
+    do_extended_prepare(device, ctx, data)?;
+    do_extended_ntt_pure(device, ctx, data)?;
+    Ok(())
+}
+
+fn do_extended_ntt_pure<F: FieldExt>(
     device: &CudaDevice,
     ctx: &mut EvalHContext<F>,
     data: &mut CudaDeviceBufRaw,
@@ -1221,15 +1165,6 @@ fn do_extended_fft<F: FieldExt>(
     } else {
         tmp.unwrap()
     };
-    extended_prepare(
-        device,
-        data,
-        &ctx.coset_powers_buf,
-        3,
-        ctx.size,
-        ctx.extended_size,
-    )?;
-    device.synchronize()?;
     ntt_raw(
         device,
         data,
@@ -1279,7 +1214,6 @@ fn evaluate_prove_expr_v2<F: FieldExt>(
         let coeffs_buf = device.alloc_device_buffer_from_slice(&coeffs[..])?;
 
         unsafe {
-            let timer = start_timer!(|| "prepare buffer");
             let mut group = vec![];
             let mut rots = vec![];
 
@@ -1321,7 +1255,7 @@ fn evaluate_prove_expr_v2<F: FieldExt>(
                         } => (&instance[*column_index], rotation),
                     };
                     if !bufs.contains_key(&id) {
-                        let buf = do_extended_fft_v2(device, ctx, src)?;
+                        let buf = do_extended_ntt_v2(device, ctx, src)?;
                         bufs.insert(id, buf);
                     }
                     for _ in 0..*exp {
@@ -1334,10 +1268,7 @@ fn evaluate_prove_expr_v2<F: FieldExt>(
             }
             let group_buf = device.alloc_device_buffer_from_slice(&group[..])?;
             let rots_buf = device.alloc_device_buffer_from_slice(&rots[..])?;
-            device.synchronize()?;
-            end_timer!(timer);
 
-            let timer = start_timer!(|| "do field_op_batch_mul_sum");
             let err = cuda::bn254_c::field_op_batch_mul_sum(
                 res.ptr(),
                 group_buf.ptr(),
@@ -1346,9 +1277,7 @@ fn evaluate_prove_expr_v2<F: FieldExt>(
                 ctx.extended_size as i32,
             );
 
-            device.synchronize()?;
-            assert_eq!(err, cuda_runtime_sys::cudaError::cudaSuccess);
-            end_timer!(timer);
+            to_result((), err, "fail to run field_op_batch_mul_sum")?;
 
             last_bufs = bufs;
         }

@@ -413,6 +413,8 @@ __global__ void _permutation_eval_h_p2(
             t2 = t2 * l0[i];
             t1 += t2;
         }
+
+        res[i] = t1;
     }
 }
 

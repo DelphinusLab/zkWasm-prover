@@ -123,6 +123,38 @@ pub(crate) fn field_sum<F: FieldExt>(
     Ok(())
 }
 
+pub(crate) fn field_sub<F: FieldExt>(
+    device: &CudaDevice,
+    res: &CudaDeviceBufRaw,
+    rhs: &CudaDeviceBufRaw,
+    size: usize,
+) -> Result<(), Error> {
+    let mut expect = vec![];
+
+    for _ in 0..CHECK_COUNT {
+        let i = rand::random::<usize>() % size;
+        let v = pick_from_buf::<F>(device, res, 0, i as isize, size).unwrap()
+            + pick_from_buf::<F>(device, rhs, 0, i as isize, size).unwrap();
+        expect.push((i, v));
+    }
+
+    field_op_v2::<F>(
+        device,
+        res,
+        Some(res),
+        None,
+        Some(rhs),
+        None,
+        size,
+        FieldOp::Sub,
+    )?;
+    for (i, expect) in expect {
+        let res = pick_from_buf::<F>(device, res, 0, i as isize, size).unwrap();
+        assert_eq!(expect, res);
+    }
+    Ok(())
+}
+
 pub(crate) fn field_mul<F: FieldExt>(
     device: &CudaDevice,
     res: &CudaDeviceBufRaw,
@@ -559,9 +591,9 @@ pub fn buffer_copy_with_shift<F: FieldExt>(
     } else if rot > 0 {
         let rot = rot as usize;
         let len = size - rot as usize;
-        device.copy_from_device_to_device::<F>(&dst, 0, src, rot as usize, len)?;
+        device.copy_from_device_to_device::<F>(&dst, 0, src, rot, len)?;
         device.synchronize()?;
-        device.copy_from_device_to_device::<F>(&dst, len, src, 0, rot as usize)?;
+        device.copy_from_device_to_device::<F>(&dst, len, src, 0, rot)?;
         device.synchronize()?;
     } else {
         let rot = -rot as usize;

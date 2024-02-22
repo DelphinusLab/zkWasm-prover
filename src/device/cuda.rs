@@ -1,13 +1,12 @@
 use core::cell::RefCell;
 use core::mem;
-use halo2_proofs::{arithmetic::FieldExt, plonk::evaluation_gpu::ProveExpression};
 use std::ffi::c_void;
 use std::mem::size_of;
 
 use cuda_runtime_sys::cudaError;
 
 use super::{Device, DeviceBuf, Error};
-use crate::{cache::Cache, device::DeviceResult};
+use crate::device::DeviceResult;
 
 thread_local! {
     static ACITVE_CUDA_DEVICE: RefCell<i32> = RefCell::new(-1);
@@ -185,7 +184,7 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
                 (dst.ptr()).offset((dst_offset * mem::size_of::<T>()) as isize),
                 (src.ptr()).offset((src_offset * mem::size_of::<T>()) as isize),
                 len * mem::size_of::<T>(),
-                cuda_runtime_sys::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                cuda_runtime_sys::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
             );
             to_result((), res, "fail to copy memory from device to device")
         }
@@ -216,23 +215,6 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
         unsafe {
             let res = cuda_runtime_sys::cudaHostUnregister(dst.as_mut_ptr() as *mut _);
             to_result((), res, "fail to synchronize")
-        }
-    }
-}
-
-pub(crate) fn gen_cache_policy<F: FieldExt, T>(
-    expr: &ProveExpression<F>,
-    unit_cache: &mut Cache<T>,
-) {
-    match expr {
-        ProveExpression::Unit(u) => unit_cache.access(u.get_group()),
-        ProveExpression::Op(l, r, _) => {
-            gen_cache_policy(l, unit_cache);
-            gen_cache_policy(r, unit_cache);
-        }
-        ProveExpression::Y(_) => {}
-        ProveExpression::Scale(l, _) => {
-            gen_cache_policy(l, unit_cache);
         }
     }
 }
