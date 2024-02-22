@@ -467,7 +467,6 @@ pub fn create_proof_from_advices<
     end_timer!(timer);
 
     let theta: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
-    println!("theta is {:?}", theta);
 
     let timer = start_timer!(|| "wait single lookups");
     let (mut single_unit_lookups, mut single_comp_lookups, tuple_lookups) =
@@ -571,9 +570,7 @@ pub fn create_proof_from_advices<
     }
 
     let beta: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
-    println!("beta is {:?}", beta);
     let gamma: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
-    println!("gamma is {:?}", gamma);
 
     let mut lookups = vec![];
     lookups.append(&mut single_unit_lookups);
@@ -801,7 +798,6 @@ pub fn create_proof_from_advices<
             .unwrap();
 
     let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
-    println!("y is {:?}", y);
 
     let timer = start_timer!(|| "h_poly");
     {
@@ -869,7 +865,6 @@ pub fn create_proof_from_advices<
 
     let x: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
     let xn = x.pow_vartime(&[params.n as u64]);
-    println!("x {:?}", x);
     end_timer!(timer);
 
     let timer = start_timer!(|| "compute eval");
@@ -1027,8 +1022,6 @@ where
     I: IntoIterator<Item = ProverQueryGeneral<'a, C>>,
 {
     let v: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
-    println!("v is {:?}", v);
-
     let commitment_data = halo2_proofs::poly::multiopen::construct_intermediate_sets(queries);
 
     // Sort by len to compute large batch first

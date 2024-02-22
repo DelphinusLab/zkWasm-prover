@@ -448,7 +448,6 @@ pub(crate) fn evaluate_h_gates<C: CurveAffine>(
     }
 
     device.copy_from_device_to_host(res, &h_buf)?;
-    println!("after lookup res[0..4] is {:?}", &res[0..4]);
     end_timer!(timer);
 
     Ok(())
