@@ -3,7 +3,6 @@ use core::mem;
 use std::ffi::c_void;
 use std::mem::size_of;
 
-use ark_std::{end_timer, start_timer};
 use cuda_runtime_sys::{cudaError, cudaFree};
 
 use super::{Device, DeviceBuf, Error};

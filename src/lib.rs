@@ -1,6 +1,7 @@
 #![feature(allocator_api)]
 #![feature(get_mut_unchecked)]
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread;
 
@@ -55,7 +56,6 @@ use crate::device::cuda::CudaDevice;
 use crate::device::Device as _;
 use crate::device::DeviceResult;
 
-mod cache;
 pub mod cuda;
 pub mod device;
 mod hugetlb;
@@ -365,17 +365,6 @@ pub fn create_proof_from_advices<
         .map(|x| device.alloc_device_buffer_from_slice(x))
         .collect::<DeviceResult<Vec<_>>>()?;
     end_timer!(timer);
-
-    /*
-    let timer =
-        start_timer!(|| format!("copy fixed columns to gpu, count {}", pk.fixed_values.len()));
-    let fixed_device_buf = pk
-        .fixed_values
-        .iter()
-        .map(|x| device.alloc_device_buffer_from_slice(x))
-        .collect::<DeviceResult<Vec<_>>>()?;
-    end_timer!(timer);
-    */
 
     let timer = start_timer!(|| "copy g_lagrange buffer");
     let g_lagrange_buf = device
@@ -856,7 +845,11 @@ pub fn create_proof_from_advices<
         .map(|x| &x[..])
         .collect::<Vec<_>>()[..];
 
-    let h_poly = evaluate_h_gates(
+    let mut h = Vec::new_in(HugePageAllocator);
+    h.resize(1 << extended_k, C::ScalarExt::zero());
+    end_timer!(timer);
+
+    evaluate_h_gates(
         &device,
         &pk,
         fixed_ref,
@@ -877,6 +870,7 @@ pub fn create_proof_from_advices<
         intt_pq_buf,
         intt_omegas_buf,
         intt_divisor_buf,
+        &mut h[..],
     )?;
     end_timer!(timer);
 
@@ -885,7 +879,6 @@ pub fn create_proof_from_advices<
 
 struct EvalHContext<F: FieldExt> {
     y: Vec<F>,
-    allocator: Vec<CudaDeviceBufRaw>,
     extended_allocator: Vec<CudaDeviceBufRaw>,
     extended_k: usize,
     k: usize,
@@ -894,7 +887,6 @@ struct EvalHContext<F: FieldExt> {
     extended_ntt_omegas_buf: CudaDeviceBufRaw,
     extended_ntt_pq_buf: CudaDeviceBufRaw,
     coset_powers_buf: CudaDeviceBufRaw,
-    omegas_buf: CudaDeviceBufRaw,
 }
 
 impl<F: FieldExt> EvalHContext<F> {
@@ -906,6 +898,106 @@ impl<F: FieldExt> EvalHContext<F> {
             Ok(buf.unwrap())
         }
     }
+}
+
+pub(crate) fn analyze_expr_tree<F: FieldExt>(
+    expr: &ProveExpression<F>
+) -> Vec<Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>> {
+    let tree = expr.clone().flatten();
+    let tree = tree
+        .into_iter()
+        .map(|(us, v)| {
+            let mut map = BTreeMap::new();
+            for mut u in us {
+                if let Some(c) = map.get_mut(&mut u) {
+                    *c = *c + 1;
+                } else {
+                    map.insert(u.clone(), 1);
+                }
+            }
+            (map, v.clone())
+        })
+        .collect::<Vec<_, _>>();
+
+    let limit = 20;
+    let mut v = HashSet::new();
+
+    let mut expr_group = vec![];
+    let mut expr_groups = vec![];
+    for (_, (units, coeff)) in tree.iter().enumerate() {
+        let mut v_new = v.clone();
+        let mut v_new_clean = HashSet::new();
+        let mut muls_new = 0;
+        for (unit, exp) in units {
+            v_new.insert(unit.get_group());
+            v_new_clean.insert(unit.get_group());
+            muls_new += exp;
+        }
+        muls_new -= 1;
+
+        if v_new.len() > limit {
+            v = v_new_clean;
+
+            expr_groups.push(expr_group);
+            expr_group = vec![(units.clone(), coeff.clone())];
+        } else {
+            v = v_new;
+            expr_group.push((units.clone(), coeff.clone()));
+        }
+    }
+
+    expr_groups.push(expr_group);
+    expr_groups
+}
+
+pub fn export_evaluate_h_gates<C: CurveAffine>(
+    pk: &ProvingKey<C>,
+    fixed: &[&[C::ScalarExt]],
+    advice: &[&[C::ScalarExt]],
+    instance: &[&[C::ScalarExt]],
+    permutation_products: &[&[C::ScalarExt]],
+    lookup_products: &[(
+        &[C::ScalarExt],
+        &[C::ScalarExt],
+        &[C::ScalarExt],
+        &[C::ScalarExt],
+        &[C::ScalarExt],
+    )],
+    y: C::ScalarExt,
+    beta: C::ScalarExt,
+    gamma: C::ScalarExt,
+    theta: C::ScalarExt,
+    res: &mut [C::ScalarExt],
+) {
+    let device = CudaDevice::get_device(0).unwrap();
+    let (intt_omegas_buf, intt_pq_buf) = ntt_prepare(
+        &device,
+        pk.get_vk().domain.get_omega_inv(),
+        pk.vk.domain.k() as usize,
+    )
+    .unwrap();
+    let intt_divisor_buf = device
+        .alloc_device_buffer_from_slice::<C::ScalarExt>(&[pk.get_vk().domain.ifft_divisor])
+        .unwrap();
+
+    let h_buf = evaluate_h_gates(
+        &device,
+        pk,
+        fixed,
+        advice,
+        instance,
+        permutation_products,
+        lookup_products,
+        y,
+        beta,
+        gamma,
+        theta,
+        intt_pq_buf,
+        intt_omegas_buf,
+        intt_divisor_buf,
+        res,
+    )
+    .unwrap();
 }
 
 fn evaluate_h_gates<C: CurveAffine>(
@@ -929,7 +1021,8 @@ fn evaluate_h_gates<C: CurveAffine>(
     intt_pq_buf: CudaDeviceBufRaw,
     intt_omegas_buf: CudaDeviceBufRaw,
     intt_divisor_buf: CudaDeviceBufRaw,
-) -> DeviceResult<Vec<C::ScalarExt, HugePageAllocator>> {
+    res: &mut [C::ScalarExt],
+) -> DeviceResult<()> {
     let timer = start_timer!(|| "evaluate_h setup");
     let k = pk.get_vk().domain.k() as usize;
     let size = 1 << pk.get_vk().domain.k();
@@ -940,14 +1033,13 @@ fn evaluate_h_gates<C: CurveAffine>(
 
     let (extended_ntt_omegas_buf, extended_ntt_pq_buf) =
         ntt_prepare(device, extended_omega, extended_k)?;
-    let (omegas_buf, _) = ntt_prepare(device, omega, k)?;
     let coset_powers_buf = device.alloc_device_buffer_from_slice(&[
         pk.get_vk().domain.g_coset,
         pk.get_vk().domain.g_coset_inv,
     ])?;
+
     let mut ctx = EvalHContext {
         y: vec![C::ScalarExt::one(), y],
-        allocator: vec![],
         extended_allocator: vec![],
         k,
         extended_k,
@@ -956,30 +1048,19 @@ fn evaluate_h_gates<C: CurveAffine>(
         extended_ntt_omegas_buf,
         extended_ntt_pq_buf,
         coset_powers_buf,
-        omegas_buf,
     };
 
-    let mut res = Vec::new_in(HugePageAllocator);
-    res.resize(extended_size, C::ScalarExt::zero());
-    end_timer!(timer);
-
     let timer = start_timer!(|| "evaluate_h gates");
+    assert!(pk.ev.gpu_gates_expr.len() == 1);
+    let exprs = analyze_expr_tree(&pk.ev.gpu_gates_expr[0]);
     let h_buf = evaluate_prove_expr(
         device,
-        &pk.ev.analyze_result,
+        &exprs,
         fixed,
         advice,
         instance,
         &mut ctx,
     )?;
-    device.print_memory_info()?;
-    println!(
-        "ctx free buffers {} {}",
-        ctx.allocator.len(),
-        ctx.extended_allocator.len()
-    );
-    device.copy_from_device_to_host(&mut res[..], &h_buf)?;
-    println!("after gates res[0..4] is {:?}", &res[0..4]);
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h prepare buffers for constants");
@@ -1108,13 +1189,9 @@ fn evaluate_h_gates<C: CurveAffine>(
             }
         }
     }
-
-    device.copy_from_device_to_host(&mut res[..], &h_buf)?;
-    println!("after permutation res[0..4] is {:?}", &res[0..4]);
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h lookup");
-
     for (i, (lookup, (permuted_input, permuted_table, input, table, z))) in pk
         .vk
         .cs
@@ -1126,11 +1203,6 @@ fn evaluate_h_gates<C: CurveAffine>(
         let input_deg = get_expr_degree(&lookup.input_expressions);
         let table_deg = get_expr_degree(&lookup.table_expressions);
 
-        let timer = start_timer!(|| format!(
-            "evaluate_h lookup flatten {}, deg {} {}",
-            i, input_deg, table_deg
-        ));
-
         let [e1, e2] = flatten_lookup_expression(
             &lookup.input_expressions,
             &lookup.table_expressions,
@@ -1138,9 +1210,7 @@ fn evaluate_h_gates<C: CurveAffine>(
             gamma,
             theta,
         );
-        end_timer!(timer);
 
-        let timer = start_timer!(|| format!("evaluate_h lookup compress {}", i));
         let input_buf = if input_deg > 1 {
             evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx)?
         } else {
@@ -1197,14 +1267,13 @@ fn evaluate_h_gates<C: CurveAffine>(
         let z_buf = do_extended_ntt_v2(device, &mut ctx, z)?;
 
         unsafe {
-            let timer = start_timer!(|| format!("evaluate_h lookup_eval_h core {}", i));
             let err = lookup_eval_h(
                 h_buf.ptr(),
                 input_buf.ptr(),
                 table_buf.ptr(),
                 permuted_input_buf.ptr(),
                 permuted_table_buf.ptr(),
-                z_buf.ptr(), 
+                z_buf.ptr(),
                 l0_buf.ptr(),
                 l_last_buf.ptr(),
                 l_active_buf.ptr(),
@@ -1217,7 +1286,6 @@ fn evaluate_h_gates<C: CurveAffine>(
 
             to_result((), err, "fail to run field_op_batch_mul_sum")?;
             device.synchronize()?;
-            end_timer!(timer);
         }
 
         ctx.extended_allocator.push(input_buf);
@@ -1225,14 +1293,13 @@ fn evaluate_h_gates<C: CurveAffine>(
         ctx.extended_allocator.push(permuted_input_buf);
         ctx.extended_allocator.push(permuted_table_buf);
         ctx.extended_allocator.push(z_buf);
-        end_timer!(timer);
     }
 
-    device.copy_from_device_to_host(&mut res[..], &h_buf)?;
+    device.copy_from_device_to_host(res, &h_buf)?;
     println!("after lookup res[0..4] is {:?}", &res[0..4]);
     end_timer!(timer);
 
-    Ok(res)
+    Ok(())
 }
 
 fn get_expr_degree<F: FieldExt>(expr: &Vec<halo2_proofs::plonk::circuit::Expression<F>>) -> usize {

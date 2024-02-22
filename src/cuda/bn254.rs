@@ -1,8 +1,7 @@
 use super::bn254_c;
-use crate::device::cuda::{self, to_result, CudaBuffer, CudaDevice, CudaDeviceBufRaw};
+use crate::device::cuda::{to_result, CudaBuffer, CudaDevice, CudaDeviceBufRaw};
 use crate::device::Error;
 use crate::device::{Device, DeviceResult};
-use ark_std::{end_timer, start_timer};
 use halo2_proofs::arithmetic::{CurveAffine, FieldExt};
 use halo2_proofs::pairing::group::Curve;
 use halo2_proofs::pairing::group::Group;
@@ -208,84 +207,6 @@ pub(crate) fn pick_from_buf<F: FieldExt>(
         to_result((), err, "fail to pick_from_buf")?;
     }
     Ok(v[0])
-}
-
-pub(crate) fn field_mul_sum_vec<F: FieldExt>(
-    device: &CudaDevice,
-    res: &CudaDeviceBufRaw,
-    rhs: &Vec<(&CudaDeviceBufRaw, isize, Option<F>)>,
-    omegas: &CudaDeviceBufRaw,
-    size: usize,
-) -> Result<(), Error> {
-    //println!("start field_mul_sum_vec {}", rhs.len());
-    let mut expect = vec![];
-    for _ in 0..CHECK_COUNT {
-        let i = rand::random::<usize>() % size;
-        let mut v = F::zero();
-
-        for (b, rot, c) in rhs {
-            let l = pick_from_buf::<F>(device, b, *rot, i as isize, size).unwrap();
-            let r = c.unwrap_or(F::one());
-            v = v + l * r;
-        }
-
-        expect.push((i, v));
-    }
-    let mut v = vec![];
-    let mut v_rot = vec![];
-    let mut v_c = vec![];
-
-    for (buf, rot, c) in rhs {
-        v.push(buf.ptr());
-        v_rot.push(*rot as i32);
-        if c.is_some() {
-            v_c.push(c.unwrap());
-        }
-    }
-
-    let v_buf = device.alloc_device_buffer_from_slice(&v[..])?;
-    let v_c_buf = device.alloc_device_buffer_from_slice(&v_c[..])?;
-    let v_rot_buf = device.alloc_device_buffer_from_slice(&v_rot[..])?;
-
-    let mut v_c_ptr = vec![];
-    let mut idx = 0;
-    for (_, _, c) in rhs {
-        if c.is_some() {
-            v_c_ptr.push(unsafe {
-                v_c_buf
-                    .ptr()
-                    .offset(idx * core::mem::size_of::<F>() as isize)
-            });
-            idx += 1;
-        } else {
-            v_c_ptr.push(0 as *mut _);
-        }
-    }
-
-    let v_c_ptr_buf = device.alloc_device_buffer_from_slice(&v_c_ptr[..])?;
-
-    unsafe {
-        device.acitve_ctx()?;
-        let err = bn254_c::field_sum(
-            res.ptr(),
-            v_buf.ptr(),
-            v_c_ptr_buf.ptr(),
-            v_rot_buf.ptr(),
-            omegas.ptr(),
-            rhs.len() as i32,
-            size as i32,
-        );
-        to_result((), err, "fail to run field_mul_sum_vec")?;
-    }
-
-    for (i, expect) in expect {
-        let res = pick_from_buf::<F>(device, res, 0, i as isize, size).unwrap();
-        if expect != res {
-            println!("wrong at {}", i);
-            assert_eq!(expect, res);
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn field_op<F: FieldExt>(
