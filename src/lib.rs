@@ -828,8 +828,6 @@ pub fn create_proof_from_advices<
     let y: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
     println!("y is {:?}", y);
 
-    let (ntt_omegas_buf, ntt_pq_buf) = ntt_prepare(&device, pk.get_vk().domain.get_omega(), k)?;
-
     let timer = start_timer!(|| "h_poly");
     {
         let timer = start_timer!(|| "advices intt");
@@ -988,7 +986,6 @@ fn evaluate_h_gates<C: CurveAffine>(
     let y_buf = device.alloc_device_buffer_from_slice(&[y][..])?;
     let beta_buf = device.alloc_device_buffer_from_slice(&[beta][..])?;
     let gamma_buf = device.alloc_device_buffer_from_slice(&[gamma][..])?;
-    let theta_buf = device.alloc_device_buffer_from_slice(&[theta][..])?;
 
     let l0 = &pk.l0;
     let l_last = &pk.l_last;
@@ -1124,7 +1121,6 @@ fn evaluate_h_gates<C: CurveAffine>(
         .lookups
         .iter()
         .zip(lookup_products.iter())
-        .take(1)
         .enumerate()
     {
         let input_deg = get_expr_degree(&lookup.input_expressions);
@@ -1163,9 +1159,11 @@ fn evaluate_h_gates<C: CurveAffine>(
             )?;
             ctx.extended_allocator.push(tmp_buf);
 
-            let short = vec![input[0] + beta];
+            let coeff = pick_from_buf::<C::ScalarExt>(device, &buf, 0, 0, ctx.size)?;
+            let short = vec![coeff + beta];
             device.copy_from_host_to_device(&buf, &short[..])?;
             do_extended_ntt(device, &mut ctx, &mut buf)?;
+
             buf
         };
         let table_buf = if table_deg > 1 {
@@ -1173,7 +1171,7 @@ fn evaluate_h_gates<C: CurveAffine>(
         } else {
             let mut buf = ctx.alloc(device)?;
             device.copy_from_host_to_device(&buf, &table)?;
-            
+
             let mut tmp_buf = ctx.alloc(device)?;
             intt_raw(
                 &device,
@@ -1185,10 +1183,12 @@ fn evaluate_h_gates<C: CurveAffine>(
                 k,
             )?;
             ctx.extended_allocator.push(tmp_buf);
-            
-            let short = vec![table[0] + gamma];
+
+            let coeff = pick_from_buf::<C::ScalarExt>(device, &buf, 0, 0, ctx.size)?;
+            let short = vec![coeff + gamma];
             device.copy_from_host_to_device(&buf, &short[..])?;
             do_extended_ntt(device, &mut ctx, &mut buf)?;
+
             buf
         };
 
@@ -1203,8 +1203,8 @@ fn evaluate_h_gates<C: CurveAffine>(
                 input_buf.ptr(),
                 table_buf.ptr(),
                 permuted_input_buf.ptr(),
-                table_buf.ptr(),
-                z_buf.ptr(),
+                permuted_table_buf.ptr(),
+                z_buf.ptr(), 
                 l0_buf.ptr(),
                 l_last_buf.ptr(),
                 l_active_buf.ptr(),

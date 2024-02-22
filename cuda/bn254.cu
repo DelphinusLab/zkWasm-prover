@@ -501,12 +501,15 @@ __global__ void _lookup_eval_h(
 
     // l_0(X) * (1 - z(X)) = 0
     t = t * *y;
-    u = l0[i] * (Bn254FrField(1) - z[i]);
+    u = Bn254FrField(1) - z[i];
+    u = l0[i] * u;
     t += u;
 
     // l_last(X) * (z(X)^2 - z(X)) = 0
     t = t * *y;
-    u = l_last[i] * (z[i].sqr() - z[i]);
+    u = z[i] * z[i];
+    u -= z[i];
+    u = l_last[i] * u;
     t += u;
 
     // (1 - (l_last(X) + l_blind(X))) * (
@@ -515,8 +518,12 @@ __global__ void _lookup_eval_h(
     //          (\theta^{m-1} s_0(X) + ... + s_{m-1}(X) + \gamma)
     // ) = 0
     t = t * *y;
-    u = z[r_next] * (permuted_input[i] + *beta) * (permuted_table[i] + *gamma);
-    u -= z[i] * (input[i] * table[i]);
+    u = permuted_input[i] + *beta;
+    p = permuted_table[i] + *gamma;
+    u = u * p;
+    u = u * z[r_next];
+    Bn254FrField x = input[i] * table[i];
+    u -= z[i] * x;
     u = u * l_active_row[i];
     t += u;
 
@@ -528,7 +535,9 @@ __global__ void _lookup_eval_h(
 
     // (1 - (l_last + l_blind)) * (a′(X) − s′(X))⋅(a′(X) − a′(\omega^{-1} X)) = 0
     t = t * *y;
-    u = l_active_row[i] * (permuted_input[i] - permuted_input[r_prev]) * p;
+    u = permuted_input[i] - permuted_input[r_prev];
+    u = u * p;
+    u = u * l_active_row[i];
     t += u;
 
     res[i] = t;
@@ -712,8 +721,8 @@ extern "C"
         _lookup_eval_h<<<blocks, threads>>>(
             res,
             input, table, permuted_input, permuted_table, z,
-            l0, l_last, l_active_row, y,
-            beta, gamma,
+            l0, l_last, l_active_row,
+            y, beta, gamma,
             rot, n);
         return cudaGetLastError();
     }

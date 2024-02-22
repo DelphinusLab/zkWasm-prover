@@ -1035,6 +1035,7 @@ dependencies = [
  "ark-std 0.4.0",
  "cc",
  "cuda-runtime-sys",
+ "ec-gpu-gen",
  "halo2_proofs",
  "lazy_static",
  "libc",
