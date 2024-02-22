@@ -10,9 +10,10 @@ use ark_std::start_timer;
 use cuda::bn254::buffer_copy_with_shift;
 use cuda::bn254::extended_prepare;
 use cuda::bn254::field_mul;
-use cuda::bn254::field_op;
 use cuda::bn254::field_sum;
 use cuda::bn254::FieldOp;
+use cuda_runtime_sys::cudaMemset;
+use device::cuda::CudaBuffer;
 use device::cuda::CudaDeviceBufRaw;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
@@ -34,6 +35,7 @@ use rayon::iter::IntoParallelRefIterator as _;
 use rayon::iter::IntoParallelRefMutIterator as _;
 use rayon::iter::ParallelIterator as _;
 use rayon::slice::ParallelSlice as _;
+use std::collections::BTreeMap;
 
 use crate::cuda::bn254::field_mul_sum_vec;
 use crate::cuda::bn254::field_op_v2;
@@ -880,6 +882,7 @@ struct EvalHContext<F: FieldExt> {
     allocator: Vec<CudaDeviceBufRaw>,
     extended_allocator: Vec<CudaDeviceBufRaw>,
     extended_k: usize,
+    k: usize,
     size: usize,
     extended_size: usize,
     extended_ntt_omegas_buf: CudaDeviceBufRaw,
@@ -918,6 +921,7 @@ fn evaluate_h_gates<C: CurveAffine>(
         y: vec![C::ScalarExt::one(), y],
         allocator: vec![],
         extended_allocator: vec![],
+        k,
         extended_k,
         size,
         extended_size,
@@ -960,6 +964,7 @@ fn evaluate_h_gates<C: CurveAffine>(
 
     device.print_memory_info()?;
     let timer = start_timer!(|| "evaluate_h gates");
+    /*
     let buf = evaluate_prove_expr(
         device,
         &pk.ev.gpu_gates_expr[0],
@@ -972,6 +977,15 @@ fn evaluate_h_gates<C: CurveAffine>(
         EvalResult::SumBorrow(_, _, _) => unreachable!(),
         EvalResult::Single(_, buf) => buf,
     };
+    */
+    let h_buf = evaluate_prove_expr_v2(
+        device,
+        &pk.ev.analyze_result,
+        fixed,
+        advice,
+        instance,
+        &mut ctx,
+    )?;
     device.print_memory_info()?;
     println!(
         "xixi {} {}",
@@ -1201,17 +1215,12 @@ fn do_extended_fft<F: FieldExt>(
     ctx: &mut EvalHContext<F>,
     data: &mut CudaDeviceBufRaw,
 ) -> DeviceResult<()> {
-    //let timer = start_timer!(|| "handle extended fft");
-    //let timer1 = start_timer!(|| "alloc buffer");
     let tmp = ctx.extended_allocator.pop();
     let mut tmp = if tmp.is_none() {
-        println!("alloc");
         device.alloc_device_buffer::<F>(ctx.extended_size)?
     } else {
         tmp.unwrap()
     };
-    //end_timer!(timer1);
-    //let timer1 = start_timer!(|| "prepare");
     extended_prepare(
         device,
         data,
@@ -1221,8 +1230,6 @@ fn do_extended_fft<F: FieldExt>(
         ctx.extended_size,
     )?;
     device.synchronize()?;
-    //end_timer!(timer1);
-    //let timer1 = start_timer!(|| "ntt");
     ntt_raw(
         device,
         data,
@@ -1232,136 +1239,11 @@ fn do_extended_fft<F: FieldExt>(
         ctx.extended_k,
     )?;
     device.synchronize()?;
-    // end_timer!(timer1);
     ctx.extended_allocator.push(tmp);
-    // end_timer!(timer);
     Ok(())
 }
 
-enum EvalResult<'a, F: FieldExt> {
-    SumBorrow(
-        usize,
-        Vec<(&'a CudaDeviceBufRaw, isize, Option<F>)>,
-        Option<F>,
-    ),
-    Single(usize, CudaDeviceBufRaw),
-}
-
-impl<'a, F: FieldExt> EvalResult<'a, F> {
-    fn deg(&self) -> &usize {
-        match self {
-            EvalResult::SumBorrow(deg, _, _) => deg,
-            EvalResult::Single(deg, _) => deg,
-        }
-    }
-
-    fn eval(
-        self,
-        device: &CudaDevice,
-        target_deg: usize,
-        ctx: &mut EvalHContext<F>,
-    ) -> DeviceResult<CudaDeviceBufRaw> {
-        let (mut buf, deg) = match self {
-            EvalResult::SumBorrow(deg, arr, c) => {
-                assert!(deg == 1);
-                let buf = ctx.extended_allocator.pop();
-                let res = if buf.is_none() {
-                    device.alloc_device_buffer::<F>(ctx.extended_size)?
-                } else {
-                    buf.unwrap()
-                };
-                field_mul_sum_vec(device, &res, &arr, &ctx.omegas_buf, ctx.size)?;
-                if c.is_some() {
-                    assert!(deg == 1);
-                    let mut v = [F::zero()];
-                    device.copy_from_device_to_host(&mut v[..], &res)?;
-                    v[0] += c.unwrap();
-                    device.copy_from_host_to_device(&res, &v[..])?;
-                }
-                (res, deg)
-            }
-            EvalResult::Single(deg, buf) => (buf, deg),
-        };
-
-        // switch to lagrange coeff
-        if deg != target_deg {
-            assert!(target_deg == 4);
-            do_extended_fft(device, ctx, &mut buf)?;
-        }
-        Ok(buf)
-    }
-
-    fn is_borrow(&self) -> bool {
-        match self {
-            EvalResult::SumBorrow(_, _, _) => true,
-            EvalResult::Single(_, _) => false,
-        }
-    }
-
-    fn is_const(&self) -> Option<F> {
-        match self {
-            EvalResult::SumBorrow(_, arr, c) => {
-                if arr.is_empty() {
-                    c.clone()
-                } else {
-                    None
-                }
-            }
-            EvalResult::Single(_, _) => None,
-        }
-    }
-
-    fn merge(self, other: Self) -> Self {
-        match (self, other) {
-            (
-                EvalResult::SumBorrow(deg, mut l, mut l_c),
-                EvalResult::SumBorrow(r_deg, mut r, r_c),
-            ) => {
-                assert!(deg == r_deg);
-                l.append(&mut r);
-                if r_c.is_some() {
-                    if l_c.is_some() {
-                        l_c = Some(l_c.unwrap() + r_c.unwrap());
-                    } else {
-                        l_c = r_c;
-                    }
-                }
-                EvalResult::SumBorrow(deg, l, l_c)
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    fn scale(&mut self, device: &CudaDevice, v: F, ctx: &mut EvalHContext<F>) -> DeviceResult<()> {
-        match self {
-            EvalResult::SumBorrow(_, arr, c) => {
-                *c = c.map(|x| v * x);
-                for (_, _, c) in arr {
-                    *c = if c.is_some() {
-                        Some(c.unwrap() * v)
-                    } else {
-                        Some(v)
-                    }
-                }
-            }
-            EvalResult::Single(deg, buf) => {
-                field_op_v2(
-                    device,
-                    &buf,
-                    Some(&buf),
-                    None,
-                    None,
-                    Some(v),
-                    ctx.size * *deg,
-                    FieldOp::Mul,
-                )?;
-            }
-        }
-        Ok(())
-    }
-}
-
-fn eval_ys<F: FieldExt>(ys: &std::collections::BTreeMap<u32, F>, ctx: &mut EvalHContext<F>) -> F {
+fn eval_ys<F: FieldExt>(ys: &BTreeMap<u32, F>, ctx: &mut EvalHContext<F>) -> F {
     let max_y_order = *ys.keys().max().unwrap();
     for _ in (ctx.y.len() as u32)..=max_y_order {
         ctx.y.push(ctx.y[1] * ctx.y.last().unwrap());
@@ -1371,220 +1253,108 @@ fn eval_ys<F: FieldExt>(ys: &std::collections::BTreeMap<u32, F>, ctx: &mut EvalH
     })
 }
 
-fn evaluate_prove_expr<'a, F: FieldExt>(
+fn evaluate_prove_expr_v2<F: FieldExt>(
     device: &CudaDevice,
-    expr: &ProveExpression<F>,
-    fixed_buf: &'a [CudaDeviceBufRaw],
-    advice_buf: &'a [CudaDeviceBufRaw],
-    instance_buf: &'a [CudaDeviceBufRaw],
+    exprs: &Vec<Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>>,
+    fixed: &[&[F]],
+    advice: &[&[F]],
+    instance: &[&[F]],
     ctx: &mut EvalHContext<F>,
-) -> DeviceResult<EvalResult<'a, F>> {
-    match expr {
-        ProveExpression::Unit(u) => {
-            //let timer = start_timer!(|| "handle unit");
-            let (src, rotation) = match u {
-                ProveExpressionUnit::Fixed {
-                    column_index,
-                    rotation,
-                } => (&fixed_buf[*column_index], rotation),
-                ProveExpressionUnit::Advice {
-                    column_index,
-                    rotation,
-                } => (&advice_buf[*column_index], rotation),
-                ProveExpressionUnit::Instance {
-                    column_index,
-                    rotation,
-                } => (&instance_buf[*column_index], rotation),
-            };
-
-            let rot = rotation.0 as isize;
-
-            Ok(EvalResult::SumBorrow(1, vec![(src, rot, None)], None))
-        }
-        ProveExpression::Op(l, r, op) => {
-            let l = evaluate_prove_expr(device, l, fixed_buf, advice_buf, instance_buf, ctx)?;
-            let r = evaluate_prove_expr(device, r, fixed_buf, advice_buf, instance_buf, ctx)?;
-
-            let l_deg = *l.deg();
-            let r_deg = *r.deg();
-
-            match op {
-                Bop::Sum => {
-                    if l_deg == r_deg && l.is_borrow() && r.is_borrow() {
-                        assert!(l_deg == 1);
-                        return Ok(l.merge(r));
-                    }
-                    if true || l_deg.max(r_deg) == 4 {
-                        let l = l.eval(device, 4, ctx)?;
-                        let r = r.eval(device, 4, ctx)?;
-                        field_sum::<F>(device, &l, &r, ctx.extended_size)?;
-                        ctx.extended_allocator.push(r);
-                        return Ok(EvalResult::Single(4, l));
-                    }
-                    unreachable!()
-                    /* else {
-                        let l = l.eval(device, l_deg, ctx)?;
-                        let r = r.eval(device, r_deg, ctx)?;
-                        let (res, other) = if l_deg >= r_deg { (l, r) } else { (r, l) };
-                        field_sum::<F>(device, &res, &other, ctx.size)?;
-                        ctx.extended_allocator.push(other);
-                        Ok(EvalResult::Single(l_deg.max(r_deg), res))
-                    } */
-                }
-                Bop::Product => {
-                    let l = l.eval(device, 4, ctx)?;
-                    let r = r.eval(device, 4, ctx)?;
-                    field_mul::<F>(device, &l, &r, ctx.extended_size)?;
-                    ctx.extended_allocator.push(r);
-                    Ok(EvalResult::Single(4, l))
-                }
-            }
-        }
-        ProveExpression::Y(ys) => {
-            let c = eval_ys(ys, ctx);
-            Ok(EvalResult::SumBorrow(1, vec![], Some(c)))
-        }
-        ProveExpression::Scale(l, ys) => {
-            let mut l = evaluate_prove_expr(device, l, fixed_buf, advice_buf, instance_buf, ctx)?;
-            let c = eval_ys(ys, ctx);
-            l.scale(device, c, ctx)?;
-            Ok(l)
-        }
+) -> DeviceResult<CudaDeviceBufRaw> {
+    let res = device.alloc_device_buffer::<F>(ctx.extended_size)?;
+    unsafe {
+        cudaMemset(res.ptr(), 0, ctx.extended_size * core::mem::size_of::<F>());
     }
-}
+    let mut last_bufs = BTreeMap::new();
 
-fn analysis<F: FieldExt>(expr: &ProveExpression<F>) -> usize {
-    match expr {
-        ProveExpression::Unit(u) => {
-            let rotation = match u {
-                ProveExpressionUnit::Fixed { rotation, .. } => rotation,
-                ProveExpressionUnit::Advice { rotation, .. } => rotation,
-                ProveExpressionUnit::Instance { rotation, .. } => rotation,
-            };
-            println!("handle unit {:?}", rotation);
-            return 1;
+    let mut total_items = 0;
+
+    for expr in exprs.iter() {
+        total_items += expr.len();
+        let mut bufs = BTreeMap::new();
+        let mut coeffs = vec![];
+        for (_, ys) in expr {
+            coeffs.push(eval_ys(&ys, ctx));
         }
-        ProveExpression::Op(l, r, op) => {
-            let l_dep = analysis(l);
-            let r_dep = analysis(r);
-            match op {
-                Bop::Sum => {
-                    if l_dep != r_dep {
-                        println!(
-                            "handle deep upgrade {} {}",
-                            l_dep.min(r_dep),
-                            l_dep.max(r_dep)
-                        );
-                    }
+        let coeffs_buf = device.alloc_device_buffer_from_slice(&coeffs[..])?;
 
-                    println!("handle sum {} {}", l_dep, r_dep);
-                    return l_dep.max(r_dep);
-                }
-                Bop::Product => {
-                    if l_dep == 1 && r_dep == 1 {
-                        println!("handle deep upgrade {} {}", 1, 2);
-                        println!("handle deep upgrade {} {}", 1, 2);
-                        println!("handle mul {}", 2);
-                        return 2;
-                    } else {
-                        println!("handle mul {}", l_dep.max(r_dep));
-                        if l_dep < 4 {
-                            println!("handle deep upgrade 4 from {}", l_dep);
-                        }
-                        if r_dep < 4 {
-                            println!("handle deep upgrade 4 from {}", r_dep);
-                        }
-                        return 4;
+        unsafe {
+            let timer = start_timer!(|| "prepare buffer");
+            let mut group = vec![];
+            let mut rots = vec![];
+
+            for (units, _) in expr.iter() {
+                for (u, _) in units {
+                    let id = u.get_group();
+                    if !bufs.contains_key(&id) && last_bufs.contains_key(&id) {
+                        let buf = last_bufs.remove(&id).unwrap();
+                        bufs.insert(id, buf);
                     }
                 }
             }
-        }
-        ProveExpression::Y(_) => {
-            println!("handle y");
-            return 1;
-        }
-        ProveExpression::Scale(l, _) => {
-            let l_dep = analysis(l);
-            println!("handle scale {}", l_dep);
-            return l_dep;
-        }
-    }
-}
 
-fn print_ident(ident: usize) {
-    for i in 0..ident {
-        print!("-");
-    }
-}
-
-fn analysis_v2<F: FieldExt>(expr: &ProveExpression<F>, ident: usize) -> usize {
-    match expr {
-        ProveExpression::Unit(u) => {
-            let rotation = match u {
-                ProveExpressionUnit::Fixed { rotation, .. } => rotation,
-                ProveExpressionUnit::Advice { rotation, .. } => rotation,
-                ProveExpressionUnit::Instance { rotation, .. } => rotation,
-            };
-            print_ident(ident);
-            println!("handle unit {:?}", rotation);
-            return 1;
-        }
-        ProveExpression::Op(l, r, op) => {
-            let l_dep = analysis_v2(l, ident + 2);
-            let r_dep = analysis_v2(r, ident + 2);
-
-            match op {
-                Bop::Sum => {
-                    if l_dep != r_dep {
-                        /*
-                        print_ident(ident);
-                        println!(
-                            "handle deep upgrade {} {}",
-                            l_dep.min(r_dep),
-                            l_dep.max(r_dep)
-                        ); */
-                    }
-                    print_ident(ident);
-                    println!("handle sum {} {}", l_dep, r_dep);
-                    return l_dep.max(r_dep);
-                }
-                Bop::Product => {
-                    if l_dep == 1 && r_dep == 1 {
-                        /*
-                        print_ident(ident);
-                        println!("handle deep upgrade {} {}", 1, 2);
-                        print_ident(ident);
-                        println!("handle deep upgrade {} {}", 1, 2); */
-                        print_ident(ident);
-                        println!("handle mul {}", 2);
-                        return 2;
-                    } else {
-                        print_ident(ident);
-                        println!("handle mul {}", l_dep.max(r_dep));
-                        /*
-                        if l_dep < 4 {
-                            print_ident(ident);
-                            println!("handle deep upgrade 4 from {}", l_dep);
-                        }
-                        if r_dep < 4 {
-                            print_ident(ident);
-                            println!("handle deep upgrade 4 from {}", r_dep);
-                        }*/
-                        return 4;
-                    }
-                }
+            for (_, buf) in last_bufs {
+                ctx.extended_allocator.push(buf)
             }
-        }
-        ProveExpression::Y(_) => {
-            print_ident(ident);
-            println!("handle y");
-            return 1;
-        }
-        ProveExpression::Scale(l, _) => {
-            let l_dep = analysis_v2(l, ident + 2);
-            print_ident(ident);
-            println!("handle scale {}", l_dep);
-            return l_dep;
+
+            for (i, (units, _)) in expr.iter().enumerate() {
+                group.push(
+                    coeffs_buf
+                        .ptr()
+                        .offset((i * core::mem::size_of::<F>()) as isize),
+                );
+
+                for (u, exp) in units {
+                    let id = u.get_group();
+                    let (src, rot) = match u {
+                        ProveExpressionUnit::Fixed {
+                            column_index,
+                            rotation,
+                        } => (&fixed[*column_index], rotation),
+                        ProveExpressionUnit::Advice {
+                            column_index,
+                            rotation,
+                        } => (&advice[*column_index], rotation),
+                        ProveExpressionUnit::Instance {
+                            column_index,
+                            rotation,
+                        } => (&instance[*column_index], rotation),
+                    };
+                    if !bufs.contains_key(&id) {
+                        let buf = do_extended_fft_v2(device, ctx, src)?;
+                        bufs.insert(id, buf);
+                    }
+                    for _ in 0..*exp {
+                        group.push(bufs.get(&id).unwrap().ptr());
+                        rots.push(rot.0 << (ctx.extended_k - ctx.k));
+                    }
+                }
+
+                group.push(0usize as _);
+            }
+            let group_buf = device.alloc_device_buffer_from_slice(&group[..])?;
+            let rots_buf = device.alloc_device_buffer_from_slice(&rots[..])?;
+            device.synchronize()?;
+            end_timer!(timer);
+
+            let timer = start_timer!(|| "do field_op_batch_mul_sum");
+            let err = cuda::bn254_c::field_op_batch_mul_sum(
+                res.ptr(),
+                group_buf.ptr(),
+                rots_buf.ptr(),
+                group.len() as i32,
+                ctx.extended_size as i32,
+            );
+
+            device.synchronize()?;
+            assert_eq!(err, cuda_runtime_sys::cudaError::cudaSuccess);
+            end_timer!(timer);
+
+            last_bufs = bufs;
         }
     }
+
+    println!("total items is {}", total_items);
+
+    Ok(res)
 }

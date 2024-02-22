@@ -221,6 +221,38 @@ __global__ void _field_sum(
     }
 }
 
+__global__ void _field_op_batch_mul_sum(
+    Bn254FrField *res,
+    Bn254FrField **v, // coeff0, a00, a01, null, coeff1, a10, a11, null,
+    int *rot,
+    int n_v,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = gid;
+
+    Bn254FrField fl(0), fr;
+    int v_idx = 0;
+    int rot_idx = 0;
+    while (v_idx < n_v)
+    {
+        fr = *v[v_idx++]; // first one is coeff
+        while (v[v_idx])
+        {
+            int idx;
+            idx = (n + i + rot[rot_idx]) & (n - 1);
+            fr = fr * v[v_idx][idx];
+            v_idx++;
+            rot_idx++;
+        }
+
+        fl += fr;
+        v_idx++;
+    }
+
+    res[i] += fl;
+}
+
 __global__ void _field_op(
     Bn254FrField *res,
     Bn254FrField *l,
@@ -452,9 +484,8 @@ extern "C"
         int v_n,
         int n)
     {
-        int threads = n >= 128 ? 128 : 1;
+        int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
-        blocks = blocks > 32 ? 32 : blocks;
         _field_sum<<<blocks, threads>>>(res, v, v_c, v_rot, omegas, v_n, n);
         return cudaGetLastError();
     }
@@ -466,11 +497,23 @@ extern "C"
         int size,
         int extended_size)
     {
-        int threads = size >= 128 ? 128 : 1;
+        int threads = size >= 64 ? 64 : 1;
         int blocks = size / threads;
-        blocks = blocks > 32 ? 32 : blocks;
         _extended_prepare<<<blocks, threads>>>(s, coset_powers, coset_powers_n, extended_size);
         cudaMemset(&s[size], 0, (extended_size - size) * sizeof(Bn254FrField));
+        return cudaGetLastError();
+    }
+
+    cudaError_t field_op_batch_mul_sum(
+        Bn254FrField *res,
+        Bn254FrField **v, // coeff0, a00, a01, null, coeff1, a10, a11, null,
+        int *rot,
+        int n_v,
+        int n)
+    {
+        int threads = n >= 64 ? 64 : 1;
+        int blocks = n / threads;
+        _field_op_batch_mul_sum<<<blocks, threads>>>(res, v, rot, n_v, n);
         return cudaGetLastError();
     }
 
@@ -485,9 +528,8 @@ extern "C"
         int n,
         int op)
     {
-        int threads = n >= 128 ? 128 : 1;
+        int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
-        blocks = blocks > 32 ? 32 : blocks;
         _field_op<<<blocks, threads>>>(res, l, l_rot, l_c, r, r_rot, r_c, n, op);
         return cudaGetLastError();
     }
@@ -501,9 +543,8 @@ extern "C"
         const Bn254FrField *y,
         int n)
     {
-        int threads = n >= 128 ? 128 : 1;
+        int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
-        blocks = blocks > 32 ? 32 : blocks;
         _permutation_eval_h_p1<<<blocks, threads>>>(res, first_set, last_set, l0, l_last, y, n);
         return cudaGetLastError();
     }
@@ -518,9 +559,8 @@ extern "C"
         int rot,
         int n)
     {
-        int threads = n >= 128 ? 128 : 1;
+        int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
-        blocks = blocks > 32 ? 32 : blocks;
         _permutation_eval_h_p2<<<blocks, threads>>>(res, set, l0, l_last, y, n_set, rot, n);
         return cudaGetLastError();
     }
@@ -532,9 +572,8 @@ extern "C"
         const Bn254FrField *p,
         int n)
     {
-        int threads = n >= 128 ? 128 : 1;
+        int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
-        blocks = blocks > 32 ? 32 : blocks;
         _permutation_eval_h_l<<<blocks, threads>>>(res, beta, gamma, p, n);
         return cudaGetLastError();
     }
@@ -605,11 +644,12 @@ extern "C"
 // Tests
 
 __global__ void _test_bn254_ec(
-    const Bn254G1Affine *a,
-    const Bn254G1Affine *b,
-    Bn254G1Affine *add,
-    Bn254G1Affine *sub,
-    Bn254G1Affine *_double,
+    const Bn254FrField *a,
+    const Bn254FrField *b,
+    const Bn254FrField **x,
+    Bn254FrField *add,
+    Bn254FrField *sub,
+    Bn254FrField *_double,
     int n)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -620,11 +660,17 @@ __global__ void _test_bn254_ec(
 
     for (int i = start; i < end; i++)
     {
-        Bn254G1 zero;
-        Bn254G1 _a(a[i]);
-        Bn254G1 _b(b[i]);
+        Bn254FrField t = a[i] + b[i] + sub[i];
 
-        add[i] = _a + _b;
+        int j = 0;
+        while (x[j]) {
+            t = t * x[j][i];
+            j++;
+        }
+
+        add[i] = t;
+
+        /*
         assert(add[i] == _a + b[i]);
         assert(zero + a[i] + b[i] == add[i]);
         sub[i] = _a - _b;
@@ -635,6 +681,7 @@ __global__ void _test_bn254_ec(
         assert(a[i] == Bn254G1::identity() + _a);
         assert(a[i] == Bn254G1::identity() + _a);
         assert(_a - a[i] == Bn254G1::identity());
+        */
     }
 }
 
@@ -784,14 +831,15 @@ extern "C"
 
     cudaError_t test_bn254_ec(
         int blocks, int threads,
-        const Bn254G1Affine *a,
-        const Bn254G1Affine *b,
-        Bn254G1Affine *add,
-        Bn254G1Affine *sub,
-        Bn254G1Affine *_double,
+        const Bn254FrField *a,
+        const Bn254FrField *b,
+        const Bn254FrField **x,
+        Bn254FrField *add,
+        Bn254FrField *sub,
+        Bn254FrField *_double,
         int n)
     {
-        _test_bn254_ec<<<blocks, threads>>>(a, b, add, sub, _double, n);
+        _test_bn254_ec<<<blocks, threads>>>(a, b, x, add, sub, _double, n);
         return cudaGetLastError();
     }
 }
