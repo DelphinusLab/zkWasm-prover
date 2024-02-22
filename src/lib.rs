@@ -874,6 +874,74 @@ pub fn create_proof_from_advices<
     )?;
     end_timer!(timer);
 
+
+    let domain = &pk.vk.domain;
+
+    let timer = start_timer!(|| "vanishing construct");
+    // Construct the vanishing argument's h(X) commitments
+    let vanishing = vanishing.construct_general(params, domain, &mut h[..], transcript).unwrap();
+
+    let x: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
+    let xn = x.pow_vartime(&[params.n as u64]);
+    println!("x {:?}", x);
+    end_timer!(timer);
+
+    let timer = start_timer!(|| "compute eval");
+    let mut inputs = vec![];
+
+    for instance in instance.iter() {
+        meta.instance_queries.iter().for_each(|&(column, at)| {
+            inputs.push((
+                &instance.instance_polys[column.index()].values[..],
+                domain.rotate_omega(x, at),
+            ))
+        })
+    }
+
+    meta.advice_queries.iter().for_each(|&(column, at)| {
+        inputs.push((
+            &advices[column.index()],
+            domain.rotate_omega(x, at),
+        ))
+    });
+
+    meta.fixed_queries.iter().for_each(|&(column, at)| {
+        inputs.push((&pk.fixed_polys[column.index()], domain.rotate_omega(x, at)))
+    });
+
+    inputs.push((&vanishing.committed.random_poly, x));
+
+    for poly in pk.permutation.polys.iter() {
+        inputs.push((&poly, x));
+    }
+
+    for poly in permutation_products.iter() {
+        inputs.push((&poly, x));
+    }
+
+    let x_inv = domain.rotate_omega(x, halo2_proofs::poly::Rotation::prev());
+    let x_next = domain.rotate_omega(x, halo2_proofs::poly::Rotation::next());
+
+    for (permuted_input, permuted_table, _, _, z) in lookups.iter() {
+        inputs.push((z, x));
+        inputs.push((z, x_next));
+        inputs.push((permuted_input, x));
+        inputs.push((permuted_input, x_inv));
+        inputs.push((permuted_table, x));
+    }
+
+    for eval in inputs
+        .into_par_iter()
+        .map(|(a, b)| halo2_proofs::arithmetic::eval_polynomial_st(a, b))
+        .collect::<Vec<_>>()
+    {
+        transcript.write_scalar(eval).unwrap();
+    }
+    end_timer!(timer);
+
+    let fake: C::ScalarExt = *transcript.squeeze_challenge_scalar::<()>();
+    println!("fake {:?}", fake);
+
     Ok(())
 }
 
@@ -901,7 +969,7 @@ impl<F: FieldExt> EvalHContext<F> {
 }
 
 pub(crate) fn analyze_expr_tree<F: FieldExt>(
-    expr: &ProveExpression<F>
+    expr: &ProveExpression<F>,
 ) -> Vec<Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>> {
     let tree = expr.clone().flatten();
     let tree = tree
@@ -1053,14 +1121,7 @@ fn evaluate_h_gates<C: CurveAffine>(
     let timer = start_timer!(|| "evaluate_h gates");
     assert!(pk.ev.gpu_gates_expr.len() == 1);
     let exprs = analyze_expr_tree(&pk.ev.gpu_gates_expr[0]);
-    let h_buf = evaluate_prove_expr(
-        device,
-        &exprs,
-        fixed,
-        advice,
-        instance,
-        &mut ctx,
-    )?;
+    let h_buf = evaluate_prove_expr(device, &exprs, fixed, advice, instance, &mut ctx)?;
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h prepare buffers for constants");
