@@ -665,7 +665,8 @@ __global__ void _test_bn254_ec(
         Bn254FrField t = a[i] + b[i] + sub[i];
 
         int j = 0;
-        while (x[j]) {
+        while (x[j])
+        {
             t = t * x[j][i];
             j++;
         }
@@ -843,5 +844,11 @@ extern "C"
     {
         _test_bn254_ec<<<blocks, threads>>>(a, b, x, add, sub, _double, n);
         return cudaGetLastError();
+    }
+
+    cudaError_t free_async(
+        void *x)
+    {
+        cudaFreeAsync(x, 0);
     }
 }

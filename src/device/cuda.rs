@@ -3,7 +3,8 @@ use core::mem;
 use std::ffi::c_void;
 use std::mem::size_of;
 
-use cuda_runtime_sys::cudaError;
+use ark_std::{end_timer, start_timer};
+use cuda_runtime_sys::{cudaError, cudaFree};
 
 use super::{Device, DeviceBuf, Error};
 use crate::device::DeviceResult;
@@ -77,11 +78,13 @@ pub struct CudaDeviceBufRaw {
 
 impl Drop for CudaDeviceBufRaw {
     fn drop(&mut self) {
-        self.device().acitve_ctx().unwrap();
-        unsafe {
-            let res = cuda_runtime_sys::cudaFree(self.ptr());
-            to_result((), res, "fail to free device memory").unwrap();
-        }
+        //std::thread::spawn(move || {
+            self.device().acitve_ctx().unwrap();
+            unsafe {
+                let res = cudaFree(self.ptr());
+                to_result((), res, "fail to free device memory").unwrap();
+            }
+        //});
     }
 }
 

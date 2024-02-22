@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::thread;
 
 use ark_std::end_timer;
+use ark_std::iterable::Iterable;
 use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
 use cuda::bn254::buffer_copy_with_shift;
@@ -645,7 +646,9 @@ pub fn create_proof_from_advices<
 
     let mut lookups = lookups
         .into_iter()
-        .map(|(_, (permuted_input, permuted_table, _, _, z))| (permuted_input, permuted_table, z))
+        .map(|(_, (permuted_input, permuted_table, input, table, z))| {
+            (permuted_input, permuted_table, input, table, z)
+        })
         .collect::<Vec<_>>();
     end_timer!(timer);
 
@@ -753,7 +756,7 @@ pub fn create_proof_from_advices<
     let timer = start_timer!(|| "lookup intt and z msm");
     let mut tmp_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
     let mut ntt_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
-    for (permuted_input, permuted_table, z) in lookups.iter_mut() {
+    for (permuted_input, permuted_table, input, table, z) in lookups.iter_mut() {
         device.copy_from_host_to_device(&ntt_buf, &z[..])?;
         let commitment = msm_with_groups(&device, &g_lagrange_buf, &ntt_buf, size, 1)?;
         lookup_z_commitments.push(commitment);
@@ -833,8 +836,6 @@ pub fn create_proof_from_advices<
     {
         let timer = start_timer!(|| "advices intt");
 
-        let mut check_buf = advices[0].clone();
-
         for advices in unsafe { Arc::get_mut_unchecked(&mut advices) }.iter_mut() {
             device.copy_from_host_to_device(&ntt_buf, &advices[..])?;
             intt_raw(
@@ -868,6 +869,10 @@ pub fn create_proof_from_advices<
         &permutation_products
             .iter()
             .map(|x| &x[..])
+            .collect::<Vec<_>>()[..],
+        &lookups
+            .iter()
+            .map(|(v0, v1, v2, v3, v4)| (&v0[..], &v1[..], &v2[..], &v3[..], &v4[..]))
             .collect::<Vec<_>>()[..],
         y,
         beta,
@@ -911,11 +916,19 @@ fn evaluate_h_gates<C: CurveAffine>(
     advice: &[&[C::ScalarExt]],
     instance: &[&[C::ScalarExt]],
     permutation_products: &[&[C::ScalarExt]],
+    lookup_products: &[(
+        &[C::ScalarExt],
+        &[C::ScalarExt],
+        &[C::ScalarExt],
+        &[C::ScalarExt],
+        &[C::ScalarExt],
+    )],
     y: C::ScalarExt,
     beta: C::ScalarExt,
     gamma: C::ScalarExt,
     theta: C::ScalarExt,
 ) -> DeviceResult<Vec<C::ScalarExt, HugePageAllocator>> {
+    let timer = start_timer!(|| "evaluate_h setup");
     let k = pk.get_vk().domain.k() as usize;
     let size = 1 << pk.get_vk().domain.k();
     let omega = pk.vk.domain.get_omega();
@@ -947,9 +960,14 @@ fn evaluate_h_gates<C: CurveAffine>(
     let mut res = Vec::new_in(HugePageAllocator);
     res.resize(extended_size, C::ScalarExt::zero());
 
-    device.print_memory_info()?;
+    let l0 = &pk.l0;
+    let l_last = &pk.l_last;
+    let l0_buf = do_extended_ntt_v2(device, &mut ctx, &l0.values[..])?;
+    let l_last_buf = do_extended_ntt_v2(device, &mut ctx, &l_last.values[..])?;
+    end_timer!(timer);
+
     let timer = start_timer!(|| "evaluate_h gates");
-    let h_buf = evaluate_prove_expr_v2(
+    let h_buf = evaluate_prove_expr(
         device,
         &pk.ev.analyze_result,
         fixed,
@@ -978,12 +996,7 @@ fn evaluate_h_gates<C: CurveAffine>(
         let last_rotation = (ctx.size - (blinding_factors + 1)) << (extended_k - k);
         let chunk_len = pk.vk.cs.degree() - 2;
 
-        let l0 = &pk.l0;
-        let l_last = &pk.l_last;
         let l_active_row = &pk.l_active_row;
-
-        let l0_buf = do_extended_ntt_v2(device, &mut ctx, &l0.values[..])?;
-        let l_last_buf = do_extended_ntt_v2(device, &mut ctx, &l_last.values[..])?;
         let l_active_buf = device.alloc_device_buffer_from_slice(&l_active_row.values[..])?;
 
         let extended_p_buf = permutation_products
@@ -992,7 +1005,6 @@ fn evaluate_h_gates<C: CurveAffine>(
             .collect::<Result<Vec<_>, _>>()?;
 
         {
-            let timer = start_timer!(|| "p1");
             permutation_eval_h_p1(
                 device,
                 &h_buf,
@@ -1003,9 +1015,7 @@ fn evaluate_h_gates<C: CurveAffine>(
                 &y_buf,
                 ctx.extended_size,
             )?;
-            end_timer!(timer);
 
-            let timer = start_timer!(|| "p2");
             permutation_eval_h_p2(
                 device,
                 &h_buf,
@@ -1016,7 +1026,6 @@ fn evaluate_h_gates<C: CurveAffine>(
                 last_rotation,
                 ctx.extended_size,
             )?;
-            end_timer!(timer);
 
             let mut curr_delta = beta * &C::Scalar::ZETA;
             for ((extended_p_buf, columns), polys) in extended_p_buf
@@ -1109,7 +1118,153 @@ fn evaluate_h_gates<C: CurveAffine>(
     println!("after permutation res[0..4] is {:?}", &res[0..4]);
     end_timer!(timer);
 
+    let timer = start_timer!(|| "evaluate_h lookup");
+
+    for (i, (lookup, (permuted_input, permuted_table, input, table, z))) in pk
+        .vk
+        .cs
+        .lookups
+        .iter()
+        .zip(lookup_products.iter())
+        .enumerate()
+    {
+        let input_deg = get_expr_degree(&lookup.input_expressions);
+        let table_deg = get_expr_degree(&lookup.table_expressions);
+
+        let timer = start_timer!(|| format!(
+            "evaluate_h lookup flatten {}, deg {} {}",
+            i, input_deg, table_deg
+        ));
+
+        let [e1, e2] = flatten_lookup_expression(
+            &lookup.input_expressions,
+            &lookup.table_expressions,
+            beta,
+            gamma,
+            theta,
+        );
+        end_timer!(timer);
+
+        let timer = start_timer!(|| format!("evaluate_h lookup compress {}", i));
+        let input = if input_deg > 1 {
+            evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx)?
+        } else {
+            let mut buf = ctx.alloc(device)?;
+            device.copy_from_host_to_device(&buf, &input)?;
+            let short = vec![input[0] + beta];
+            device.copy_from_host_to_device(&buf, &short[..])?;
+            do_extended_ntt(device, &mut ctx, &mut buf)?;
+            buf
+        };
+        let table = if table_deg > 1 {
+            evaluate_prove_expr(device, &vec![e2], fixed, advice, instance, &mut ctx)?
+        } else {
+            let mut buf = ctx.alloc(device)?;
+            device.copy_from_host_to_device(&buf, &table)?;
+            let short = vec![table[0] + gamma];
+            device.copy_from_host_to_device(&buf, &short[..])?;
+            do_extended_ntt(device, &mut ctx, &mut buf)?;
+            buf
+        };
+        ctx.extended_allocator.push(input);
+        ctx.extended_allocator.push(table);
+        end_timer!(timer);
+    }
+    end_timer!(timer);
+
     Ok(res)
+}
+
+fn get_expr_degree<F: FieldExt>(expr: &Vec<halo2_proofs::plonk::circuit::Expression<F>>) -> usize {
+    let mut deg = 0;
+    for expr in expr {
+        deg = deg.max(expr.degree());
+    }
+    deg
+}
+
+fn flatten_lookup_expression<F: FieldExt>(
+    input: &Vec<halo2_proofs::plonk::circuit::Expression<F>>,
+    table: &Vec<halo2_proofs::plonk::circuit::Expression<F>>,
+    beta: F,
+    gamma: F,
+    theta: F,
+) -> [Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>; 2] {
+    let mut expr_input = ProveExpression::<F>::from_expr(&input[0]);
+    for input in input.iter().skip(1) {
+        expr_input = ProveExpression::Scale(
+            Box::new(expr_input),
+            BTreeMap::from_iter([(0, theta)].into_iter()),
+        );
+        expr_input = ProveExpression::Op(
+            Box::new(expr_input),
+            Box::new(ProveExpression::<F>::from_expr(input)),
+            Bop::Sum,
+        );
+    }
+
+    expr_input = ProveExpression::Op(
+        Box::new(expr_input),
+        Box::new(ProveExpression::Y(BTreeMap::from_iter(
+            [(0, beta)].into_iter(),
+        ))),
+        Bop::Sum,
+    );
+
+    let expr_input = expr_input
+        .flatten()
+        .into_iter()
+        .map(|(us, v)| {
+            let mut map = BTreeMap::new();
+            for mut u in us {
+                if let Some(c) = map.get_mut(&mut u) {
+                    *c = *c + 1;
+                } else {
+                    map.insert(u.clone(), 1);
+                }
+            }
+            (map, v.clone())
+        })
+        .collect::<Vec<_, _>>();
+
+    let mut expr_table = ProveExpression::<F>::from_expr(&table[0]);
+    for table in table.iter().skip(1) {
+        expr_table = ProveExpression::Scale(
+            Box::new(expr_table),
+            BTreeMap::from_iter([(0, theta)].into_iter()),
+        );
+        expr_table = ProveExpression::Op(
+            Box::new(expr_table),
+            Box::new(ProveExpression::<F>::from_expr(table)),
+            Bop::Sum,
+        );
+    }
+
+    expr_table = ProveExpression::Op(
+        Box::new(expr_table),
+        Box::new(ProveExpression::Y(BTreeMap::from_iter(
+            [(0, gamma)].into_iter(),
+        ))),
+        Bop::Sum,
+    );
+
+    let expr_table = expr_table
+        .flatten()
+        .into_iter()
+        .map(|(us, v)| {
+            let mut map = BTreeMap::new();
+            for mut u in us {
+                if let Some(c) = map.get_mut(&mut u) {
+                    *c = *c + 1;
+                } else {
+                    map.insert(u.clone(), 1);
+                }
+            }
+            (map, v.clone())
+        })
+        .collect::<Vec<_, _>>();
+
+    [expr_input, expr_table]
 }
 
 fn do_extended_ntt_v2<F: FieldExt>(
@@ -1188,7 +1343,7 @@ fn eval_ys<F: FieldExt>(ys: &BTreeMap<u32, F>, ctx: &mut EvalHContext<F>) -> F {
     })
 }
 
-fn evaluate_prove_expr_v2<F: FieldExt>(
+fn evaluate_prove_expr<F: FieldExt>(
     device: &CudaDevice,
     exprs: &Vec<Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>>,
     fixed: &[&[F]],
@@ -1196,16 +1351,13 @@ fn evaluate_prove_expr_v2<F: FieldExt>(
     instance: &[&[F]],
     ctx: &mut EvalHContext<F>,
 ) -> DeviceResult<CudaDeviceBufRaw> {
-    let res = device.alloc_device_buffer::<F>(ctx.extended_size)?;
+    let res = ctx.alloc(device)?;
     unsafe {
         cudaMemset(res.ptr(), 0, ctx.extended_size * core::mem::size_of::<F>());
     }
     let mut last_bufs = BTreeMap::new();
 
-    let mut total_items = 0;
-
     for expr in exprs.iter() {
-        total_items += expr.len();
         let mut bufs = BTreeMap::new();
         let mut coeffs = vec![];
         for (_, ys) in expr {
@@ -1282,8 +1434,6 @@ fn evaluate_prove_expr_v2<F: FieldExt>(
             last_bufs = bufs;
         }
     }
-
-    println!("total items is {}", total_items);
 
     Ok(res)
 }
