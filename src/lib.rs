@@ -1035,7 +1035,7 @@ where
     let ws = commitment_data
         .into_par_iter()
         .map(|commitment_at_a_point| -> DeviceResult<_> {
-            println!("queries {}", commitment_at_a_point.queries.len());
+            //println!("queries {}", commitment_at_a_point.queries.len());
             let poly_batch_buf = device.alloc_device_buffer::<C::Scalar>(params.n as usize)?;
             let tmp_buf = device.alloc_device_buffer::<C::Scalar>(params.n as usize)?;
 
@@ -1082,7 +1082,6 @@ where
     for witness_poly in ws {
         device.copy_from_host_to_device(&s_buf, &witness_poly[..])?;
         let commitment = msm_with_groups(&device, &p_buf, &s_buf, params.n as usize, 1)?;
-        println!("commitment is {:?}", commitment);
         transcript.write_point(commitment).unwrap();
     }
     end_timer!(timer);
