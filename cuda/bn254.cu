@@ -545,6 +545,29 @@ __global__ void _lookup_eval_h(
     res[i] = t;
 }
 
+__global__ void _expand_omega_buffer(
+    Bn254FrField *buf,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int workers = gridDim.x * blockDim.x;
+    int tasks = n / workers;
+    int start = gid * tasks;
+    int end = start + tasks;
+
+    start = start < 2 ? 2 : start;
+    end = end > n ? n : end;
+
+    Bn254FrField x = buf[1];
+    Bn254FrField curr = Bn254FrField::pow(&x, start);
+
+    for (int i = start; i < end; i++)
+    {
+        buf[i] = curr;
+        curr = curr * x;
+    }
+}
+
 extern "C"
 {
     cudaError_t field_sum(
@@ -730,6 +753,16 @@ extern "C"
             l0, l_last, l_active_row,
             y, beta, gamma,
             rot, n);
+        return cudaGetLastError();
+    }
+
+    cudaError_t expand_omega_buffer(
+        Bn254FrField *res,
+        int n)
+    {
+        int threads = n >= 64 ? 64 : 1;
+        int blocks = n / threads;
+        _expand_omega_buffer<<<blocks, threads>>>(res, n);
         return cudaGetLastError();
     }
 }

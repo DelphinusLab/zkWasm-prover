@@ -278,10 +278,7 @@ pub fn ntt_prepare<F: FieldExt>(
     len_log: usize,
 ) -> DeviceResult<(CudaDeviceBufRaw, CudaDeviceBufRaw)> {
     let len = 1 << len_log;
-    let mut omegas = vec![F::one()];
-    for _ in 1..len {
-        omegas.push(*omegas.last().unwrap() * omega);
-    }
+    let mut omegas = vec![F::one(), omega];
 
     let max_deg = MAX_DEG.min(len_log);
     let mut pq = vec![F::zero(); 1 << max_deg >> 1];
@@ -295,7 +292,13 @@ pub fn ntt_prepare<F: FieldExt>(
         }
     }
 
-    let omegas_buf = device.alloc_device_buffer_from_slice(&omegas[..])?;
+    let omegas_buf = device.alloc_device_buffer::<F>(1 << len_log)?;
+    device.copy_from_host_to_device(&omegas_buf, &omegas[..])?;
+    unsafe {
+        let err =
+            crate::cuda::bn254_c::expand_omega_buffer(omegas_buf.ptr(), (1 << len_log) as i32);
+        to_result((), err, "fail to run expand_omega_buffer")?;
+    }
     let pq_buf = device.alloc_device_buffer_from_slice(&pq[..])?;
 
     Ok((omegas_buf, pq_buf))

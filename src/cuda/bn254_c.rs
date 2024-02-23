@@ -108,4 +108,6 @@ extern "C" {
         rot: i32,
         n: i32,
     ) -> cudaError;
+
+    pub fn expand_omega_buffer(buf: *mut c_void, n: i32) -> cudaError;
 }
