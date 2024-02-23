@@ -14,7 +14,7 @@ pub(crate) fn extended_prepare(
     coset_powers_n: usize,
     size: usize,
     extended_size: usize,
-    stream: Option<cudaStream_t>
+    stream: Option<cudaStream_t>,
 ) -> Result<(), Error> {
     unsafe {
         device.acitve_ctx()?;
@@ -49,7 +49,7 @@ pub(crate) fn field_op_v2<F: FieldExt>(
     size: usize,
     op: FieldOp,
 ) -> Result<(), Error> {
-    field_op(device, res, l, 0, l_c, r, 0, r_c, size, op)?;
+    field_op(device, res, l, 0, l_c, r, 0, r_c, size, op, None)?;
 
     Ok(())
 }
@@ -186,6 +186,7 @@ pub(crate) fn field_op<F: FieldExt>(
     r_c: Option<F>,
     size: usize,
     op: FieldOp,
+    stream: Option<cudaStream_t>,
 ) -> Result<(), Error> {
     let l_c = if l_c.is_none() {
         None
@@ -210,6 +211,7 @@ pub(crate) fn field_op<F: FieldExt>(
             r_c.as_ref().map_or(0usize as *mut _, |x| x.ptr()),
             size as i32,
             op as i32,
+            stream.unwrap_or(0usize as _),
         );
         to_result((), err, "fail to run field_op")?;
     }
@@ -306,7 +308,7 @@ pub fn ntt_raw(
     pq_buf: &CudaDeviceBufRaw,
     omegas_buf: &CudaDeviceBufRaw,
     len_log: usize,
-    stream: Option<cudaStream_t>
+    stream: Option<cudaStream_t>,
 ) -> Result<(), Error> {
     let mut swap = false;
     unsafe {
@@ -319,7 +321,7 @@ pub fn ntt_raw(
             len_log as i32,
             MAX_DEG as i32,
             &mut swap as *mut _ as _,
-            stream.unwrap_or(0usize as _)
+            stream.unwrap_or(0usize as _),
         );
         to_result((), err, "fail to run ntt")?;
     }
@@ -338,7 +340,22 @@ pub fn intt_raw(
     divisor: &CudaDeviceBufRaw,
     len_log: usize,
 ) -> Result<(), Error> {
-    ntt_raw(device, s_buf, tmp_buf, pq_buf, omegas_buf, len_log, None)?;
+    intt_raw_async(
+        device, s_buf, tmp_buf, pq_buf, omegas_buf, divisor, len_log, None,
+    )
+}
+
+pub fn intt_raw_async(
+    device: &CudaDevice,
+    s_buf: &mut CudaDeviceBufRaw,
+    tmp_buf: &mut CudaDeviceBufRaw,
+    pq_buf: &CudaDeviceBufRaw,
+    omegas_buf: &CudaDeviceBufRaw,
+    divisor: &CudaDeviceBufRaw,
+    len_log: usize,
+    stream: Option<cudaStream_t>,
+) -> Result<(), Error> {
+    ntt_raw(device, s_buf, tmp_buf, pq_buf, omegas_buf, len_log, stream)?;
     unsafe {
         let err = bn254_c::field_op(
             s_buf.ptr(),
@@ -350,6 +367,7 @@ pub fn intt_raw(
             divisor.ptr(),
             (1 << len_log) as i32,
             FieldOp::Mul as i32,
+            stream.unwrap_or(0usize as _),
         );
         to_result((), err, "fail to run field_op in intt_raw")?;
     }

@@ -87,9 +87,13 @@ impl Drop for CudaDeviceBufRaw {
 
 impl DeviceBuf for CudaDeviceBufRaw {}
 
-
 impl CudaDevice {
-    pub fn copy_from_host_to_device_async<T>(&self, dst: &CudaDeviceBufRaw, src: &[T], stream: cudaStream_t) -> DeviceResult<()> {
+    pub fn copy_from_host_to_device_async<T>(
+        &self,
+        dst: &CudaDeviceBufRaw,
+        src: &[T],
+        stream: cudaStream_t,
+    ) -> DeviceResult<()> {
         self.acitve_ctx()?;
         unsafe {
             let res = cuda_runtime_sys::cudaMemcpyAsync(
@@ -100,6 +104,25 @@ impl CudaDevice {
                 stream,
             );
             to_result((), res, "fail to copy memory from host to device")
+        }
+    }
+
+    pub fn copy_from_device_to_host_async<T>(
+        &self,
+        dst: &mut [T],
+        src: &CudaDeviceBufRaw,
+        stream: cudaStream_t,
+    ) -> DeviceResult<()> {
+        self.acitve_ctx()?;
+        unsafe {
+            let res = cuda_runtime_sys::cudaMemcpyAsync(
+                dst.as_ptr() as _,
+                src.ptr(),
+                dst.len() * mem::size_of::<T>(),
+                cuda_runtime_sys::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                stream,
+            );
+            to_result((), res, "fail to copy memory from device to host")
         }
     }
 }

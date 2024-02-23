@@ -33,6 +33,7 @@ extern "C" {
         r_c: *mut c_void,
         size: i32,
         op: i32,
+        stream: *mut CUstream_st,
     ) -> cudaError;
 
     pub fn extended_prepare(

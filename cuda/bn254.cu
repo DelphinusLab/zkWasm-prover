@@ -599,11 +599,12 @@ extern "C"
         int r_rot,
         Bn254FrField *r_c,
         int n,
-        int op)
+        int op,
+        CUstream_st *stream)
     {
         int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
-        _field_op<<<blocks, threads>>>(res, l, l_rot, l_c, r, r_rot, r_c, n, op);
+        _field_op<<<blocks, threads, 0, stream>>>(res, l, l_rot, l_c, r, r_rot, r_c, n, op);
         return cudaGetLastError();
     }
 

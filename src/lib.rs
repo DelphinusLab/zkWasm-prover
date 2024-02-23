@@ -32,6 +32,7 @@ use rayon::slice::ParallelSlice as _;
 use crate::cuda::bn254::field_op_v2;
 use crate::cuda::bn254::field_sum;
 use crate::cuda::bn254::intt_raw;
+use crate::cuda::bn254::intt_raw_async;
 use crate::cuda::bn254::msm;
 use crate::cuda::bn254::msm_with_groups;
 use crate::cuda::bn254::ntt_prepare;
@@ -803,18 +804,40 @@ pub fn create_proof_from_advices<
     {
         let timer = start_timer!(|| "advices intt");
 
+        let mut last_stream = None;
+        let mut last_tmp_buf = Some(device.alloc_device_buffer::<C::Scalar>(size)?);
+        let mut last_ntt_buf = Some(device.alloc_device_buffer::<C::Scalar>(size)?);
         for advices in unsafe { Arc::get_mut_unchecked(&mut advices) }.iter_mut() {
-            device.copy_from_host_to_device(&ntt_buf, &advices[..])?;
-            intt_raw(
-                &device,
-                &mut ntt_buf,
-                &mut tmp_buf,
-                &intt_pq_buf,
-                &intt_omegas_buf,
-                &intt_divisor_buf,
-                k,
-            )?;
-            device.copy_from_device_to_host(&mut advices[..], &ntt_buf)?;
+            unsafe {
+                let mut stream = std::mem::zeroed();
+                let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+                crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
+                device.copy_from_host_to_device_async(&ntt_buf, &advices[..], stream)?;
+                intt_raw_async(
+                    &device,
+                    &mut ntt_buf,
+                    &mut tmp_buf,
+                    &intt_pq_buf,
+                    &intt_omegas_buf,
+                    &intt_divisor_buf,
+                    k,
+                    Some(stream),
+                )?;
+                device.copy_from_device_to_host_async(&mut advices[..], &ntt_buf, stream)?;
+                if let Some(last_stream) = last_stream {
+                    cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                    cuda_runtime_sys::cudaStreamDestroy(last_stream);
+                }
+                std::mem::swap(&mut ntt_buf, last_ntt_buf.as_mut().unwrap());
+                std::mem::swap(&mut tmp_buf, last_tmp_buf.as_mut().unwrap());
+                last_stream = Some(stream);
+            }
+        }
+        if let Some(last_stream) = last_stream {
+            unsafe {
+                cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                cuda_runtime_sys::cudaStreamDestroy(last_stream);
+            }
         }
         end_timer!(timer);
     }
