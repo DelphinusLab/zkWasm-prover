@@ -419,9 +419,23 @@ pub(crate) fn evaluate_h_gates<C: CurveAffine>(
             buf
         };
 
-        let permuted_input_buf = do_extended_ntt_v2(device, &mut ctx, permuted_input)?;
-        let permuted_table_buf = do_extended_ntt_v2(device, &mut ctx, permuted_table)?;
-        let z_buf = do_extended_ntt_v2(device, &mut ctx, z)?;
+        let (permuted_input_buf, tmp0, stream0) =
+            do_extended_ntt_v2_async(device, &mut ctx, permuted_input)?;
+        let (permuted_table_buf, tmp1, stream1) =
+            do_extended_ntt_v2_async(device, &mut ctx, permuted_table)?;
+        let (z_buf, tmp2, stream2) = do_extended_ntt_v2_async(device, &mut ctx, z)?;
+
+        unsafe {
+            cuda_runtime_sys::cudaStreamSynchronize(stream0);
+            cuda_runtime_sys::cudaStreamDestroy(stream0);
+            ctx.extended_allocator.push(tmp0);
+            cuda_runtime_sys::cudaStreamSynchronize(stream1);
+            cuda_runtime_sys::cudaStreamDestroy(stream1);
+            ctx.extended_allocator.push(tmp1);
+            cuda_runtime_sys::cudaStreamSynchronize(stream2);
+            cuda_runtime_sys::cudaStreamDestroy(stream2);
+            ctx.extended_allocator.push(tmp2);
+        }
 
         unsafe {
             let err = lookup_eval_h(
