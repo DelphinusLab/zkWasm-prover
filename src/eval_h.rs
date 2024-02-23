@@ -4,6 +4,10 @@ use ark_std::end_timer;
 use ark_std::iterable::Iterable;
 use ark_std::start_timer;
 use cuda_runtime_sys::cudaMemset;
+use cuda_runtime_sys::cudaStreamDestroy;
+use cuda_runtime_sys::cudaStreamSynchronize;
+use cuda_runtime_sys::cudaStream_t;
+use cuda_runtime_sys::CUstream_st;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
@@ -212,7 +216,8 @@ pub(crate) fn evaluate_h_gates<C: CurveAffine>(
     let timer = start_timer!(|| "evaluate_h gates");
     assert!(pk.ev.gpu_gates_expr.len() == 1);
     let exprs = analyze_expr_tree(&pk.ev.gpu_gates_expr[0]);
-    let h_buf = evaluate_prove_expr(device, &exprs, fixed, advice, instance, &mut ctx)?;
+    let h_buf =
+        evaluate_prove_expr_with_async_ntt(device, &exprs, fixed, advice, instance, &mut ctx)?;
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h prepare buffers for constants");
@@ -307,7 +312,7 @@ pub(crate) fn evaluate_h_gates<C: CurveAffine>(
                     do_extended_ntt(&device, &mut ctx, &mut l_res)?;
                     field_mul::<C::ScalarExt>(&device, &l, &l_res, ctx.extended_size)?;
 
-                    do_extended_prepare(device, &mut ctx, &mut r_res)?;
+                    do_extended_prepare(device, &mut ctx, &mut r_res, None)?;
                     let coeff =
                         pick_from_buf::<C::ScalarExt>(device, &r_res, 0, 1, ctx.extended_size)?;
                     let short = vec![value[0] + gamma, coeff + curr_delta];
@@ -562,10 +567,37 @@ fn do_extended_ntt_v2<F: FieldExt>(
     Ok(buf)
 }
 
+fn do_extended_ntt_v2_async<F: FieldExt>(
+    device: &CudaDevice,
+    ctx: &mut EvalHContext<F>,
+    data: &[F],
+) -> DeviceResult<(CudaDeviceBufRaw, CudaDeviceBufRaw, *mut CUstream_st)> {
+    let buf = ctx.extended_allocator.pop();
+    let mut buf = if buf.is_none() {
+        device.alloc_device_buffer::<F>(ctx.extended_size)?
+    } else {
+        buf.unwrap()
+    };
+    let (tmp, stream) = unsafe {
+        let mut stream = std::mem::zeroed();
+        let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+        assert_eq!(err, cuda_runtime_sys::cudaError::cudaSuccess);
+        device.copy_from_host_to_device_async::<F>(&buf, data, stream)?;
+        do_extended_prepare(device, ctx, &mut buf, Some(stream))?;
+        (
+            do_extended_ntt_pure_async(device, ctx, &mut buf, Some(stream))?,
+            stream,
+        )
+    };
+
+    Ok((buf, tmp, stream))
+}
+
 fn do_extended_prepare<F: FieldExt>(
     device: &CudaDevice,
     ctx: &mut EvalHContext<F>,
     data: &mut CudaDeviceBufRaw,
+    stream: Option<cudaStream_t>,
 ) -> DeviceResult<()> {
     extended_prepare(
         device,
@@ -574,6 +606,7 @@ fn do_extended_prepare<F: FieldExt>(
         3,
         ctx.size,
         ctx.extended_size,
+        stream,
     )
 }
 
@@ -582,16 +615,17 @@ fn do_extended_ntt<F: FieldExt>(
     ctx: &mut EvalHContext<F>,
     data: &mut CudaDeviceBufRaw,
 ) -> DeviceResult<()> {
-    do_extended_prepare(device, ctx, data)?;
+    do_extended_prepare(device, ctx, data, None)?;
     do_extended_ntt_pure(device, ctx, data)?;
     Ok(())
 }
 
-fn do_extended_ntt_pure<F: FieldExt>(
+fn do_extended_ntt_pure_async<F: FieldExt>(
     device: &CudaDevice,
     ctx: &mut EvalHContext<F>,
     data: &mut CudaDeviceBufRaw,
-) -> DeviceResult<()> {
+    stream: Option<cudaStream_t>,
+) -> DeviceResult<CudaDeviceBufRaw> {
     let tmp = ctx.extended_allocator.pop();
     let mut tmp = if tmp.is_none() {
         device.alloc_device_buffer::<F>(ctx.extended_size)?
@@ -605,7 +639,17 @@ fn do_extended_ntt_pure<F: FieldExt>(
         &ctx.extended_ntt_pq_buf,
         &ctx.extended_ntt_omegas_buf,
         ctx.extended_k,
+        stream,
     )?;
+    Ok(tmp)
+}
+
+fn do_extended_ntt_pure<F: FieldExt>(
+    device: &CudaDevice,
+    ctx: &mut EvalHContext<F>,
+    data: &mut CudaDeviceBufRaw,
+) -> DeviceResult<()> {
+    let tmp = do_extended_ntt_pure_async(device, ctx, data, None)?;
     device.synchronize()?;
     ctx.extended_allocator.push(tmp);
     Ok(())
@@ -633,8 +677,8 @@ fn evaluate_prove_expr<F: FieldExt>(
     unsafe {
         cudaMemset(res.ptr(), 0, ctx.extended_size * core::mem::size_of::<F>());
     }
-    let mut last_bufs = BTreeMap::new();
 
+    let mut last_bufs = BTreeMap::new();
     for expr in exprs.iter() {
         let mut bufs = BTreeMap::new();
         let mut coeffs = vec![];
@@ -696,6 +740,120 @@ fn evaluate_prove_expr<F: FieldExt>(
 
                 group.push(0usize as _);
             }
+
+            let group_buf = device.alloc_device_buffer_from_slice(&group[..])?;
+            let rots_buf = device.alloc_device_buffer_from_slice(&rots[..])?;
+
+            let err = field_op_batch_mul_sum(
+                res.ptr(),
+                group_buf.ptr(),
+                rots_buf.ptr(),
+                group.len() as i32,
+                ctx.extended_size as i32,
+            );
+
+            to_result((), err, "fail to run field_op_batch_mul_sum")?;
+
+            last_bufs = bufs;
+        }
+    }
+
+    Ok(res)
+}
+
+fn evaluate_prove_expr_with_async_ntt<F: FieldExt>(
+    device: &CudaDevice,
+    exprs: &Vec<Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>>,
+    fixed: &[&[F]],
+    advice: &[&[F]],
+    instance: &[&[F]],
+    ctx: &mut EvalHContext<F>,
+) -> DeviceResult<CudaDeviceBufRaw> {
+    let res = ctx.alloc(device)?;
+    unsafe {
+        cudaMemset(res.ptr(), 0, ctx.extended_size * core::mem::size_of::<F>());
+    }
+
+    let mut last_bufs = BTreeMap::new();
+    for expr in exprs.iter() {
+        let mut bufs = BTreeMap::new();
+        let mut coeffs = vec![];
+        for (_, ys) in expr {
+            coeffs.push(eval_ys(&ys, ctx));
+        }
+        let coeffs_buf = device.alloc_device_buffer_from_slice(&coeffs[..])?;
+
+        unsafe {
+            let mut group = vec![];
+            let mut rots = vec![];
+
+            for (units, _) in expr.iter() {
+                for (u, _) in units {
+                    let id = u.get_group();
+                    if !bufs.contains_key(&id) && last_bufs.contains_key(&id) {
+                        let buf = last_bufs.remove(&id).unwrap();
+                        bufs.insert(id, buf);
+                    }
+                }
+            }
+
+            for (_, buf) in last_bufs {
+                ctx.extended_allocator.push(buf)
+            }
+
+            let mut last_tmp = None;
+            let mut last_stream = None;
+            for (i, (units, _)) in expr.iter().enumerate() {
+                group.push(
+                    coeffs_buf
+                        .ptr()
+                        .offset((i * core::mem::size_of::<F>()) as isize),
+                );
+
+                for (u, exp) in units {
+                    let id = u.get_group();
+                    let (src, rot) = match u {
+                        ProveExpressionUnit::Fixed {
+                            column_index,
+                            rotation,
+                        } => (&fixed[*column_index], rotation),
+                        ProveExpressionUnit::Advice {
+                            column_index,
+                            rotation,
+                        } => (&advice[*column_index], rotation),
+                        ProveExpressionUnit::Instance {
+                            column_index,
+                            rotation,
+                        } => (&instance[*column_index], rotation),
+                    };
+                    if !bufs.contains_key(&id) {
+                        let (buf, tmp, stream) = do_extended_ntt_v2_async(device, ctx, src)?;
+                        if let Some(last_stream) = last_stream {
+                            cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                            cuda_runtime_sys::cudaStreamDestroy(last_stream);
+                            ctx.extended_allocator.push(last_tmp.unwrap());
+                            last_tmp = Some(tmp);
+                        } else {
+                            last_tmp = Some(tmp);
+                        }
+                        last_stream = Some(stream);
+                        bufs.insert(id, buf);
+                    }
+                    for _ in 0..*exp {
+                        group.push(bufs.get(&id).unwrap().ptr());
+                        rots.push(rot.0 << (ctx.extended_k - ctx.k));
+                    }
+                }
+
+                group.push(0usize as _);
+            }
+
+            if let Some(last_stream) = last_stream {
+                cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                cuda_runtime_sys::cudaStreamDestroy(last_stream);
+                ctx.extended_allocator.push(last_tmp.unwrap());
+            }
+
             let group_buf = device.alloc_device_buffer_from_slice(&group[..])?;
             let rots_buf = device.alloc_device_buffer_from_slice(&rots[..])?;
 

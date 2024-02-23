@@ -3,7 +3,7 @@ use core::mem;
 use std::ffi::c_void;
 use std::mem::size_of;
 
-use cuda_runtime_sys::{cudaError, cudaFree};
+use cuda_runtime_sys::{cudaError, cudaFree, cudaStream_t};
 
 use super::{Device, DeviceBuf, Error};
 use crate::device::DeviceResult;
@@ -86,6 +86,23 @@ impl Drop for CudaDeviceBufRaw {
 }
 
 impl DeviceBuf for CudaDeviceBufRaw {}
+
+
+impl CudaDevice {
+    pub fn copy_from_host_to_device_async<T>(&self, dst: &CudaDeviceBufRaw, src: &[T], stream: cudaStream_t) -> DeviceResult<()> {
+        self.acitve_ctx()?;
+        unsafe {
+            let res = cuda_runtime_sys::cudaMemcpyAsync(
+                dst.ptr(),
+                src.as_ptr() as _,
+                src.len() * mem::size_of::<T>(),
+                cuda_runtime_sys::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream,
+            );
+            to_result((), res, "fail to copy memory from host to device")
+        }
+    }
+}
 
 impl Device<CudaDeviceBufRaw> for CudaDevice {
     fn get_device_count() -> DeviceResult<usize> {

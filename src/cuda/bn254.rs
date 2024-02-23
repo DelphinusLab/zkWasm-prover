@@ -2,6 +2,7 @@ use super::bn254_c;
 use crate::device::cuda::{to_result, CudaBuffer, CudaDevice, CudaDeviceBufRaw};
 use crate::device::Error;
 use crate::device::{Device, DeviceResult};
+use cuda_runtime_sys::cudaStream_t;
 use halo2_proofs::arithmetic::{CurveAffine, FieldExt};
 use halo2_proofs::pairing::group::Curve;
 use halo2_proofs::pairing::group::Group;
@@ -13,6 +14,7 @@ pub(crate) fn extended_prepare(
     coset_powers_n: usize,
     size: usize,
     extended_size: usize,
+    stream: Option<cudaStream_t>
 ) -> Result<(), Error> {
     unsafe {
         device.acitve_ctx()?;
@@ -22,6 +24,7 @@ pub(crate) fn extended_prepare(
             coset_powers_n as i32,
             size as i32,
             extended_size as i32,
+            stream.unwrap_or(0usize as _),
         );
         to_result((), err, "fail to run extended_prepare")?;
         Ok(())
@@ -303,6 +306,7 @@ pub fn ntt_raw(
     pq_buf: &CudaDeviceBufRaw,
     omegas_buf: &CudaDeviceBufRaw,
     len_log: usize,
+    stream: Option<cudaStream_t>
 ) -> Result<(), Error> {
     let mut swap = false;
     unsafe {
@@ -315,6 +319,7 @@ pub fn ntt_raw(
             len_log as i32,
             MAX_DEG as i32,
             &mut swap as *mut _ as _,
+            stream.unwrap_or(0usize as _)
         );
         to_result((), err, "fail to run ntt")?;
     }
@@ -333,7 +338,7 @@ pub fn intt_raw(
     divisor: &CudaDeviceBufRaw,
     len_log: usize,
 ) -> Result<(), Error> {
-    ntt_raw(device, s_buf, tmp_buf, pq_buf, omegas_buf, len_log)?;
+    ntt_raw(device, s_buf, tmp_buf, pq_buf, omegas_buf, len_log, None)?;
     unsafe {
         let err = bn254_c::field_op(
             s_buf.ptr(),
@@ -360,7 +365,7 @@ pub fn ntt<F: FieldExt>(
     result: &mut [F],
     len_log: usize,
 ) -> Result<(), Error> {
-    ntt_raw(device, s_buf, tmp_buf, pq_buf, omegas_buf, len_log)?;
+    ntt_raw(device, s_buf, tmp_buf, pq_buf, omegas_buf, len_log, None)?;
     device.copy_from_device_to_host(result, s_buf)?;
     Ok(())
 }

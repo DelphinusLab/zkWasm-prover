@@ -577,6 +577,7 @@ fn test_bn254_fft() {
             &pq_buf,
             &omegas_buf,
             len_log as usize,
+            None,
         )
         .unwrap();
         device.synchronize().unwrap();

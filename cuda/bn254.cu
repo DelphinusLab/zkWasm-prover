@@ -567,12 +567,13 @@ extern "C"
         Bn254FrField *coset_powers,
         uint coset_powers_n,
         int size,
-        int extended_size)
+        int extended_size,
+        CUstream_st *stream)
     {
         int threads = size >= 64 ? 64 : 1;
         int blocks = size / threads;
-        _extended_prepare<<<blocks, threads>>>(s, coset_powers, coset_powers_n, extended_size);
-        cudaMemset(&s[size], 0, (extended_size - size) * sizeof(Bn254FrField));
+        _extended_prepare<<<blocks, threads, 0, stream>>>(s, coset_powers, coset_powers_n, extended_size);
+        cudaMemsetAsync(&s[size], 0, (extended_size - size) * sizeof(Bn254FrField), stream);
         return cudaGetLastError();
     }
 
@@ -657,7 +658,8 @@ extern "C"
         const Bn254FrField *omegas,
         int log_n,
         int max_deg,
-        bool *swap)
+        bool *swap,
+        CUstream_st *stream)
     {
         int p = 0;
 
@@ -675,7 +677,7 @@ extern "C"
             int blocks = total >> (deg - 1);
             blocks = blocks > 65536 ? 65536 : blocks;
             int grids = (total / blocks) >> (deg - 1);
-            _ntt_core<<<blocks, threads>>>(src, dst, pq, omegas, len, p, deg, max_deg, grids);
+            _ntt_core<<<blocks, threads, 0, stream>>>(src, dst, pq, omegas, len, p, deg, max_deg, grids);
 
             Bn254FrField *t = src;
             src = dst;

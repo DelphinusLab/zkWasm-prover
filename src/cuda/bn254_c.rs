@@ -1,4 +1,4 @@
-use cuda_runtime_sys::cudaError;
+use cuda_runtime_sys::{cudaError, CUstream_st};
 use std::ffi::c_void;
 
 #[link(name = "zkwasm_prover_kernel", kind = "static")]
@@ -20,6 +20,7 @@ extern "C" {
         array_log: i32,
         max_deg: i32,
         swap: *mut c_void,
+        stream: *mut CUstream_st,
     ) -> cudaError;
 
     pub fn field_op(
@@ -40,6 +41,7 @@ extern "C" {
         coset_powers_n: i32,
         size: i32,
         extended_size: i32,
+        stream: *mut CUstream_st,
     ) -> cudaError;
 
     pub fn permutation_eval_h_p1(
