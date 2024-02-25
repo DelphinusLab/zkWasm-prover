@@ -4,6 +4,8 @@ use crate::device::Error;
 use crate::device::{Device, DeviceResult};
 use cuda_runtime_sys::cudaStream_t;
 use halo2_proofs::arithmetic::{CurveAffine, FieldExt};
+use halo2_proofs::pairing::group::ff::PrimeField as _;
+use halo2_proofs::pairing::group::prime::PrimeCurveAffine as _;
 use halo2_proofs::pairing::group::Curve;
 use halo2_proofs::pairing::group::Group;
 
@@ -35,7 +37,7 @@ pub(crate) fn extended_prepare(
 pub(crate) enum FieldOp {
     Sum = 0,
     Mul = 1,
-    Neg = 2,
+    _Neg = 2,
     Sub = 3,
 }
 
@@ -175,6 +177,36 @@ pub(crate) fn pick_from_buf<F: FieldExt>(
     Ok(v[0])
 }
 
+pub(crate) fn field_op_v3(
+    device: &CudaDevice,
+    res: &CudaDeviceBufRaw,
+    l: Option<&CudaDeviceBufRaw>,
+    l_c: Option<&CudaDeviceBufRaw>,
+    r: Option<&CudaDeviceBufRaw>,
+    r_c: Option<&CudaDeviceBufRaw>,
+    size: usize,
+    op: FieldOp,
+    stream: Option<cudaStream_t>,
+) -> Result<(), Error> {
+    unsafe {
+        device.acitve_ctx()?;
+        let err = bn254_c::field_op(
+            res.ptr(),
+            l.map_or(0usize as *mut _, |x| x.ptr()),
+            0,
+            l_c.as_ref().map_or(0usize as *mut _, |x| x.ptr()),
+            r.map_or(0usize as *mut _, |x| x.ptr()),
+            0,
+            r_c.as_ref().map_or(0usize as *mut _, |x| x.ptr()),
+            size as i32,
+            op as i32,
+            stream.unwrap_or(0usize as _),
+        );
+        to_result((), err, "fail to run field_op")?;
+    }
+    Ok(())
+}
+
 pub(crate) fn field_op<F: FieldExt>(
     device: &CudaDevice,
     res: &CudaDeviceBufRaw,
@@ -234,6 +266,84 @@ pub fn msm_with_groups<C: CurveAffine>(
     len: usize,
     msm_groups: usize,
 ) -> Result<C, Error> {
+    if false {
+        _msm_with_groups::<C>(device, p_buf, s_buf, len, msm_groups)?;
+        unreachable!();
+    } else {
+        use core::mem::ManuallyDrop;
+        use icicle_bn254::curve::BaseField;
+        use icicle_bn254::curve::CurveCfg;
+        use icicle_bn254::curve::G1Projective;
+        use icicle_core::curve::Curve;
+        use icicle_core::msm;
+        use icicle_core::traits::FieldImpl;
+        use icicle_cuda_runtime::memory::HostOrDeviceSlice;
+        use icicle_cuda_runtime::stream::CudaStream;
+
+        let points = {
+            unsafe {
+                ManuallyDrop::new(HostOrDeviceSlice::Device(
+                    std::slice::from_raw_parts_mut(p_buf.ptr() as _, len),
+                    0,
+                ))
+            }
+        };
+
+        let scalars = {
+            unsafe {
+                ManuallyDrop::new(HostOrDeviceSlice::Device(
+                    std::slice::from_raw_parts_mut(s_buf.ptr() as _, len),
+                    0,
+                ))
+            }
+        };
+        let mut msm_results: HostOrDeviceSlice<'_, G1Projective> =
+            HostOrDeviceSlice::cuda_malloc(1).unwrap();
+        let mut msm_host_result = vec![G1Projective::zero(); 1];
+        let mut msm_host_affine_result = vec![icicle_bn254::curve::G1Affine::zero(); 1];
+        let mut cfg = msm::MSMConfig::default();
+        let stream = CudaStream::create().unwrap();
+        cfg.ctx.stream = &stream;
+        cfg.is_async = true;
+        cfg.are_scalars_montgomery_form = true;
+        cfg.are_points_montgomery_form = true;
+        msm::msm(&scalars, &points, &cfg, &mut msm_results).unwrap();
+        stream.synchronize().unwrap();
+        msm_results.copy_to_host(&mut msm_host_result[..]).unwrap();
+        let res = if msm_host_result[0].z == BaseField::zero() {
+            C::identity()
+        } else {
+            CurveCfg::to_affine(&mut msm_host_result[0], &mut msm_host_affine_result[0]);
+            let mut res = [halo2_proofs::pairing::bn256::G1Affine::identity()];
+            res[0].x = halo2_proofs::pairing::bn256::Fq::from_repr(
+                msm_host_affine_result[0]
+                    .x
+                    .to_bytes_le()
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap();
+            res[0].y = halo2_proofs::pairing::bn256::Fq::from_repr(
+                msm_host_affine_result[0]
+                    .y
+                    .to_bytes_le()
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap();
+            unsafe { core::mem::transmute::<_, &[C]>(&res[..])[0] }
+        };
+        Ok(res)
+    }
+}
+
+pub fn _msm_with_groups<C: CurveAffine>(
+    device: &CudaDevice,
+    p_buf: &CudaDeviceBufRaw,
+    s_buf: &CudaDeviceBufRaw,
+    len: usize,
+    msm_groups: usize,
+) -> Result<C, Error> {
     let threads = 128;
     let windows = 32;
     let windows_bits = 8;
@@ -278,7 +388,7 @@ pub fn ntt_prepare<F: FieldExt>(
     len_log: usize,
 ) -> DeviceResult<(CudaDeviceBufRaw, CudaDeviceBufRaw)> {
     let len = 1 << len_log;
-    let mut omegas = vec![F::one(), omega];
+    let omegas = vec![F::one(), omega];
 
     let max_deg = MAX_DEG.min(len_log);
     let mut pq = vec![F::zero(); 1 << max_deg >> 1];

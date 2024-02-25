@@ -4,8 +4,6 @@ use ark_std::end_timer;
 use ark_std::iterable::Iterable;
 use ark_std::start_timer;
 use cuda_runtime_sys::cudaMemset;
-use cuda_runtime_sys::cudaStreamDestroy;
-use cuda_runtime_sys::cudaStreamSynchronize;
 use cuda_runtime_sys::cudaStream_t;
 use cuda_runtime_sys::CUstream_st;
 use halo2_proofs::arithmetic::CurveAffine;
@@ -113,7 +111,7 @@ pub(crate) fn analyze_expr_tree<F: FieldExt>(
     expr_groups
 }
 
-pub fn export_evaluate_h_gates<C: CurveAffine>(
+pub fn _export_evaluate_h_gates<C: CurveAffine>(
     pk: &ProvingKey<C>,
     fixed: &[&[C::ScalarExt]],
     advice: &[&[C::ScalarExt]],

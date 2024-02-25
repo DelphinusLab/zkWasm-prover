@@ -29,8 +29,7 @@ use rayon::iter::IntoParallelRefMutIterator as _;
 use rayon::iter::ParallelIterator as _;
 use rayon::slice::ParallelSlice as _;
 
-use crate::cuda::bn254::field_op_v2;
-use crate::cuda::bn254::field_sum;
+use crate::cuda::bn254::field_op_v3;
 use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::intt_raw_async;
 use crate::cuda::bn254::msm;
@@ -312,6 +311,8 @@ pub fn create_proof_from_advices<
     let unusable_rows_start = params.n as usize - (meta.blinding_factors() + 1);
     let omega = pk.get_vk().domain.get_omega();
 
+    let domain = &pk.vk.domain;
+
     let timer = start_timer!(|| "create single instances");
     let instance =
         halo2_proofs::plonk::create_single_instances(params, &pk, &[instances], transcript)
@@ -345,13 +346,6 @@ pub fn create_proof_from_advices<
                 }
             });
     }
-
-    let timer = start_timer!(|| format!("copy advice columns to gpu, count {}", advices.len()));
-    let advices_device_buf = advices
-        .iter()
-        .map(|x| device.alloc_device_buffer_from_slice(&x[..]))
-        .collect::<DeviceResult<Vec<_>>>()?;
-    end_timer!(timer);
 
     let timer = start_timer!(|| "copy g_lagrange buffer");
     let g_lagrange_buf = device
@@ -460,8 +454,10 @@ pub fn create_proof_from_advices<
     });
 
     // Advice MSM
-    let timer = start_timer!(|| format!("advices msm {}", advices_device_buf.len()));
-    for s_buf in advices_device_buf {
+    let timer = start_timer!(|| format!("advices msm {}", advices.len()));
+    let s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+    for advice in advices.iter() {
+        device.copy_from_host_to_device(&s_buf, &advice[..])?;
         let commitment = msm(&device, &g_lagrange_buf, &s_buf, size)?;
         transcript.write_point(commitment).unwrap();
     }
@@ -534,20 +530,16 @@ pub fn create_proof_from_advices<
         single_comp_lookups.len()
     ));
     for (i, (permuted_input, permuted_table, _, _, _)) in single_unit_lookups.iter() {
-        let permuted_input_buf = device.alloc_device_buffer_from_slice(&permuted_input[..])?;
-        let permuted_table_buf = device.alloc_device_buffer_from_slice(&permuted_table[..])?;
-        lookup_permuted_commitments[i * 2] =
-            msm(&device, &g_lagrange_buf, &permuted_input_buf, size)?;
-        lookup_permuted_commitments[i * 2 + 1] =
-            msm(&device, &g_lagrange_buf, &permuted_table_buf, size)?;
+        device.copy_from_host_to_device(&s_buf, &permuted_input[..])?;
+        lookup_permuted_commitments[i * 2] = msm(&device, &g_lagrange_buf, &s_buf, size)?;
+        device.copy_from_host_to_device(&s_buf, &permuted_table[..])?;
+        lookup_permuted_commitments[i * 2 + 1] = msm(&device, &g_lagrange_buf, &s_buf, size)?;
     }
     for (i, (permuted_input, permuted_table, _, _, _)) in single_comp_lookups.iter() {
-        let permuted_input_buf = device.alloc_device_buffer_from_slice(&permuted_input[..])?;
-        let permuted_table_buf = device.alloc_device_buffer_from_slice(&permuted_table[..])?;
-        lookup_permuted_commitments[i * 2] =
-            msm(&device, &g_lagrange_buf, &permuted_input_buf, size)?;
-        lookup_permuted_commitments[i * 2 + 1] =
-            msm(&device, &g_lagrange_buf, &permuted_table_buf, size)?;
+        device.copy_from_host_to_device(&s_buf, &permuted_input[..])?;
+        lookup_permuted_commitments[i * 2] = msm(&device, &g_lagrange_buf, &s_buf, size)?;
+        device.copy_from_host_to_device(&s_buf, &permuted_table[..])?;
+        lookup_permuted_commitments[i * 2 + 1] = msm(&device, &g_lagrange_buf, &s_buf, size)?;
     }
     end_timer!(timer);
 
@@ -557,12 +549,10 @@ pub fn create_proof_from_advices<
 
     let timer = start_timer!(|| format!("tuple lookup msm {}", tuple_lookups.len(),));
     for (i, (permuted_input, permuted_table, _, _, _)) in tuple_lookups.iter() {
-        let permuted_input_buf = device.alloc_device_buffer_from_slice(&permuted_input[..])?;
-        let permuted_table_buf = device.alloc_device_buffer_from_slice(&permuted_table[..])?;
-        lookup_permuted_commitments[i * 2] =
-            msm(&device, &g_lagrange_buf, &permuted_input_buf, size)?;
-        lookup_permuted_commitments[i * 2 + 1] =
-            msm(&device, &g_lagrange_buf, &permuted_table_buf, size)?;
+        device.copy_from_host_to_device(&s_buf, &permuted_input[..])?;
+        lookup_permuted_commitments[i * 2] = msm(&device, &g_lagrange_buf, &s_buf, size)?;
+        device.copy_from_host_to_device(&s_buf, &permuted_table[..])?;
+        lookup_permuted_commitments[i * 2 + 1] = msm(&device, &g_lagrange_buf, &s_buf, size)?;
     }
     end_timer!(timer);
 
@@ -878,8 +868,6 @@ pub fn create_proof_from_advices<
     )?;
     end_timer!(timer);
 
-    let domain = &pk.vk.domain;
-
     let timer = start_timer!(|| "vanishing construct");
     // Construct the vanishing argument's h(X) commitments
     let vanishing = vanishing
@@ -890,7 +878,6 @@ pub fn create_proof_from_advices<
     let xn = x.pow_vartime(&[params.n as u64]);
     end_timer!(timer);
 
-    let timer = start_timer!(|| "compute eval");
     let mut inputs = vec![];
 
     for instance in instance.iter() {
@@ -939,6 +926,7 @@ pub fn create_proof_from_advices<
         inputs.push((permuted_table, x));
     }
 
+    let timer = start_timer!(|| format!("compute eval {}", inputs.len()));
     for eval in inputs
         .into_par_iter()
         .map(|(a, b)| halo2_proofs::arithmetic::eval_polynomial_st(a, b))
@@ -1054,6 +1042,7 @@ where
             //println!("queries {}", commitment_at_a_point.queries.len());
             let poly_batch_buf = device.alloc_device_buffer::<C::Scalar>(params.n as usize)?;
             let tmp_buf = device.alloc_device_buffer::<C::Scalar>(params.n as usize)?;
+            let c_buf = device.alloc_device_buffer_from_slice(&[v][..])?;
 
             let mut poly_batch = Vec::new_in(HugePageAllocator);
             poly_batch.resize(params.n as usize, C::Scalar::zero());
@@ -1069,15 +1058,16 @@ where
                 assert_eq!(query.get_point(), z);
                 device.copy_from_host_to_device(&tmp_buf, query.get_commitment())?;
 
-                field_op_v2(
+                field_op_v3(
                     device,
                     &poly_batch_buf,
                     Some(&poly_batch_buf),
-                    Some(v),
+                    Some(&c_buf),
                     Some(&tmp_buf),
                     None,
                     params.n as usize,
                     FieldOp::Sum,
+                    None,
                 )?;
             }
 

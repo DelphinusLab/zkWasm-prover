@@ -9,45 +9,10 @@ use ark_std::{end_timer, start_timer};
 use cuda_runtime_sys::cudaError;
 use halo2_proofs::arithmetic::{best_fft_cpu, BaseExt, Field as _, FieldExt, Group};
 use halo2_proofs::pairing::bn256::{Fr, G1Affine, G1};
+use halo2_proofs::pairing::group::cofactor::CofactorCurveAffine;
 use halo2_proofs::pairing::group::ff::PrimeField as _;
 use halo2_proofs::pairing::group::Curve;
-
-use super::bn254::MAX_DEG;
-
-fn bench_field_sum_template() {
-    let len = 1 << 22;
-    let mut res = vec![];
-
-    let mut v1 = vec![];
-    let mut v2 = vec![];
-    let mut v3 = vec![];
-
-    let mut r = Fr::rand();
-
-    for i in 0..len {
-        v1.push(r);
-        r += Fr::one();
-        v2.push(r);
-        r += Fr::one();
-        v3.push(r);
-        r += Fr::one();
-        res.push(r);
-        r += Fr::one();
-    }
-
-    let device = CudaDevice::get_device(0).unwrap();
-    let res_buf = device.alloc_device_buffer_from_slice(&res[..]).unwrap();
-    let v1_buf = device.alloc_device_buffer_from_slice(&v1[..]).unwrap();
-    let v2_buf = device.alloc_device_buffer_from_slice(&v2[..]).unwrap();
-    let v3_buf = device.alloc_device_buffer_from_slice(&v3[..]).unwrap();
-
-    for _ in 0..3 {
-        let timer = start_timer!(|| format!("field sum {:?}", 3));
-        todo!();
-        device.synchronize().unwrap();
-        end_timer!(timer);
-    }
-}
+use icicle_cuda_runtime::stream::CudaStream;
 
 #[link(name = "zkwasm_prover_kernel", kind = "static")]
 extern "C" {
@@ -383,22 +348,22 @@ fn test_bn254_ec_cuda() {
             end_timer!(timer);
 
             assert_eq!(res, cudaError::cudaSuccess);
-/*
-            device
-                .copy_from_device_to_host(&mut b[..], &add_buf)
-                .unwrap();
-            assert_eq!(b, add_expect);
+            /*
+                       device
+                           .copy_from_device_to_host(&mut b[..], &add_buf)
+                           .unwrap();
+                       assert_eq!(b, add_expect);
 
-            device
-                .copy_from_device_to_host(&mut b[..], &sub_buf)
-                .unwrap();
-            assert_eq!(b, sub_expect);
+                       device
+                           .copy_from_device_to_host(&mut b[..], &sub_buf)
+                           .unwrap();
+                       assert_eq!(b, sub_expect);
 
-            device
-                .copy_from_device_to_host(&mut b[..], &double_buf)
-                .unwrap();
-            assert_eq!(b, double_expect);
- */
+                       device
+                           .copy_from_device_to_host(&mut b[..], &double_buf)
+                           .unwrap();
+                       assert_eq!(b, double_expect);
+            */
         }
     }
 }
@@ -452,8 +417,8 @@ fn test_bn254_msm() {
         unsafe {
             let timer = start_timer!(|| "copy buffer");
             let tmp_buf = device.alloc_device_buffer_from_slice(&tmp[..]).unwrap();
-            let a_buf = device.alloc_device_buffer_from_slice(&p[..]).unwrap();
-            let b_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
+            let p_buf = device.alloc_device_buffer_from_slice(&p[..]).unwrap();
+            let s_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
             end_timer!(timer);
 
             let timer = start_timer!(|| "gpu costs********");
@@ -461,8 +426,8 @@ fn test_bn254_msm() {
                 msm_groups as i32,
                 threads,
                 tmp_buf.ptr(),
-                a_buf.ptr(),
-                b_buf.ptr(),
+                p_buf.ptr(),
+                s_buf.ptr(),
                 len as i32,
             );
             device.synchronize().unwrap();
@@ -491,6 +456,60 @@ fn test_bn254_msm() {
             }
             end_timer!(timer);
             assert_eq!(msm_res.to_affine(), msm_res_expect.to_affine());
+
+            {
+                use icicle_bn254::curve::CurveCfg;
+                use icicle_bn254::curve::G1Projective;
+                use icicle_bn254::curve::ScalarField;
+                use icicle_core::curve::Affine;
+                use icicle_core::curve::Curve;
+                use icicle_core::msm;
+                use icicle_core::traits::FieldImpl;
+                use icicle_cuda_runtime::memory::HostOrDeviceSlice;
+
+                let mut msm_host_result = vec![G1Projective::zero(); 1];
+                let mut msm_host_affine_result = vec![icicle_bn254::curve::G1Affine::zero(); 1];
+
+                let points = HostOrDeviceSlice::Host(
+                    unsafe { std::mem::transmute::<_, &[Affine<_>]>(&p[..len]) }.to_vec(),
+                );
+                let scalars = HostOrDeviceSlice::Host(
+                    unsafe { std::mem::transmute::<_, &[ScalarField]>(&s[..len]) }.to_vec(),
+                );
+                let mut msm_results: HostOrDeviceSlice<'_, G1Projective> =
+                    HostOrDeviceSlice::cuda_malloc(1).unwrap();
+                let mut cfg = msm::MSMConfig::default();
+                let stream = CudaStream::create().unwrap();
+                cfg.ctx.stream = &stream;
+                cfg.is_async = true;
+                cfg.are_scalars_montgomery_form = true;
+                cfg.are_points_montgomery_form = true;
+                msm::msm(&scalars, &points, &cfg, &mut msm_results).unwrap();
+                stream.synchronize().unwrap();
+                msm_results.copy_to_host(&mut msm_host_result[..]).unwrap();
+                let _res = [CurveCfg::to_affine(
+                    &mut msm_host_result[0],
+                    &mut msm_host_affine_result[0],
+                )];
+                let mut res = G1Affine::identity();
+                res.x = halo2_proofs::pairing::bn256::Fq::from_repr(
+                    msm_host_affine_result[0]
+                        .x
+                        .to_bytes_le()
+                        .try_into()
+                        .unwrap(),
+                )
+                .unwrap();
+                res.y = halo2_proofs::pairing::bn256::Fq::from_repr(
+                    msm_host_affine_result[0]
+                        .y
+                        .to_bytes_le()
+                        .try_into()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(res, msm_res_expect.to_affine());
+            }
         }
     }
 }
@@ -500,7 +519,6 @@ fn test_bn254_fft() {
     let device = CudaDevice::get_device(0).unwrap();
     let len_log = 20;
     let len = 1 << len_log;
-    let max_deg = MAX_DEG.min(len_log as usize);
 
     let mut omega = Fr::ROOT_OF_UNITY_INV.invert().unwrap();
     for _ in len_log..Fr::S {
