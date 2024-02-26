@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::mem::ManuallyDrop;
 
 use ark_std::end_timer;
 use ark_std::iterable::Iterable;
@@ -14,15 +15,20 @@ use halo2_proofs::plonk::evaluation_gpu::ProveExpression;
 use halo2_proofs::plonk::evaluation_gpu::ProveExpressionUnit;
 use halo2_proofs::plonk::Any;
 use halo2_proofs::plonk::ProvingKey;
+use halo2_proofs::transcript::EncodedChallenge;
+use halo2_proofs::transcript::TranscriptWrite;
 use std::collections::BTreeMap;
 
 use crate::cuda::bn254::buffer_copy_with_shift;
+use crate::cuda::bn254::extended_intt_after;
 use crate::cuda::bn254::extended_prepare;
 use crate::cuda::bn254::field_mul;
 use crate::cuda::bn254::field_op_v2;
+use crate::cuda::bn254::field_op_v3;
 use crate::cuda::bn254::field_sub;
 use crate::cuda::bn254::field_sum;
 use crate::cuda::bn254::intt_raw;
+use crate::cuda::bn254::msm;
 use crate::cuda::bn254::ntt_prepare;
 use crate::cuda::bn254::ntt_raw;
 use crate::cuda::bn254::permutation_eval_h_l;
@@ -30,6 +36,7 @@ use crate::cuda::bn254::permutation_eval_h_p1;
 use crate::cuda::bn254::permutation_eval_h_p2;
 use crate::cuda::bn254::pick_from_buf;
 use crate::cuda::bn254::FieldOp;
+use crate::cuda::bn254_c;
 use crate::cuda::bn254_c::field_op_batch_mul_sum;
 use crate::cuda::bn254_c::lookup_eval_h;
 use crate::device::cuda::to_result;
@@ -38,6 +45,7 @@ use crate::device::cuda::CudaDevice;
 use crate::device::cuda::CudaDeviceBufRaw;
 use crate::device::Device as _;
 use crate::device::DeviceResult;
+use crate::hugetlb::HugePageAllocator;
 
 struct EvalHContext<F: FieldExt> {
     y: Vec<F>,
@@ -141,7 +149,7 @@ pub fn _export_evaluate_h_gates<C: CurveAffine>(
         .alloc_device_buffer_from_slice::<C::ScalarExt>(&[pk.get_vk().domain.ifft_divisor])
         .unwrap();
 
-    evaluate_h_gates(
+    let (_, h_buf) = evaluate_h_gates_core(
         &device,
         pk,
         fixed,
@@ -156,12 +164,17 @@ pub fn _export_evaluate_h_gates<C: CurveAffine>(
         intt_pq_buf,
         intt_omegas_buf,
         intt_divisor_buf,
-        res,
     )
     .unwrap();
+
+    device.copy_from_device_to_host(res, &h_buf).unwrap();
 }
 
-pub(crate) fn evaluate_h_gates<C: CurveAffine>(
+pub(crate) fn evaluate_h_gates_and_vanishing_construct<
+    C: CurveAffine,
+    E: EncodedChallenge<C>,
+    T: TranscriptWrite<C, E>,
+>(
     device: &CudaDevice,
     pk: &ProvingKey<C>,
     fixed: &[&[C::ScalarExt]],
@@ -182,8 +195,175 @@ pub(crate) fn evaluate_h_gates<C: CurveAffine>(
     intt_pq_buf: CudaDeviceBufRaw,
     intt_omegas_buf: CudaDeviceBufRaw,
     intt_divisor_buf: CudaDeviceBufRaw,
-    res: &mut [C::ScalarExt],
-) -> DeviceResult<()> {
+    g_buf: &CudaDeviceBufRaw,
+    transcript: &mut T,
+    params: &halo2_proofs::poly::commitment::Params<C>,
+    vanish: halo2_proofs::plonk::vanishing::prover::Committed<C>,
+) -> DeviceResult<(
+    C::ScalarExt,
+    C::ScalarExt,
+    Vec<C::ScalarExt, HugePageAllocator>,
+)> {
+    let domain = &pk.vk.domain;
+    let k = &pk.vk.domain.k();
+    let size = 1 << k;
+
+    let (mut ctx, mut h_buf) = evaluate_h_gates_core(
+        &device,
+        pk,
+        fixed,
+        advice,
+        instance,
+        permutation_products,
+        lookup_products,
+        y,
+        beta,
+        gamma,
+        theta,
+        intt_pq_buf,
+        intt_omegas_buf,
+        intt_divisor_buf,
+    )
+    .unwrap();
+
+    // do vanishing construct
+
+    // divide zH
+    {
+        let t_evalutions_buf =
+            device.alloc_device_buffer_from_slice::<C::ScalarExt>(&domain.t_evaluations[..])?;
+
+        let err = unsafe {
+            bn254_c::field_mul_zip(
+                h_buf.ptr(),
+                t_evalutions_buf.ptr(),
+                domain.t_evaluations.len() as i32,
+                domain.extended_len() as i32,
+            )
+        };
+
+        to_result((), err, "failed to run field_mul_zip")?;
+    }
+
+    // intt
+    {
+        let intt_divisor_buf = device
+            .alloc_device_buffer_from_slice::<C::ScalarExt>(&[domain.extended_ifft_divisor])
+            .unwrap();
+
+        let (extended_intt_omegas_buf, extended_intt_pq_buf) = ntt_prepare(
+            &device,
+            domain.extended_omega_inv,
+            pk.vk.domain.extended_k() as usize,
+        )?;
+        let mut tmp = ctx.alloc(&device)?;
+
+        intt_raw(
+            &device,
+            &mut h_buf,
+            &mut tmp,
+            &extended_intt_pq_buf,
+            &extended_intt_omegas_buf,
+            &intt_divisor_buf,
+            pk.vk.domain.extended_k() as usize,
+        )?;
+
+        let coset_powers_buf =
+            device.alloc_device_buffer_from_slice(&[domain.g_coset_inv, domain.g_coset])?;
+
+        extended_intt_after(
+            &device,
+            &h_buf,
+            &coset_powers_buf,
+            3,
+            ctx.size,
+            ctx.extended_size,
+            None,
+        )?;
+
+        let timer = start_timer!(|| format!("vanishing msm {}", domain.quotient_poly_degree));
+        for i in 0..domain.quotient_poly_degree as usize {
+            let s_buf = unsafe {
+                ManuallyDrop::new(CudaDeviceBufRaw {
+                    ptr: h_buf
+                        .ptr()
+                        .offset((i * size * core::mem::size_of::<C::ScalarExt>()) as isize),
+                    device: device.clone(),
+                })
+            };
+            let commitment = msm(&device, &g_buf, &s_buf, size)?;
+            transcript.write_point(commitment).unwrap();
+        }
+        end_timer!(timer);
+    }
+
+    let x: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
+    let xn = x.pow_vartime(&[1u64 << k]);
+
+    let mut h_pieces = Vec::new_in(HugePageAllocator);
+    h_pieces.resize(size, C::Scalar::zero());
+    // pre-compute h_pieces for multi open
+    {
+        let last_ptr = unsafe {
+            ManuallyDrop::new(CudaDeviceBufRaw {
+                ptr: h_buf.ptr().offset(
+                    ((domain.quotient_poly_degree as usize - 1)
+                        * size
+                        * core::mem::size_of::<C::ScalarExt>()) as isize,
+                ),
+                device: device.clone(),
+            })
+        };
+        let xn_buf = device.alloc_device_buffer_from_slice(&[xn][..])?;
+        for i in (0..(domain.quotient_poly_degree - 1) as usize).rev() {
+            let curr_ptr = unsafe {
+                ManuallyDrop::new(CudaDeviceBufRaw {
+                    ptr: h_buf
+                        .ptr()
+                        .offset((i * size * core::mem::size_of::<C::ScalarExt>()) as isize),
+                    device: device.clone(),
+                })
+            };
+            field_op_v3(
+                device,
+                &last_ptr,
+                Some(&last_ptr),
+                Some(&xn_buf),
+                Some(&curr_ptr),
+                None,
+                size,
+                FieldOp::Sum,
+                None,
+            )?;
+        }
+        device.copy_from_device_to_host(&mut h_pieces[..], &last_ptr)?;
+    }
+
+    Ok((x, xn, h_pieces))
+}
+
+fn evaluate_h_gates_core<C: CurveAffine>(
+    device: &CudaDevice,
+    pk: &ProvingKey<C>,
+    fixed: &[&[C::ScalarExt]],
+    advice: &[&[C::ScalarExt]],
+    instance: &[&[C::ScalarExt]],
+    permutation_products: &[&[C::ScalarExt]],
+    lookup_products: &[(
+        &[C::ScalarExt],
+        &[C::ScalarExt],
+        &[C::ScalarExt],
+        &[C::ScalarExt],
+        &[C::ScalarExt],
+    )],
+    y: C::ScalarExt,
+    beta: C::ScalarExt,
+    gamma: C::ScalarExt,
+    theta: C::ScalarExt,
+    intt_pq_buf: CudaDeviceBufRaw,
+    intt_omegas_buf: CudaDeviceBufRaw,
+    intt_divisor_buf: CudaDeviceBufRaw,
+) -> DeviceResult<(EvalHContext<C::ScalarExt>, CudaDeviceBufRaw)> {
     let timer = start_timer!(|| "evaluate_h setup");
     let k = pk.get_vk().domain.k() as usize;
     let size = 1 << pk.get_vk().domain.k();
@@ -463,11 +643,9 @@ pub(crate) fn evaluate_h_gates<C: CurveAffine>(
         ctx.extended_allocator.push(permuted_table_buf);
         ctx.extended_allocator.push(z_buf);
     }
-
-    device.copy_from_device_to_host(res, &h_buf)?;
     end_timer!(timer);
 
-    Ok(())
+    Ok((ctx, h_buf))
 }
 
 fn get_expr_degree<F: FieldExt>(expr: &Vec<halo2_proofs::plonk::circuit::Expression<F>>) -> usize {

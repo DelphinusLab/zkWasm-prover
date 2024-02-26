@@ -42,6 +42,7 @@ extern "C" {
         coset_powers_n: i32,
         size: i32,
         extended_size: i32,
+        to_coset: i32,
         stream: *mut CUstream_st,
     ) -> cudaError;
 
@@ -110,4 +111,6 @@ extern "C" {
     ) -> cudaError;
 
     pub fn expand_omega_buffer(buf: *mut c_void, n: i32) -> cudaError;
+
+    pub fn field_mul_zip(buf: *mut c_void, coeff: *mut c_void, coeff_n: i32, n: i32) -> cudaError;
 }

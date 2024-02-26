@@ -26,6 +26,32 @@ pub(crate) fn extended_prepare(
             coset_powers_n as i32,
             size as i32,
             extended_size as i32,
+            0,
+            stream.unwrap_or(0usize as _),
+        );
+        to_result((), err, "fail to run extended_prepare")?;
+        Ok(())
+    }
+}
+
+pub(crate) fn extended_intt_after(
+    device: &CudaDevice,
+    s: &CudaDeviceBufRaw,
+    coset_powers: &CudaDeviceBufRaw,
+    coset_powers_n: usize,
+    size: usize,
+    extended_size: usize,
+    stream: Option<cudaStream_t>,
+) -> Result<(), Error> {
+    unsafe {
+        device.acitve_ctx()?;
+        let err = bn254_c::extended_prepare(
+            s.ptr(),
+            coset_powers.ptr(),
+            coset_powers_n as i32,
+            size as i32,
+            extended_size as i32,
+            1,
             stream.unwrap_or(0usize as _),
         );
         to_result((), err, "fail to run extended_prepare")?;

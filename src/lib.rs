@@ -9,6 +9,7 @@ use ark_std::end_timer;
 use ark_std::iterable::Iterable;
 use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
+use device::cuda::CudaDeviceBufRaw;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
@@ -39,7 +40,7 @@ use crate::cuda::bn254::FieldOp;
 use crate::device::cuda::CudaDevice;
 use crate::device::Device as _;
 use crate::device::DeviceResult;
-use crate::eval_h::evaluate_h_gates;
+use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
 use crate::hugetlb::HugePageAllocator;
 
 pub mod cuda;
@@ -850,10 +851,10 @@ pub fn create_proof_from_advices<
             .map(|x| &x[..])
             .collect::<Vec<_>>()[..];
 
-        let mut h = Vec::new_in(HugePageAllocator);
-        h.resize(1 << extended_k, C::Scalar::zero());
+        let g_buf = g_lagrange_buf;
+        device.copy_from_host_to_device(&g_buf, &params.g[..])?;
 
-        evaluate_h_gates(
+        let (x, xn, h_pieces) = evaluate_h_gates_and_vanishing_construct(
             &device,
             &pk,
             fixed_ref,
@@ -874,18 +875,11 @@ pub fn create_proof_from_advices<
             intt_pq_buf,
             intt_omegas_buf,
             intt_divisor_buf,
-            &mut h[..],
+            &g_buf,
+            transcript,
+            params,
+            vanishing.clone(),
         )?;
-        end_timer!(timer);
-
-        let timer = start_timer!(|| "vanishing construct");
-        // Construct the vanishing argument's h(X) commitments
-        let vanishing = vanishing
-            .construct_general(params, domain, &mut h[..], transcript)
-            .unwrap();
-
-        let x: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
-        let xn = x.pow_vartime(&[params.n as u64]);
         end_timer!(timer);
 
         let mut inputs = vec![];
@@ -907,7 +901,7 @@ pub fn create_proof_from_advices<
             inputs.push((&pk.fixed_polys[column.index()], domain.rotate_omega(x, at)))
         });
 
-        inputs.push((&vanishing.committed.random_poly, x));
+        inputs.push((&vanishing.random_poly, x));
 
         for poly in pk.permutation.polys.iter() {
             inputs.push((&poly, x));
@@ -947,12 +941,6 @@ pub fn create_proof_from_advices<
         end_timer!(timer);
 
         let timer = start_timer!(|| "multi open");
-        let h_pieces = vanishing
-            .h_pieces
-            .iter()
-            .rev()
-            .fold(domain.empty_coeff(), |acc, eval| acc * xn + eval);
-
         let advices_arr = [advices];
         let permutation_products_arr = [permutation_products];
         let lookups_arr = [lookups];
@@ -1022,11 +1010,11 @@ pub fn create_proof_from_advices<
                     .chain(Some(ProverQueryGeneral {
                         point: x,
                         rotation: Rotation::cur(),
-                        poly: &vanishing.committed.random_poly,
+                        poly: &vanishing.random_poly,
                     })),
             );
 
-        multiopen(&device, params, transcript, instances)?;
+        multiopen(&device, &g_buf, params, transcript, instances)?;
         end_timer!(timer);
 
         Ok(())
@@ -1035,6 +1023,7 @@ pub fn create_proof_from_advices<
 
 fn multiopen<'a, I, C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
     device: &CudaDevice,
+    g_buf: &CudaDeviceBufRaw,
     params: &Params<C>,
     transcript: &mut T,
     queries: I,
@@ -1094,10 +1083,9 @@ where
 
     let timer = start_timer!(|| "msm");
     let s_buf = device.alloc_device_buffer::<C::Scalar>(params.n as usize)?;
-    let p_buf = device.alloc_device_buffer_from_slice(&params.g[..])?;
     for witness_poly in ws {
         device.copy_from_host_to_device(&s_buf, &witness_poly[..])?;
-        let commitment = msm_with_groups(&device, &p_buf, &s_buf, params.n as usize, 1)?;
+        let commitment = msm_with_groups(&device, &g_buf, &s_buf, params.n as usize, 1)?;
         transcript.write_point(commitment).unwrap();
     }
     end_timer!(timer);
