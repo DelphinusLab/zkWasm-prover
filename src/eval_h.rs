@@ -197,8 +197,6 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     intt_divisor_buf: CudaDeviceBufRaw,
     g_buf: &CudaDeviceBufRaw,
     transcript: &mut T,
-    params: &halo2_proofs::poly::commitment::Params<C>,
-    vanish: halo2_proofs::plonk::vanishing::prover::Committed<C>,
 ) -> DeviceResult<(
     C::ScalarExt,
     C::ScalarExt,
@@ -392,7 +390,10 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h gates");
-    assert!(pk.ev.gpu_gates_expr.len() == 1);
+    if pk.ev.gpu_gates_expr.len() != 1 {
+        println!("Multi-GPU detected, please set CUDA_VISIBLE_DEVICES to use one GPU");
+        assert!(false);
+    }
     let exprs = analyze_expr_tree(&pk.ev.gpu_gates_expr[0]);
     let h_buf =
         evaluate_prove_expr_with_async_ntt(device, &exprs, fixed, advice, instance, &mut ctx)?;
