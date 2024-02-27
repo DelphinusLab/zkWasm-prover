@@ -50,7 +50,7 @@ mod eval_h;
 mod hugetlb;
 mod multiopen;
 
-const ADD_RANDOM: bool = false;
+const ADD_RANDOM: bool = true;
 
 pub fn prepare_advice_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
@@ -145,8 +145,9 @@ fn handle_lookup_pair<F: FieldExt>(
 
     permuted_input
         .iter()
-        .zip(permuted_table_state.iter_mut())
-        .zip(permuted_table.iter_mut())
+        .take(unusable_rows_start)
+        .zip(permuted_table_state.iter_mut().take(unusable_rows_start))
+        .zip(permuted_table.iter_mut().take(unusable_rows_start))
         .enumerate()
         .for_each(|(row, ((input_value, table_state), table_value))| {
             // If this is the first occurrence of `input_value` in the input expression
@@ -378,28 +379,18 @@ pub fn create_proof_from_advices<
                         if let Some(v) = expr.is_constant() {
                             target.fill(v);
                         } else if let Some(idx) = expr.is_pure_fixed() {
-                            target.clone_from_slice(
-                                &pk.fixed_values[idx].values[0..unusable_rows_start],
-                            );
+                            target.clone_from_slice(&pk.fixed_values[idx].values[..]);
                         } else if let Some(idx) = expr.is_pure_instance() {
-                            target.clone_from_slice(
-                                &instance[0].instance_values[idx].values[0..unusable_rows_start],
-                            );
+                            target.clone_from_slice(&instance[0].instance_values[idx].values[..]);
                         } else if let Some(idx) = expr.is_pure_advice() {
-                            target.clone_from_slice(&advices[idx][0..unusable_rows_start]);
+                            target.clone_from_slice(&advices[idx][..]);
                         } else {
                             unreachable!()
                         }
                     };
 
-                    f(
-                        &pk.vk.cs.lookups[i].input_expressions[0],
-                        &mut input[0..unusable_rows_start],
-                    );
-                    f(
-                        &pk.vk.cs.lookups[i].table_expressions[0],
-                        &mut table[0..unusable_rows_start],
-                    );
+                    f(&pk.vk.cs.lookups[i].input_expressions[0], &mut input[..]);
+                    f(&pk.vk.cs.lookups[i].table_expressions[0], &mut table[..]);
                     let (permuted_input, permuted_table) =
                         handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
                     (i, (permuted_input, permuted_table, input, table, z))
@@ -424,14 +415,8 @@ pub fn create_proof_from_advices<
                         evaluate_expr(expr, size, 1, fixed_ref, advice_ref, instance_ref, target)
                     };
 
-                    f(
-                        &pk.vk.cs.lookups[i].input_expressions[0],
-                        &mut input[0..unusable_rows_start],
-                    );
-                    f(
-                        &pk.vk.cs.lookups[i].table_expressions[0],
-                        &mut table[0..unusable_rows_start],
-                    );
+                    f(&pk.vk.cs.lookups[i].input_expressions[0], &mut input[..]);
+                    f(&pk.vk.cs.lookups[i].table_expressions[0], &mut table[..]);
                     let (permuted_input, permuted_table) =
                         handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
                     (i, (permuted_input, permuted_table, input, table, z))
@@ -493,14 +478,8 @@ pub fn create_proof_from_advices<
                         )
                     };
 
-                    f(
-                        &pk.vk.cs.lookups[i].input_expressions[..],
-                        &mut input[0..unusable_rows_start],
-                    );
-                    f(
-                        &pk.vk.cs.lookups[i].table_expressions[..],
-                        &mut table[0..unusable_rows_start],
-                    );
+                    f(&pk.vk.cs.lookups[i].input_expressions[..], &mut input[..]);
+                    f(&pk.vk.cs.lookups[i].table_expressions[..], &mut table[..]);
                     let (permuted_input, permuted_table) =
                         handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
                     (i, (permuted_input, permuted_table, input, table, z))
@@ -692,14 +671,13 @@ pub fn create_proof_from_advices<
                     tmp = tmp * z[i];
                 }
 
-                tmp = z[unusable_rows_start];
-
                 if ADD_RANDOM {
-                    let blinding_factors = pk.vk.cs.blinding_factors();
-                    for v in z[size - blinding_factors..].iter_mut() {
+                    for v in z[unusable_rows_start + 1..].iter_mut() {
                         *v = C::Scalar::random(&mut OsRng);
                     }
                 }
+
+                tmp = z[unusable_rows_start];
             }
             p_z
         });
@@ -834,7 +812,7 @@ pub fn create_proof_from_advices<
             .map(|x| &x[..])
             .collect::<Vec<_>>()[..];
 
-        let (x, xn, h_pieces) = evaluate_h_gates_and_vanishing_construct(
+        let (x, _xn, h_pieces) = evaluate_h_gates_and_vanishing_construct(
             &device,
             &pk,
             fixed_ref,
