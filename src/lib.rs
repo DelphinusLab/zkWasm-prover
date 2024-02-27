@@ -31,7 +31,6 @@ use rayon::slice::ParallelSlice as _;
 use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::intt_raw_async;
 use crate::cuda::bn254::msm;
-use crate::cuda::bn254::msm_with_groups;
 use crate::cuda::bn254::ntt_prepare;
 use crate::device::cuda::CudaDevice;
 use crate::device::cuda::CudaDeviceBufRaw;
@@ -1014,7 +1013,14 @@ pub fn create_proof_from_advices<
                     })),
             );
 
-        multiopen(&device, &g_buf, queries, size, transcript)?;
+        multiopen(
+            &device,
+            &g_buf,
+            queries,
+            size,
+            [&s_buf, &s_buf_ext],
+            transcript,
+        )?;
         end_timer!(timer);
 
         Ok(())

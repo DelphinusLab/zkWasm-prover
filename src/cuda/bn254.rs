@@ -275,11 +275,10 @@ pub fn batch_msm<C: CurveAffine>(
             }
         };
         let stream = CudaStream::create().unwrap();
-        unsafe {
-            scalars
-                .copy_from_host_async(core::mem::transmute::<_, _>(value), &stream)
-                .unwrap();
-        }
+        let value = unsafe { core::mem::transmute::<_, _>(value) };
+        //Use async would cause failure on multi-open;
+        //scalars.copy_from_host_async(value, &stream).unwrap();
+        scalars.copy_from_host(value).unwrap();
         let mut cfg = msm::MSMConfig::default();
         cfg.ctx.stream = &stream;
         cfg.is_async = true;
@@ -287,26 +286,26 @@ pub fn batch_msm<C: CurveAffine>(
         cfg.are_points_montgomery_form = true;
         msm::msm(&scalars, &points, &cfg, &mut msm_results[idx & 1]).unwrap();
 
-        if let Some(stream) = last_stream {
+        if let Some(last_stream) = last_stream {
             let last_idx = 1 - (idx & 1);
             let mut msm_host_result = [G1Projective::zero()];
-            stream.synchronize().unwrap();
             msm_results[last_idx]
-                .copy_to_host(&mut msm_host_result[..])
+                .copy_to_host_async(&mut msm_host_result[..], &stream)
                 .unwrap();
+            last_stream.synchronize().unwrap();
             let res = to_affine(msm_host_result[0]);
             res_vec.push(res);
         }
         last_stream = Some(stream);
     }
 
-    if let Some(stream) = last_stream {
+    if let Some(last_stream) = last_stream {
         let last_idx = 1 - (msm_counts & 1);
         let mut msm_host_result = [G1Projective::zero()];
-        stream.synchronize().unwrap();
         msm_results[last_idx]
-            .copy_to_host(&mut msm_host_result[..])
+            .copy_to_host_async(&mut msm_host_result[..], &last_stream)
             .unwrap();
+        last_stream.synchronize().unwrap();
         let res = to_affine(msm_host_result[0]);
         res_vec.push(res);
     }

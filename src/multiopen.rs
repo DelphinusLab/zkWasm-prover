@@ -60,6 +60,7 @@ pub(crate) fn multiopen<'a, I, C: CurveAffine, E: EncodedChallenge<C>, T: Transc
     g_buf: &CudaDeviceBufRaw,
     queries: I,
     size: usize,
+    s_buf: [&CudaDeviceBufRaw; 2],
     transcript: &mut T,
 ) -> DeviceResult<()>
 where
@@ -81,11 +82,8 @@ where
 
             let z = commitment_at_a_point.point;
 
-            device.copy_from_host_to_device(
-                &poly_batch_buf,
-                commitment_at_a_point.queries[0].poly,
-            )?;
-
+            device
+                .copy_from_host_to_device(&poly_batch_buf, commitment_at_a_point.queries[0].poly)?;
             for query in commitment_at_a_point.queries.iter().skip(1) {
                 assert_eq!(query.point, z);
                 device.copy_from_host_to_device(&tmp_buf, query.poly)?;
@@ -109,18 +107,34 @@ where
                 commitment_at_a_point.queries[0].point,
             );
             poly_batch[0] -= eval_batch;
-            let witness_poly = halo2_proofs::arithmetic::kate_division(&poly_batch, z);
-            Ok(witness_poly)
+
+            let mut tmp = *poly_batch.last().unwrap();
+            *poly_batch.last_mut().unwrap() = C::ScalarExt::zero();
+            for i in (1..poly_batch.len() - 1).rev() {
+                let p = poly_batch[i] + tmp * z;
+                poly_batch[i] = tmp;
+                tmp = p;
+            }
+            poly_batch[0] = tmp;
+
+            Ok(poly_batch)
         })
         .collect::<DeviceResult<Vec<_>>>()?;
 
     let timer = start_timer!(|| "msm");
+
     let s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-    for witness_poly in ws {
-        device.copy_from_host_to_device(&s_buf, &witness_poly[..])?;
-        let commitment = msm_with_groups(&device, &g_buf, &s_buf, size, 1)?;
+    let s_buf_ext = device.alloc_device_buffer::<C::Scalar>(size)?;
+    let commitments = crate::cuda::bn254::batch_msm::<C>(
+        &g_buf,
+        [&s_buf, &s_buf_ext],
+        ws.iter().map(|x| &x[..]).collect(),
+        size,
+    )?;
+    for commitment in commitments {
         transcript.write_point(commitment).unwrap();
     }
+
     end_timer!(timer);
 
     Ok(())
