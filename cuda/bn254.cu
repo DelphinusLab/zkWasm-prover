@@ -4,6 +4,16 @@
 
 #include "bn254.cuh"
 
+__global__ void _poly_eval(
+    Bn254FrField *p,
+    Bn254FrField *out,
+    const Bn254FrField *x,
+    int deg)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    out[i] = p[i * 2] + p[i * 2 + 1] * x[deg];
+}
+
 __global__ void _msm_mont_unmont(
     Bn254G1Affine *p,
     Bn254FrField *s,
@@ -795,6 +805,48 @@ extern "C"
         int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
         _field_mul_zip<<<blocks, threads>>>(buf, coeff, coeff_n, n);
+        return cudaGetLastError();
+    }
+
+    cudaError_t poly_eval(
+        Bn254FrField *p,
+        Bn254FrField *res,
+        Bn254FrField *tmp,
+        const Bn254FrField *x,
+        int n)
+    {
+        Bn254FrField *in = p;
+        Bn254FrField *out = res;
+        int deg = 0;
+        while (n > 1)
+        {
+            int threads = n / 2 >= 64 ? 64 : 1;
+            int blocks = n / threads / 2;
+            _poly_eval<<<blocks, threads>>>(in, out, x, deg);
+            n >>= 1;
+
+            if (n > 1)
+            {
+                if (deg == 0)
+                {
+                    in = res;
+                    out = tmp;
+                }
+                else
+                {
+                    Bn254FrField *t = in;
+                    in = out;
+                    out = t;
+                }
+            }
+            deg++;
+        }
+
+        if (out != res)
+        {
+            cudaMemcpy(res, out, sizeof(Bn254FrField), cudaMemcpyDeviceToDevice);
+        }
+
         return cudaGetLastError();
     }
 }

@@ -58,14 +58,30 @@ pub fn prepare_advice_buffer<C: CurveAffine>(
     let rows = 1 << pk.get_vk().domain.k();
     let columns = pk.get_vk().cs.num_advice_columns;
     let zero = C::Scalar::zero();
-    (0..columns)
+    let advices = (0..columns)
         .into_par_iter()
         .map(|_| {
             let mut buf = Vec::new_in(HugePageAllocator);
             buf.resize(rows, zero);
             buf
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let device = CudaDevice::get_device(0).unwrap();
+    for x in advices.iter() {
+        device.pin_memory(&x[..]).unwrap();
+    }
+
+    if false {
+        for x in pk.fixed_values.iter() {
+            device.pin_memory(&x[..]).unwrap();
+        }
+        for x in pk.permutation.polys.iter() {
+            device.pin_memory(&x[..]).unwrap();
+        }
+    }
+
+    advices
 }
 
 #[derive(Debug)]
@@ -310,16 +326,6 @@ pub fn create_proof_from_advices<
 
         let device = CudaDevice::get_device(0).unwrap();
 
-        let timer = start_timer!(|| "pin advice memory to gpu");
-        unsafe { Arc::get_mut_unchecked(&mut advices) }
-            .iter_mut()
-            .map(|x| -> Result<(), Error> {
-                device.pin_memory(&mut x[..])?;
-                Ok(())
-            })
-            .collect::<Result<_, _>>()?;
-        end_timer!(timer);
-
         // add random value
         if ADD_RANDOM {
             let named = &pk.vk.cs.named_advices;
@@ -363,11 +369,6 @@ pub fn create_proof_from_advices<
                     permuted_table.resize(size, C::Scalar::zero());
                     let mut z = Vec::new_in(HugePageAllocator);
                     z.resize(size, C::Scalar::zero());
-
-                    let device = CudaDevice::get_device(0).unwrap();
-                    device.pin_memory(&mut permuted_input[..]).unwrap();
-                    device.pin_memory(&mut permuted_table[..]).unwrap();
-                    device.pin_memory(&mut z[..]).unwrap();
 
                     (permuted_input, permuted_table, z)
                 })
@@ -1034,21 +1035,56 @@ pub fn create_proof_from_advices<
         let x_next = domain.rotate_omega(x, Rotation::next());
 
         for (permuted_input, permuted_table, _, _, z) in lookups.iter() {
-            inputs.push((z, x));
-            inputs.push((z, x_next));
-            inputs.push((permuted_input, x));
-            inputs.push((permuted_input, x_inv));
-            inputs.push((permuted_table, x));
+            inputs.push((&z, x));
+            inputs.push((&z, x_next));
+            inputs.push((&permuted_input, x));
+            inputs.push((&permuted_input, x_inv));
+            inputs.push((&permuted_table, x));
         }
 
         let timer = start_timer!(|| format!("compute eval {}", inputs.len()));
-        for eval in inputs
-            .into_par_iter()
-            .map(|(a, b)| halo2_proofs::arithmetic::eval_polynomial_st(a, b))
-            .collect::<Vec<_>>()
-        {
+        let mut collection = std::collections::BTreeMap::new();
+        let mut deg_buffer = std::collections::BTreeMap::new();
+        for (idx, (p, x)) in inputs.iter().enumerate() {
+            collection
+                .entry(p.as_ptr() as usize)
+                .and_modify(|arr: &mut (_, Vec<_>)| arr.1.push((idx, x)))
+                .or_insert((p, vec![(idx, x)]));
+        }
+        let mut evals = vec![C::Scalar::zero(); inputs.len()];
+
+        let poly_buf = &s_buf;
+        let eval_buf = &s_buf_ext;
+        for (_, (p, arr)) in collection {
+            device.copy_from_host_to_device(poly_buf, p)?;
+            for (idx, x) in arr {
+                if !deg_buffer.contains_key(&x) {
+                    let mut buf = vec![*x];
+                    for _ in 1..k {
+                        buf.push(*buf.last().unwrap() * buf.last().unwrap());
+                    }
+                    deg_buffer.insert(x, device.alloc_device_buffer_from_slice(&buf)?);
+                }
+
+                unsafe {
+                    use crate::device::cuda::CudaBuffer;
+                    let err = crate::cuda::bn254_c::poly_eval(
+                        poly_buf.ptr(),
+                        eval_buf.ptr(),
+                        tmp_buf.ptr(),
+                        deg_buffer.get(&x).unwrap().ptr(),
+                        size as i32,
+                    );
+                    crate::device::cuda::to_result((), err, "fail to run poly_eval")?;
+                }
+                device.copy_from_device_to_host(&mut evals[idx..idx + 1], eval_buf)?;
+            }
+        }
+
+        for (_i, eval) in evals.into_iter().enumerate() {
             transcript.write_scalar(eval).unwrap();
         }
+
         end_timer!(timer);
 
         let timer = start_timer!(|| "multi open");

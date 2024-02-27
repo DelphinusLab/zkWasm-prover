@@ -261,11 +261,11 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
         }
     }
 
-    fn pin_memory<T>(&self, dst: &mut [T]) -> DeviceResult<()> {
+    fn pin_memory<T>(&self, dst: &[T]) -> DeviceResult<()> {
         self.acitve_ctx()?;
         unsafe {
             let res = cuda_runtime_sys::cudaHostRegister(
-                dst.as_mut_ptr() as *mut _,
+                dst.as_ptr() as *mut _,
                 dst.len() * size_of::<T>(),
                 cuda_runtime_sys::cudaHostAllocMapped,
             );
@@ -273,10 +273,10 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
         }
     }
 
-    fn unpin_memory<T>(&self, dst: &mut [T]) -> DeviceResult<()> {
+    fn unpin_memory<T>(&self, dst: &[T]) -> DeviceResult<()> {
         self.acitve_ctx()?;
         unsafe {
-            let res = cuda_runtime_sys::cudaHostUnregister(dst.as_mut_ptr() as *mut _);
+            let res = cuda_runtime_sys::cudaHostUnregister(dst.as_ptr() as *mut _);
             to_result((), res, "fail to synchronize")
         }
     }
