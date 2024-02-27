@@ -80,7 +80,7 @@ where
                     use rayon::iter::IndexedParallelIterator;
                     use rayon::prelude::ParallelSlice;
                     use rayon::prelude::ParallelSliceMut;
-                    let threads = (commitment_at_a_point.queries.len() + 15) / 16;
+                    let threads = (commitment_at_a_point.queries.len() + 7) / 8;
                     let chunk_size = (size + threads - 1) / threads;
                     poly_batch
                         .par_chunks_mut(chunk_size)
