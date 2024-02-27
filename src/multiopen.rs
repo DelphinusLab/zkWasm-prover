@@ -84,8 +84,6 @@ where
         }
     }
 
-    println!("collection has len {}", collection.len());
-
     let mut vs = vec![C::ScalarExt::one(), v];
     let tmp_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
     let v_buf = device.alloc_device_buffer::<C::ScalarExt>(1)?;
