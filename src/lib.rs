@@ -26,6 +26,7 @@ use rayon::iter::IntoParallelIterator as _;
 use rayon::iter::IntoParallelRefIterator as _;
 use rayon::iter::IntoParallelRefMutIterator as _;
 use rayon::iter::ParallelIterator as _;
+use rayon::prelude::ParallelSliceMut as _;
 use rayon::slice::ParallelSlice as _;
 
 use crate::cuda::bn254::intt_raw;
@@ -450,7 +451,7 @@ pub fn create_proof_from_advices<
         let theta: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
         let timer = start_timer!(|| "wait single lookups");
-        let (mut single_unit_lookups, mut single_comp_lookups, tuple_lookups) =
+        let (mut single_unit_lookups, mut single_comp_lookups, mut tuple_lookups) =
             lookup_handler.join().unwrap();
         end_timer!(timer);
 
@@ -462,7 +463,7 @@ pub fn create_proof_from_advices<
             let pk = sub_pk;
             let advices = sub_advices;
             let instance = sub_instance;
-            //let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
+            let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
 
             let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
             let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
@@ -472,30 +473,34 @@ pub fn create_proof_from_advices<
                 .map(|x| &x[..])
                 .collect::<Vec<_>>()[..];
 
+            let mut buffers = vec![];
+            for (i, (input, table, z)) in tuple_lookups.iter_mut() {
+                buffers.push((&pk.vk.cs.lookups[*i].input_expressions[..], &mut input[..]));
+                buffers.push((&pk.vk.cs.lookups[*i].table_expressions[..], &mut table[..]));
+            }
+
+            buffers.into_par_iter().for_each(|(expr, buffer)| {
+                evaluate_exprs(
+                    expr,
+                    size,
+                    1,
+                    fixed_ref,
+                    advice_ref,
+                    instance_ref,
+                    theta,
+                    buffer,
+                )
+            });
+
             let tuple_lookups = tuple_lookups
                 .into_par_iter()
                 .map(|(i, (mut input, mut table, z))| {
-                    let f = |expr: &[Expression<_>], target: &mut [_]| {
-                        evaluate_exprs(
-                            expr,
-                            size,
-                            1,
-                            fixed_ref,
-                            advice_ref,
-                            instance_ref,
-                            theta,
-                            target,
-                        )
-                    };
-
-                    f(&pk.vk.cs.lookups[i].input_expressions[..], &mut input[..]);
-                    f(&pk.vk.cs.lookups[i].table_expressions[..], &mut table[..]);
                     let (permuted_input, permuted_table) =
                         handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
                     (i, (permuted_input, permuted_table, input, table, z))
                 })
                 .collect::<Vec<_>>();
-            //end_timer!(timer);
+            end_timer!(timer);
 
             tuple_lookups
         });
@@ -674,11 +679,16 @@ pub fn create_proof_from_advices<
                             Any::Fixed => fixed_ref,
                             Any::Instance => instance_ref,
                         };
-                        for i in 0..size as usize {
-                            modified_values[i] *= &(beta * permuted_column_values[i]
-                                + &gamma
-                                + values[column.index()][i]);
-                        }
+                        let chunk_size = size >> 1;
+                        modified_values
+                            .par_chunks_mut(chunk_size)
+                            .zip(permuted_column_values.par_chunks(chunk_size))
+                            .zip(values[column.index()].par_chunks(chunk_size))
+                            .for_each(|((res, p), v)| {
+                                for i in 0..chunk_size {
+                                    res[i] *= &(beta * p[i] + &gamma + v[i]);
+                                }
+                            });
                     }
 
                     // Invert to obtain the denominator for the permutation product polynomial
@@ -692,11 +702,21 @@ pub fn create_proof_from_advices<
                             Any::Fixed => fixed_ref,
                             Any::Instance => instance_ref,
                         };
-                        for i in 0..size as usize {
-                            modified_values[i] *=
-                                &(delta_omega * &beta + &gamma + values[column.index()][i]);
-                            delta_omega *= &omega;
-                        }
+
+                        let chunk_size = size >> 1;
+                        modified_values
+                            .par_chunks_mut(chunk_size)
+                            .zip(values[column.index()].par_chunks(chunk_size))
+                            .enumerate()
+                            .for_each(|(idx, (res, v))| {
+                                let mut delta_omega =
+                                    delta_omega * omega.pow_vartime([(idx * chunk_size) as u64]);
+                                for i in 0..chunk_size {
+                                    res[i] *= &(delta_omega * &beta + &gamma + v[i]);
+                                    delta_omega *= &omega;
+                                }
+                            });
+
                         delta_omega *= &C::Scalar::DELTA;
                     }
 
