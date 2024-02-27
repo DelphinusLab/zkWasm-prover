@@ -14,7 +14,6 @@ use rayon::iter::ParallelIterator as _;
 use std::collections::BTreeMap;
 
 use crate::cuda::bn254::field_op_v3;
-use crate::cuda::bn254::msm_with_groups;
 use crate::cuda::bn254::FieldOp;
 use crate::device::cuda::CudaDevice;
 use crate::device::cuda::CudaDeviceBufRaw;
@@ -123,11 +122,9 @@ where
 
     let timer = start_timer!(|| "msm");
 
-    let s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-    let s_buf_ext = device.alloc_device_buffer::<C::Scalar>(size)?;
     let commitments = crate::cuda::bn254::batch_msm::<C>(
         &g_buf,
-        [&s_buf, &s_buf_ext],
+        s_buf,
         ws.iter().map(|x| &x[..]).collect(),
         size,
     )?;
