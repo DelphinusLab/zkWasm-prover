@@ -543,12 +543,25 @@ pub fn create_proof_from_advices<
         let mut tuple_lookups = tuple_lookup_handler.join().unwrap();
         end_timer!(timer);
 
-        let timer = start_timer!(|| format!("tuple lookup msm {}", tuple_lookups.len(),));
-        for (i, (permuted_input, permuted_table, _, _, _)) in tuple_lookups.iter() {
-            device.copy_from_host_to_device(&s_buf, &permuted_input[..])?;
-            lookup_permuted_commitments[i * 2] = msm(&device, &g_lagrange_buf, &s_buf, size)?;
-            device.copy_from_host_to_device(&s_buf, &permuted_table[..])?;
-            lookup_permuted_commitments[i * 2 + 1] = msm(&device, &g_lagrange_buf, &s_buf, size)?;
+        let timer = start_timer!(|| format!("tuple lookup msm {}", tuple_lookups.len()));
+        {
+            let mut lookup_scalars = vec![];
+            for (_, (permuted_input, permuted_table, _, _, _)) in tuple_lookups.iter() {
+                lookup_scalars.push(&permuted_input[..]);
+                lookup_scalars.push(&permuted_table[..])
+            }
+            let commitments = crate::cuda::bn254::batch_msm::<C>(
+                &g_lagrange_buf,
+                [&s_buf, &s_buf_ext],
+                lookup_scalars,
+                size,
+            )?;
+            let mut tidx = 0;
+            for (i, _) in tuple_lookups.iter() {
+                lookup_permuted_commitments[i * 2] = commitments[tidx];
+                lookup_permuted_commitments[i * 2 + 1] = commitments[tidx + 1];
+                tidx += 2;
+            }
         }
         end_timer!(timer);
 
@@ -758,20 +771,23 @@ pub fn create_proof_from_advices<
         end_timer!(timer);
 
         let timer = start_timer!(|| "permutation z msm and intt");
-        for (_i, z) in permutation_products.iter_mut().enumerate() {
-            device.copy_from_host_to_device(&s_buf, &z[..])?;
-            let commitment = msm_with_groups(&device, &g_lagrange_buf, &s_buf, size, 1)?;
+        let permutation_commitments = crate::cuda::bn254::batch_msm_and_intt::<C>(
+            &device,
+            &intt_pq_buf,
+            &intt_omegas_buf,
+            &intt_divisor_buf,
+            &g_lagrange_buf,
+            [&mut s_buf, &mut s_buf_ext],
+            [&mut tmp_buf, &mut tmp_buf_ext],
+            permutation_products
+                .iter_mut()
+                .map(|x| &mut x[..])
+                .collect(),
+            k,
+        )?;
+
+        for commitment in permutation_commitments {
             transcript.write_point(commitment).unwrap();
-            intt_raw(
-                &device,
-                &mut s_buf,
-                &mut tmp_buf,
-                &intt_pq_buf,
-                &intt_omegas_buf,
-                &intt_divisor_buf,
-                k,
-            )?;
-            device.copy_from_device_to_host(&mut z[..], &s_buf)?;
         }
 
         for (_i, commitment) in lookup_z_commitments.into_iter().enumerate() {
