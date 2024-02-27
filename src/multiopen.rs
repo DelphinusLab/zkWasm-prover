@@ -9,7 +9,10 @@ use halo2_proofs::plonk::ProvingKey;
 use halo2_proofs::poly::Rotation;
 use halo2_proofs::transcript::EncodedChallenge;
 use halo2_proofs::transcript::TranscriptWrite;
+use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelIterator as _;
+use rayon::iter::IntoParallelRefIterator;
+use rayon::iter::IntoParallelRefMutIterator;
 use rayon::iter::ParallelIterator as _;
 use std::collections::BTreeMap;
 
@@ -68,61 +71,62 @@ where
     let v: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
     let commitment_data = construct_intermediate_sets(queries);
 
-    let ws = commitment_data
-        .into_par_iter()
-        .map(|commitment_at_a_point| -> DeviceResult<_> {
+    let mut collection = BTreeMap::new();
+    let mut bufs = vec![];
+    for (rot_idx, data) in commitment_data.iter().enumerate() {
+        bufs.push(device.alloc_device_buffer::<C::ScalarExt>(size)?);
+        let len = data.queries.len();
+        for (inner_idx, q) in data.queries.iter().enumerate() {
+            collection
+                .entry(q.poly.as_ptr() as usize)
+                .and_modify(|x: &mut (_, Vec<_>)| x.1.push((rot_idx, len - 1 - inner_idx)))
+                .or_insert((q.poly, vec![(rot_idx, len - 1 - inner_idx)]));
+        }
+    }
+
+    println!("collection has len {}", collection.len());
+
+    let mut vs = vec![C::ScalarExt::one(), v];
+    let tmp_buf = device.alloc_device_buffer::<C::ScalarExt>(size)?;
+    let v_buf = device.alloc_device_buffer::<C::ScalarExt>(1)?;
+    for (_, (poly, assoc)) in collection {
+        device.copy_from_host_to_device_async(&tmp_buf, poly, 0usize as _)?;
+        for (rot_idx, inner_idx) in assoc {
+            for _ in vs.len()..=inner_idx {
+                vs.push(*vs.last().unwrap() * v);
+            }
+            device.copy_from_host_to_device_async(&v_buf, &[vs[inner_idx]][..], 0usize as _)?;
+            field_op_v3(
+                device,
+                &bufs[rot_idx],
+                Some(&bufs[rot_idx]),
+                None,
+                Some(&tmp_buf),
+                Some(&v_buf),
+                size,
+                FieldOp::Sum,
+                None,
+            )?;
+        }
+    }
+
+    let mut ws = commitment_data
+        .par_iter()
+        .map(|_| {
             let mut poly_batch = Vec::new_in(HugePageAllocator);
             poly_batch.resize(size, C::Scalar::zero());
+            poly_batch
+        })
+        .collect::<Vec<_>>();
 
+    for i in 0..ws.len() {
+        device.copy_from_device_to_host(&mut ws[i][..], &bufs[i])?;
+    }
+
+    ws.par_iter_mut().zip(commitment_data.par_iter()).for_each(
+        |(poly_batch, commitment_at_a_point)| {
             let z = commitment_at_a_point.point;
-            if commitment_at_a_point.queries.len() < 50 {
-                for query in commitment_at_a_point.queries.iter() {
-                    use rayon::iter::IndexedParallelIterator;
-                    use rayon::prelude::ParallelSlice;
-                    use rayon::prelude::ParallelSliceMut;
-                    let threads = (commitment_at_a_point.queries.len() + 7) / 8;
-                    let chunk_size = (size + threads - 1) / threads;
-                    poly_batch
-                        .par_chunks_mut(chunk_size)
-                        .zip(query.poly.par_chunks(chunk_size))
-                        .for_each(|(b, p)| {
-                            for (b, p) in b.iter_mut().zip(p.iter()) {
-                                *b = *b * &v + p;
-                            }
-                        });
-                }
-            } else {
-                let poly_batch_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-                let tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-                let c_buf = device.alloc_device_buffer_from_slice(&[v][..])?;
-
-                device.copy_from_host_to_device(
-                    &poly_batch_buf,
-                    commitment_at_a_point.queries[0].poly,
-                )?;
-                for query in commitment_at_a_point.queries.iter().skip(1) {
-                    assert_eq!(query.point, z);
-                    device.copy_from_host_to_device(&tmp_buf, query.poly)?;
-
-                    field_op_v3(
-                        device,
-                        &poly_batch_buf,
-                        Some(&poly_batch_buf),
-                        Some(&c_buf),
-                        Some(&tmp_buf),
-                        None,
-                        size,
-                        FieldOp::Sum,
-                        None,
-                    )?;
-                }
-                device.copy_from_device_to_host(&mut poly_batch[..], &poly_batch_buf)?;
-            }
-
-            let eval_batch = halo2_proofs::arithmetic::eval_polynomial_st(
-                &poly_batch,
-                commitment_at_a_point.queries[0].point,
-            );
+            let eval_batch = halo2_proofs::arithmetic::eval_polynomial_st(&poly_batch, z);
             poly_batch[0] -= eval_batch;
 
             let mut tmp = *poly_batch.last().unwrap();
@@ -133,10 +137,8 @@ where
                 tmp = p;
             }
             poly_batch[0] = tmp;
-
-            Ok(poly_batch)
-        })
-        .collect::<DeviceResult<Vec<_>>>()?;
+        },
+    );
 
     let timer = start_timer!(|| "msm");
 
