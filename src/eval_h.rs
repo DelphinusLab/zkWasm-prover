@@ -26,7 +26,6 @@ use crate::cuda::bn254::field_mul;
 use crate::cuda::bn254::field_op_v2;
 use crate::cuda::bn254::field_op_v3;
 use crate::cuda::bn254::field_sub;
-use crate::cuda::bn254::field_sum;
 use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::msm;
 use crate::cuda::bn254::ntt_prepare;
@@ -512,13 +511,12 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                     &device,
                     &h_buf,
                     Some(&h_buf),
-                    None,
-                    None,
                     Some(y),
+                    Some(&l),
+                    None,
                     ctx.extended_size,
-                    FieldOp::Mul,
+                    FieldOp::Sum,
                 )?;
-                field_sum::<C::ScalarExt>(&device, &h_buf, &l, ctx.extended_size)?;
 
                 ctx.extended_allocator.push(l);
                 ctx.extended_allocator.push(r);

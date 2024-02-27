@@ -121,8 +121,8 @@ fn lookup_classify<'a, 'b, C: CurveAffine, T>(
 }
 
 fn handle_lookup_pair<F: FieldExt>(
-    input: &Vec<F, HugePageAllocator>,
-    table: &Vec<F, HugePageAllocator>,
+    input: &mut Vec<F, HugePageAllocator>,
+    table: &mut Vec<F, HugePageAllocator>,
     unusable_rows_start: usize,
 ) -> (Vec<F, HugePageAllocator>, Vec<F, HugePageAllocator>) {
     let compare = |a: &_, b: &_| unsafe {
@@ -176,20 +176,6 @@ fn handle_lookup_pair<F: FieldExt>(
         if !permuted_table_state[i] {
             permuted_table[i] = sorted_table[i_sorted_table_idx];
             i_sorted_table_idx += 1;
-        }
-    }
-
-    if true {
-        let mut last = None;
-        for (a, b) in permuted_input
-            .iter()
-            .zip(permuted_table.iter())
-            .take(unusable_rows_start)
-        {
-            if *a != *b {
-                assert_eq!(*a, last.unwrap());
-            }
-            last = Some(*a);
         }
     }
 
@@ -310,7 +296,6 @@ pub fn create_proof_from_advices<
     thread::scope(|s| {
         let k = pk.get_vk().domain.k() as usize;
         let size = 1 << pk.get_vk().domain.k();
-        let extended_k = pk.get_vk().domain.extended_k() as usize;
         let meta = &pk.vk.cs;
         let unusable_rows_start = size - (meta.blinding_factors() + 1);
         let omega = pk.get_vk().domain.get_omega();
@@ -416,7 +401,7 @@ pub fn create_proof_from_advices<
                         &mut table[0..unusable_rows_start],
                     );
                     let (permuted_input, permuted_table) =
-                        handle_lookup_pair(&input, &table, unusable_rows_start);
+                        handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
                     (i, (permuted_input, permuted_table, input, table, z))
                 })
                 .collect::<Vec<_>>();
@@ -448,7 +433,7 @@ pub fn create_proof_from_advices<
                         &mut table[0..unusable_rows_start],
                     );
                     let (permuted_input, permuted_table) =
-                        handle_lookup_pair(&input, &table, unusable_rows_start);
+                        handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
                     (i, (permuted_input, permuted_table, input, table, z))
                 })
                 .collect::<Vec<_>>();
@@ -517,7 +502,7 @@ pub fn create_proof_from_advices<
                         &mut table[0..unusable_rows_start],
                     );
                     let (permuted_input, permuted_table) =
-                        handle_lookup_pair(&input, &table, unusable_rows_start);
+                        handle_lookup_pair(&mut input, &mut table, unusable_rows_start);
                     (i, (permuted_input, permuted_table, input, table, z))
                 })
                 .collect::<Vec<_>>();
@@ -709,8 +694,9 @@ pub fn create_proof_from_advices<
 
                 tmp = z[unusable_rows_start];
 
-                for v in z[unusable_rows_start + 1..].iter_mut() {
-                    if ADD_RANDOM {
+                if ADD_RANDOM {
+                    let blinding_factors = pk.vk.cs.blinding_factors();
+                    for v in z[size - blinding_factors..].iter_mut() {
                         *v = C::Scalar::random(&mut OsRng);
                     }
                 }

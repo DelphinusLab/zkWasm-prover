@@ -82,55 +82,12 @@ pub(crate) fn field_op_v2<F: FieldExt>(
     Ok(())
 }
 
-const CHECK_COUNT: usize = 0;
-
-pub(crate) fn field_sum<F: FieldExt>(
-    device: &CudaDevice,
-    res: &CudaDeviceBufRaw,
-    rhs: &CudaDeviceBufRaw,
-    size: usize,
-) -> Result<(), Error> {
-    let mut expect = vec![];
-
-    for _ in 0..CHECK_COUNT {
-        let i = rand::random::<usize>() % size;
-        let v = pick_from_buf::<F>(device, res, 0, i as isize, size).unwrap()
-            + pick_from_buf::<F>(device, rhs, 0, i as isize, size).unwrap();
-        expect.push((i, v));
-    }
-
-    field_op_v2::<F>(
-        device,
-        res,
-        Some(res),
-        None,
-        Some(rhs),
-        None,
-        size,
-        FieldOp::Sum,
-    )?;
-    for (i, expect) in expect {
-        let res = pick_from_buf::<F>(device, res, 0, i as isize, size).unwrap();
-        assert_eq!(expect, res);
-    }
-    Ok(())
-}
-
 pub(crate) fn field_sub<F: FieldExt>(
     device: &CudaDevice,
     res: &CudaDeviceBufRaw,
     rhs: &CudaDeviceBufRaw,
     size: usize,
 ) -> Result<(), Error> {
-    let mut expect = vec![];
-
-    for _ in 0..CHECK_COUNT {
-        let i = rand::random::<usize>() % size;
-        let v = pick_from_buf::<F>(device, res, 0, i as isize, size).unwrap()
-            + pick_from_buf::<F>(device, rhs, 0, i as isize, size).unwrap();
-        expect.push((i, v));
-    }
-
     field_op_v2::<F>(
         device,
         res,
@@ -141,10 +98,6 @@ pub(crate) fn field_sub<F: FieldExt>(
         size,
         FieldOp::Sub,
     )?;
-    for (i, expect) in expect {
-        let res = pick_from_buf::<F>(device, res, 0, i as isize, size).unwrap();
-        assert_eq!(expect, res);
-    }
     Ok(())
 }
 
@@ -154,14 +107,6 @@ pub(crate) fn field_mul<F: FieldExt>(
     rhs: &CudaDeviceBufRaw,
     size: usize,
 ) -> Result<(), Error> {
-    let mut expect = vec![];
-
-    for _ in 0..CHECK_COUNT {
-        let i = rand::random::<usize>() % size;
-        let v = pick_from_buf::<F>(device, res, 0, i as isize, size).unwrap()
-            * pick_from_buf::<F>(device, rhs, 0, i as isize, size).unwrap();
-        expect.push((i, v));
-    }
     field_op_v2::<F>(
         device,
         res,
@@ -172,10 +117,6 @@ pub(crate) fn field_mul<F: FieldExt>(
         size,
         FieldOp::Mul,
     )?;
-    for (i, expect) in expect {
-        let res = pick_from_buf::<F>(device, res, 0, i as isize, size).unwrap();
-        assert_eq!(expect, res);
-    }
     Ok(())
 }
 
