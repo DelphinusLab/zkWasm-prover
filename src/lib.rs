@@ -477,7 +477,7 @@ pub fn create_proof_from_advices<
                 .collect::<Vec<_>>()[..];
 
             let mut buffers = vec![];
-            for (i, (input, table, z)) in tuple_lookups.iter_mut() {
+            for (i, (input, table, _)) in tuple_lookups.iter_mut() {
                 buffers.push((&pk.vk.cs.lookups[*i].input_expressions[..], &mut input[..]));
                 buffers.push((&pk.vk.cs.lookups[*i].table_expressions[..], &mut table[..]));
             }
