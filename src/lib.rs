@@ -433,10 +433,13 @@ pub fn create_proof_from_advices<
             (single_unit_lookups, single_comp_lookups, tuple_lookups)
         });
 
-        // Advice MSM
-        let timer = start_timer!(|| format!("advices msm {}", advices.len()));
         let mut s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         let mut s_buf_ext = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let mut tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let mut tmp_buf_ext = device.alloc_device_buffer::<C::Scalar>(size)?;
+
+        // Advice MSM
+        let timer = start_timer!(|| format!("advices msm {}", advices.len()));
         let commitments = crate::cuda::bn254::batch_msm::<C>(
             &g_lagrange_buf,
             [&s_buf, &s_buf_ext],
@@ -583,37 +586,132 @@ pub fn create_proof_from_advices<
         lookups.sort_by(|l, r| usize::cmp(&l.0, &r.0));
 
         let timer = start_timer!(|| "generate lookup z");
+        let quart = lookups.len() >> 2;
+
         lookups.par_iter_mut().for_each(
-            |(_, (permuted_input, permuted_table, input, table, z))| {
-                for ((z, permuted_input_value), permuted_table_value) in z
-                    .iter_mut()
-                    .zip(permuted_input.iter())
-                    .zip(permuted_table.iter())
-                {
-                    *z = (beta + permuted_input_value) * &(gamma + permuted_table_value);
-                }
+            |(i, (permuted_input, permuted_table, input, table, z))| {
+                // use GPU to reduce cpu costs
+                if *i >= quart {
+                    for ((z, permuted_input_value), permuted_table_value) in z
+                        .iter_mut()
+                        .zip(permuted_input.iter())
+                        .zip(permuted_table.iter())
+                    {
+                        *z = (beta + permuted_input_value) * &(gamma + permuted_table_value);
+                    }
 
-                z.batch_invert();
+                    z.batch_invert();
 
-                for ((z, input_value), table_value) in
-                    z.iter_mut().zip(input.iter()).zip(table.iter())
-                {
-                    *z *= (beta + input_value) * &(gamma + table_value);
-                }
+                    for ((z, input_value), table_value) in
+                        z.iter_mut().zip(input.iter()).zip(table.iter())
+                    {
+                        *z *= (beta + input_value) * &(gamma + table_value);
+                    }
 
-                let mut tmp = C::Scalar::one();
-                for i in 0..=unusable_rows_start {
-                    std::mem::swap(&mut tmp, &mut z[i]);
-                    tmp = tmp * z[i];
-                }
+                    let mut tmp = C::Scalar::one();
+                    for i in 0..=unusable_rows_start {
+                        std::mem::swap(&mut tmp, &mut z[i]);
+                        tmp = tmp * z[i];
+                    }
 
-                if ADD_RANDOM {
-                    for cell in &mut z[unusable_rows_start + 1..] {
-                        *cell = C::Scalar::random(&mut OsRng);
+                    if ADD_RANDOM {
+                        for cell in &mut z[unusable_rows_start + 1..] {
+                            *cell = C::Scalar::random(&mut OsRng);
+                        }
+                    } else {
+                        for cell in &mut z[unusable_rows_start + 1..] {
+                            *cell = C::Scalar::zero();
+                        }
                     }
                 } else {
-                    for cell in &mut z[unusable_rows_start + 1..] {
-                        *cell = C::Scalar::zero();
+                    use crate::cuda::bn254::field_mul;
+                    use crate::cuda::bn254::field_op_v2;
+                    use crate::cuda::bn254::FieldOp;
+
+                    let z_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
+                    let input_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
+                    let table_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
+
+                    device
+                        .copy_from_host_to_device(&input_buf, &permuted_input[..])
+                        .unwrap();
+                    device
+                        .copy_from_host_to_device(&table_buf, &permuted_table[..])
+                        .unwrap();
+                    field_op_v2(
+                        &device,
+                        &z_buf,
+                        Some(&input_buf),
+                        None,
+                        None,
+                        Some(beta),
+                        size,
+                        FieldOp::Sum,
+                    )
+                    .unwrap();
+                    field_op_v2(
+                        &device,
+                        &table_buf,
+                        Some(&table_buf),
+                        None,
+                        None,
+                        Some(gamma),
+                        size,
+                        FieldOp::Sum,
+                    )
+                    .unwrap();
+                    field_mul::<C::Scalar>(&device, &z_buf, &table_buf, size).unwrap();
+                    device.copy_from_device_to_host(&mut z[..], &z_buf).unwrap();
+
+                    z.batch_invert();
+
+                    device.copy_from_host_to_device(&z_buf, &z[..]).unwrap();
+                    device
+                        .copy_from_host_to_device(&input_buf, &input[..])
+                        .unwrap();
+                    device
+                        .copy_from_host_to_device(&table_buf, &table[..])
+                        .unwrap();
+                    field_op_v2(
+                        &device,
+                        &input_buf,
+                        Some(&input_buf),
+                        None,
+                        None,
+                        Some(beta),
+                        size,
+                        FieldOp::Sum,
+                    )
+                    .unwrap();
+                    field_op_v2(
+                        &device,
+                        &table_buf,
+                        Some(&table_buf),
+                        None,
+                        None,
+                        Some(gamma),
+                        size,
+                        FieldOp::Sum,
+                    )
+                    .unwrap();
+                    field_mul::<C::Scalar>(&device, &z_buf, &input_buf, size).unwrap();
+                    field_mul::<C::Scalar>(&device, &z_buf, &table_buf, size).unwrap();
+                    device.copy_from_device_to_host(&mut z[..], &z_buf).unwrap();
+
+                    let mut tmp = C::Scalar::one();
+                    for i in 0..=unusable_rows_start {
+                        std::mem::swap(&mut tmp, &mut z[i]);
+                        tmp = tmp * z[i];
+                    }
+
+                    if ADD_RANDOM {
+                        for cell in &mut z[unusable_rows_start + 1..] {
+                            *cell = C::Scalar::random(&mut OsRng);
+                        }
+                    } else {
+                        for cell in &mut z[unusable_rows_start + 1..] {
+                            *cell = C::Scalar::zero();
+                        }
                     }
                 }
             },
@@ -744,8 +842,6 @@ pub fn create_proof_from_advices<
         end_timer!(timer);
 
         let timer = start_timer!(|| "lookup intt and z msm");
-        let mut tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-        let mut tmp_buf_ext = device.alloc_device_buffer::<C::Scalar>(size)?;
         let lookup_z_commitments = crate::cuda::bn254::batch_msm_and_intt::<C>(
             &device,
             &intt_pq_buf,
