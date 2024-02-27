@@ -363,6 +363,12 @@ pub fn create_proof_from_advices<
                     permuted_table.resize(size, C::Scalar::zero());
                     let mut z = Vec::new_in(HugePageAllocator);
                     z.resize(size, C::Scalar::zero());
+
+                    let device = CudaDevice::get_device(0).unwrap();
+                    device.pin_memory(&mut permuted_input[..]).unwrap();
+                    device.pin_memory(&mut permuted_table[..]).unwrap();
+                    device.pin_memory(&mut z[..]).unwrap();
+
                     (permuted_input, permuted_table, z)
                 })
                 .collect::<Vec<_>>();
@@ -429,10 +435,15 @@ pub fn create_proof_from_advices<
 
         // Advice MSM
         let timer = start_timer!(|| format!("advices msm {}", advices.len()));
-        let s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-        for advice in advices.iter() {
-            device.copy_from_host_to_device(&s_buf, &advice[..])?;
-            let commitment = msm(&device, &g_lagrange_buf, &s_buf, size)?;
+        let mut s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let mut s_buf_ext = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let commitments = crate::cuda::bn254::batch_msm::<C>(
+            &g_lagrange_buf,
+            [&s_buf, &s_buf_ext],
+            advices.iter().map(|x| &x[..]).collect(),
+            size,
+        )?;
+        for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }
         end_timer!(timer);
@@ -497,17 +508,34 @@ pub fn create_proof_from_advices<
             single_unit_lookups.len(),
             single_comp_lookups.len()
         ));
-        for (i, (permuted_input, permuted_table, _, _, _)) in single_unit_lookups.iter() {
-            device.copy_from_host_to_device(&s_buf, &permuted_input[..])?;
-            lookup_permuted_commitments[i * 2] = msm(&device, &g_lagrange_buf, &s_buf, size)?;
-            device.copy_from_host_to_device(&s_buf, &permuted_table[..])?;
-            lookup_permuted_commitments[i * 2 + 1] = msm(&device, &g_lagrange_buf, &s_buf, size)?;
-        }
-        for (i, (permuted_input, permuted_table, _, _, _)) in single_comp_lookups.iter() {
-            device.copy_from_host_to_device(&s_buf, &permuted_input[..])?;
-            lookup_permuted_commitments[i * 2] = msm(&device, &g_lagrange_buf, &s_buf, size)?;
-            device.copy_from_host_to_device(&s_buf, &permuted_table[..])?;
-            lookup_permuted_commitments[i * 2 + 1] = msm(&device, &g_lagrange_buf, &s_buf, size)?;
+
+        {
+            let mut lookup_scalars = vec![];
+            for (_, (permuted_input, permuted_table, _, _, _)) in single_unit_lookups.iter() {
+                lookup_scalars.push(&permuted_input[..]);
+                lookup_scalars.push(&permuted_table[..])
+            }
+            for (_, (permuted_input, permuted_table, _, _, _)) in single_comp_lookups.iter() {
+                lookup_scalars.push(&permuted_input[..]);
+                lookup_scalars.push(&permuted_table[..])
+            }
+            let commitments = crate::cuda::bn254::batch_msm::<C>(
+                &g_lagrange_buf,
+                [&s_buf, &s_buf_ext],
+                lookup_scalars,
+                size,
+            )?;
+            let mut tidx = 0;
+            for (i, _) in single_unit_lookups.iter() {
+                lookup_permuted_commitments[i * 2] = commitments[tidx];
+                lookup_permuted_commitments[i * 2 + 1] = commitments[tidx + 1];
+                tidx += 2;
+            }
+            for (i, _) in single_comp_lookups.iter() {
+                lookup_permuted_commitments[i * 2] = commitments[tidx];
+                lookup_permuted_commitments[i * 2 + 1] = commitments[tidx + 1];
+                tidx += 2;
+            }
         }
         end_timer!(timer);
 
@@ -683,49 +711,45 @@ pub fn create_proof_from_advices<
         });
         end_timer!(timer);
 
-        let mut lookup_z_commitments = vec![];
-
         let timer = start_timer!(|| "lookup intt and z msm");
         let mut tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-        let mut ntt_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-        for (permuted_input, permuted_table, _, _, z) in lookups.iter_mut() {
-            device.copy_from_host_to_device(&ntt_buf, &z[..])?;
-            let commitment = msm_with_groups(&device, &g_lagrange_buf, &ntt_buf, size, 1)?;
-            lookup_z_commitments.push(commitment);
-            intt_raw(
-                &device,
-                &mut ntt_buf,
-                &mut tmp_buf,
-                &intt_pq_buf,
-                &intt_omegas_buf,
-                &intt_divisor_buf,
-                k,
-            )?;
-            device.copy_from_device_to_host(&mut z[..], &ntt_buf)?;
+        let mut tmp_buf_ext = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let lookup_z_commitments = crate::cuda::bn254::batch_msm_and_intt::<C>(
+            &device,
+            &intt_pq_buf,
+            &intt_omegas_buf,
+            &intt_divisor_buf,
+            &g_lagrange_buf,
+            [&mut s_buf, &mut s_buf_ext],
+            [&mut tmp_buf, &mut tmp_buf_ext],
+            lookups.iter_mut().map(|x| &mut x.4[..]).collect(),
+            k,
+        )?;
 
-            device.copy_from_host_to_device(&ntt_buf, &permuted_input[..])?;
+        for (permuted_input, permuted_table, _, _, _) in lookups.iter_mut() {
+            device.copy_from_host_to_device(&s_buf, &permuted_input[..])?;
             intt_raw(
                 &device,
-                &mut ntt_buf,
+                &mut s_buf,
                 &mut tmp_buf,
                 &intt_pq_buf,
                 &intt_omegas_buf,
                 &intt_divisor_buf,
                 k,
             )?;
-            device.copy_from_device_to_host(&mut permuted_input[..], &ntt_buf)?;
+            device.copy_from_device_to_host(&mut permuted_input[..], &s_buf)?;
 
-            device.copy_from_host_to_device(&ntt_buf, &permuted_table[..])?;
+            device.copy_from_host_to_device(&s_buf, &permuted_table[..])?;
             intt_raw(
                 &device,
-                &mut ntt_buf,
+                &mut s_buf,
                 &mut tmp_buf,
                 &intt_pq_buf,
                 &intt_omegas_buf,
                 &intt_divisor_buf,
                 k,
             )?;
-            device.copy_from_device_to_host(&mut permuted_table[..], &ntt_buf)?;
+            device.copy_from_device_to_host(&mut permuted_table[..], &s_buf)?;
         }
         end_timer!(timer);
 
@@ -735,19 +759,19 @@ pub fn create_proof_from_advices<
 
         let timer = start_timer!(|| "permutation z msm and intt");
         for (_i, z) in permutation_products.iter_mut().enumerate() {
-            device.copy_from_host_to_device(&ntt_buf, &z[..])?;
-            let commitment = msm_with_groups(&device, &g_lagrange_buf, &ntt_buf, size, 1)?;
+            device.copy_from_host_to_device(&s_buf, &z[..])?;
+            let commitment = msm_with_groups(&device, &g_lagrange_buf, &s_buf, size, 1)?;
             transcript.write_point(commitment).unwrap();
             intt_raw(
                 &device,
-                &mut ntt_buf,
+                &mut s_buf,
                 &mut tmp_buf,
                 &intt_pq_buf,
                 &intt_omegas_buf,
                 &intt_divisor_buf,
                 k,
             )?;
-            device.copy_from_device_to_host(&mut z[..], &ntt_buf)?;
+            device.copy_from_device_to_host(&mut z[..], &s_buf)?;
         }
 
         for (_i, commitment) in lookup_z_commitments.into_iter().enumerate() {
@@ -774,10 +798,10 @@ pub fn create_proof_from_advices<
                     let mut stream = std::mem::zeroed();
                     let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
                     crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
-                    device.copy_from_host_to_device_async(&ntt_buf, &advices[..], stream)?;
+                    device.copy_from_host_to_device_async(&s_buf, &advices[..], stream)?;
                     intt_raw_async(
                         &device,
-                        &mut ntt_buf,
+                        &mut s_buf,
                         &mut tmp_buf,
                         &intt_pq_buf,
                         &intt_omegas_buf,
@@ -785,12 +809,12 @@ pub fn create_proof_from_advices<
                         k,
                         Some(stream),
                     )?;
-                    device.copy_from_device_to_host_async(&mut advices[..], &ntt_buf, stream)?;
+                    device.copy_from_device_to_host_async(&mut advices[..], &s_buf, stream)?;
                     if let Some(last_stream) = last_stream {
                         cuda_runtime_sys::cudaStreamSynchronize(last_stream);
                         cuda_runtime_sys::cudaStreamDestroy(last_stream);
                     }
-                    std::mem::swap(&mut ntt_buf, last_ntt_buf.as_mut().unwrap());
+                    std::mem::swap(&mut s_buf, last_ntt_buf.as_mut().unwrap());
                     std::mem::swap(&mut tmp_buf, last_tmp_buf.as_mut().unwrap());
                     last_stream = Some(stream);
                 }
