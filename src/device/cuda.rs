@@ -4,7 +4,7 @@ use std::ffi::c_void;
 use std::mem::size_of;
 
 use ark_std::{end_timer, start_timer};
-use cuda_runtime_sys::{cudaError, cudaFree, cudaStream_t};
+use cuda_runtime_sys::{cudaError, cudaStream_t};
 
 use super::{Device, DeviceBuf, Error};
 use crate::device::DeviceResult;
@@ -76,12 +76,20 @@ pub struct CudaDeviceBufRaw {
     pub(crate) device: CudaDevice,
 }
 
+
+extern "C" {
+    pub fn cudaFreeAsync(
+        ptr: *mut c_void,
+        stream: cudaStream_t,
+    ) -> cudaError;
+}
+
 impl Drop for CudaDeviceBufRaw {
     fn drop(&mut self) {
         self.device().acitve_ctx().unwrap();
         unsafe {
             //let timer = start_timer!(|| "cuda free");
-            let res = cudaFree(self.ptr());
+            let res = cudaFreeAsync(self.ptr(), 0usize as _);
             to_result((), res, "fail to free device memory").unwrap();
             //end_timer!(timer);
         }

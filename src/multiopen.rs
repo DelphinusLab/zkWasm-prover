@@ -10,7 +10,6 @@ use halo2_proofs::poly::Rotation;
 use halo2_proofs::transcript::EncodedChallenge;
 use halo2_proofs::transcript::TranscriptWrite;
 use rayon::iter::IndexedParallelIterator;
-use rayon::iter::IntoParallelIterator as _;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::IntoParallelRefMutIterator;
 use rayon::iter::ParallelIterator as _;
