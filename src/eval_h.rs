@@ -89,7 +89,7 @@ pub(crate) fn analyze_expr_tree<F: FieldExt>(
         })
         .collect::<Vec<_, _>>();
 
-    let limit = 20;
+    let limit = 4;
     let mut v = HashSet::new();
 
     let mut expr_group = vec![];
