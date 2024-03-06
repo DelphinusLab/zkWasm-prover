@@ -1,12 +1,12 @@
 #![feature(allocator_api)]
 #![feature(get_mut_unchecked)]
 
+use std::collections::BTreeMap;
 use std::iter;
 use std::sync::Arc;
 use std::thread;
 
 use ark_std::end_timer;
-use ark_std::iterable::Iterable;
 use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
 use halo2_proofs::arithmetic::CurveAffine;
@@ -38,8 +38,8 @@ use crate::device::cuda::CudaDeviceBufRaw;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
 use crate::hugetlb::HugePageAllocator;
+use crate::multiopen::gwc;
 use crate::multiopen::lookup_open;
-use crate::multiopen::multiopen;
 use crate::multiopen::permutation_product_open;
 use crate::multiopen::ProverQuery;
 
@@ -1043,8 +1043,8 @@ pub fn create_proof_from_advices<
         }
 
         let timer = start_timer!(|| format!("compute eval {}", inputs.len()));
-        let mut collection = std::collections::BTreeMap::new();
-        let mut deg_buffer = std::collections::BTreeMap::new();
+        let mut collection = BTreeMap::new();
+        let mut deg_buffer = BTreeMap::new();
         for (idx, (p, x)) in inputs.iter().enumerate() {
             collection
                 .entry(p.as_ptr() as usize)
@@ -1052,6 +1052,8 @@ pub fn create_proof_from_advices<
                 .or_insert((p, vec![(idx, x)]));
         }
         let mut evals = vec![C::Scalar::zero(); inputs.len()];
+
+        let mut eval_map = BTreeMap::new();
 
         let poly_buf = &s_buf;
         let eval_buf = &s_buf_ext;
@@ -1078,6 +1080,8 @@ pub fn create_proof_from_advices<
                     crate::device::cuda::to_result((), err, "fail to run poly_eval")?;
                 }
                 device.copy_from_device_to_host(&mut evals[idx..idx + 1], eval_buf)?;
+
+                eval_map.insert((p.as_ptr() as usize, *x), evals[idx]);
             }
         }
 
@@ -1165,12 +1169,13 @@ pub fn create_proof_from_advices<
                     })),
             );
 
-        multiopen(
+        gwc::multiopen(
             &device,
             &g_buf,
             queries,
             size,
             [&s_buf, &s_buf_ext],
+            eval_map,
             transcript,
         )?;
         end_timer!(timer);
@@ -1195,13 +1200,13 @@ fn vanish_commit<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E
 
     let random = vec![0; 32usize]
         .iter()
-        .map(|_| C::ScalarExt::random(&mut OsRng))
+        .map(|_| C::Scalar::random(&mut OsRng))
         .collect::<Vec<_>>();
 
     random_poly.par_iter_mut().for_each(|coeff| {
         let mut rng = thread_rng();
-        *coeff = (C::ScalarExt::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
-            * (C::ScalarExt::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
+        *coeff = (C::Scalar::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
+            * (C::Scalar::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
     });
 
     // Commit

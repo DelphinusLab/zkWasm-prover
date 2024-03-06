@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::mem::ManuallyDrop;
 
@@ -10,6 +11,7 @@ use cuda_runtime_sys::CUstream_st;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
+use halo2_proofs::plonk::circuit::Expression;
 use halo2_proofs::plonk::evaluation_gpu::Bop;
 use halo2_proofs::plonk::evaluation_gpu::ProveExpression;
 use halo2_proofs::plonk::evaluation_gpu::ProveExpressionUnit;
@@ -17,7 +19,6 @@ use halo2_proofs::plonk::Any;
 use halo2_proofs::plonk::ProvingKey;
 use halo2_proofs::transcript::EncodedChallenge;
 use halo2_proofs::transcript::TranscriptWrite;
-use std::collections::BTreeMap;
 
 use crate::cuda::bn254::buffer_copy_with_shift;
 use crate::cuda::bn254::extended_intt_after;
@@ -120,22 +121,22 @@ pub(crate) fn analyze_expr_tree<F: FieldExt>(
 
 pub fn _export_evaluate_h_gates<C: CurveAffine>(
     pk: &ProvingKey<C>,
-    fixed: &[&[C::ScalarExt]],
-    advice: &[&[C::ScalarExt]],
-    instance: &[&[C::ScalarExt]],
-    permutation_products: &[&[C::ScalarExt]],
+    fixed: &[&[C::Scalar]],
+    advice: &[&[C::Scalar]],
+    instance: &[&[C::Scalar]],
+    permutation_products: &[&[C::Scalar]],
     lookup_products: &[(
-        &[C::ScalarExt],
-        &[C::ScalarExt],
-        &[C::ScalarExt],
-        &[C::ScalarExt],
-        &[C::ScalarExt],
+        &[C::Scalar],
+        &[C::Scalar],
+        &[C::Scalar],
+        &[C::Scalar],
+        &[C::Scalar],
     )],
-    y: C::ScalarExt,
-    beta: C::ScalarExt,
-    gamma: C::ScalarExt,
-    theta: C::ScalarExt,
-    res: &mut [C::ScalarExt],
+    y: C::Scalar,
+    beta: C::Scalar,
+    gamma: C::Scalar,
+    theta: C::Scalar,
+    res: &mut [C::Scalar],
 ) {
     let device = CudaDevice::get_device(0).unwrap();
     let (intt_omegas_buf, intt_pq_buf) = ntt_prepare(
@@ -145,7 +146,7 @@ pub fn _export_evaluate_h_gates<C: CurveAffine>(
     )
     .unwrap();
     let intt_divisor_buf = device
-        .alloc_device_buffer_from_slice::<C::ScalarExt>(&[pk.get_vk().domain.ifft_divisor])
+        .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])
         .unwrap();
 
     let (_, h_buf) = evaluate_h_gates_core(
@@ -176,31 +177,27 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
 >(
     device: &CudaDevice,
     pk: &ProvingKey<C>,
-    fixed: &[&[C::ScalarExt]],
-    advice: &[&[C::ScalarExt]],
-    instance: &[&[C::ScalarExt]],
-    permutation_products: &[&[C::ScalarExt]],
+    fixed: &[&[C::Scalar]],
+    advice: &[&[C::Scalar]],
+    instance: &[&[C::Scalar]],
+    permutation_products: &[&[C::Scalar]],
     lookup_products: &[(
-        &[C::ScalarExt],
-        &[C::ScalarExt],
-        &[C::ScalarExt],
-        &[C::ScalarExt],
-        &[C::ScalarExt],
+        &[C::Scalar],
+        &[C::Scalar],
+        &[C::Scalar],
+        &[C::Scalar],
+        &[C::Scalar],
     )],
-    y: C::ScalarExt,
-    beta: C::ScalarExt,
-    gamma: C::ScalarExt,
-    theta: C::ScalarExt,
+    y: C::Scalar,
+    beta: C::Scalar,
+    gamma: C::Scalar,
+    theta: C::Scalar,
     intt_pq_buf: CudaDeviceBufRaw,
     intt_omegas_buf: CudaDeviceBufRaw,
     intt_divisor_buf: CudaDeviceBufRaw,
     g_buf: &CudaDeviceBufRaw,
     transcript: &mut T,
-) -> DeviceResult<(
-    C::ScalarExt,
-    C::ScalarExt,
-    Vec<C::ScalarExt, HugePageAllocator>,
-)> {
+) -> DeviceResult<(C::Scalar, C::Scalar, Vec<C::Scalar, HugePageAllocator>)> {
     let domain = &pk.vk.domain;
     let k = &pk.vk.domain.k();
     let size = 1 << k;
@@ -228,7 +225,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     // divide zH
     {
         let t_evalutions_buf =
-            device.alloc_device_buffer_from_slice::<C::ScalarExt>(&domain.t_evaluations[..])?;
+            device.alloc_device_buffer_from_slice::<C::Scalar>(&domain.t_evaluations[..])?;
 
         let err = unsafe {
             bn254_c::field_mul_zip(
@@ -245,7 +242,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     // intt
     {
         let intt_divisor_buf = device
-            .alloc_device_buffer_from_slice::<C::ScalarExt>(&[domain.extended_ifft_divisor])
+            .alloc_device_buffer_from_slice::<C::Scalar>(&[domain.extended_ifft_divisor])
             .unwrap();
 
         let (extended_intt_omegas_buf, extended_intt_pq_buf) = ntt_prepare(
@@ -284,7 +281,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
                 ManuallyDrop::new(CudaDeviceBufRaw {
                     ptr: h_buf
                         .ptr()
-                        .offset((i * size * core::mem::size_of::<C::ScalarExt>()) as isize),
+                        .offset((i * size * core::mem::size_of::<C::Scalar>()) as isize),
                     device: device.clone(),
                 })
             };
@@ -306,7 +303,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
                 ptr: h_buf.ptr().offset(
                     ((domain.quotient_poly_degree as usize - 1)
                         * size
-                        * core::mem::size_of::<C::ScalarExt>()) as isize,
+                        * core::mem::size_of::<C::Scalar>()) as isize,
                 ),
                 device: device.clone(),
             })
@@ -317,7 +314,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
                 ManuallyDrop::new(CudaDeviceBufRaw {
                     ptr: h_buf
                         .ptr()
-                        .offset((i * size * core::mem::size_of::<C::ScalarExt>()) as isize),
+                        .offset((i * size * core::mem::size_of::<C::Scalar>()) as isize),
                     device: device.clone(),
                 })
             };
@@ -342,25 +339,25 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
 fn evaluate_h_gates_core<C: CurveAffine>(
     device: &CudaDevice,
     pk: &ProvingKey<C>,
-    fixed: &[&[C::ScalarExt]],
-    advice: &[&[C::ScalarExt]],
-    instance: &[&[C::ScalarExt]],
-    permutation_products: &[&[C::ScalarExt]],
+    fixed: &[&[C::Scalar]],
+    advice: &[&[C::Scalar]],
+    instance: &[&[C::Scalar]],
+    permutation_products: &[&[C::Scalar]],
     lookup_products: &[(
-        &[C::ScalarExt],
-        &[C::ScalarExt],
-        &[C::ScalarExt],
-        &[C::ScalarExt],
-        &[C::ScalarExt],
+        &[C::Scalar],
+        &[C::Scalar],
+        &[C::Scalar],
+        &[C::Scalar],
+        &[C::Scalar],
     )],
-    y: C::ScalarExt,
-    beta: C::ScalarExt,
-    gamma: C::ScalarExt,
-    theta: C::ScalarExt,
+    y: C::Scalar,
+    beta: C::Scalar,
+    gamma: C::Scalar,
+    theta: C::Scalar,
     intt_pq_buf: CudaDeviceBufRaw,
     intt_omegas_buf: CudaDeviceBufRaw,
     intt_divisor_buf: CudaDeviceBufRaw,
-) -> DeviceResult<(EvalHContext<C::ScalarExt>, CudaDeviceBufRaw)> {
+) -> DeviceResult<(EvalHContext<C::Scalar>, CudaDeviceBufRaw)> {
     let timer = start_timer!(|| "evaluate_h setup");
     let k = pk.get_vk().domain.k() as usize;
     let size = 1 << pk.get_vk().domain.k();
@@ -376,7 +373,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     ])?;
 
     let mut ctx = EvalHContext {
-        y: vec![C::ScalarExt::one(), y],
+        y: vec![C::Scalar::one(), y],
         extended_allocator: vec![],
         k,
         extended_k,
@@ -452,7 +449,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                 .zip(pk.permutation.polys.chunks(chunk_len))
             {
                 let l = ctx.alloc(device)?;
-                buffer_copy_with_shift::<C::ScalarExt>(
+                buffer_copy_with_shift::<C::Scalar>(
                     &device,
                     &l,
                     &extended_p_buf,
@@ -488,16 +485,16 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                         ctx.size,
                     )?;
                     do_extended_ntt(&device, &mut ctx, &mut l_res)?;
-                    field_mul::<C::ScalarExt>(&device, &l, &l_res, ctx.extended_size)?;
+                    field_mul::<C::Scalar>(&device, &l, &l_res, ctx.extended_size)?;
 
                     do_extended_prepare(device, &mut ctx, &mut r_res, None)?;
                     let coeff =
-                        pick_from_buf::<C::ScalarExt>(device, &r_res, 0, 1, ctx.extended_size)?;
+                        pick_from_buf::<C::Scalar>(device, &r_res, 0, 1, ctx.extended_size)?;
                     let short = vec![value[0] + gamma, coeff + curr_delta];
                     device.copy_from_host_to_device(&r_res, &short[..])?;
                     do_extended_ntt_pure(device, &mut ctx, &mut r_res)?;
 
-                    field_mul::<C::ScalarExt>(&device, &r, &r_res, ctx.extended_size)?;
+                    field_mul::<C::Scalar>(&device, &r, &r_res, ctx.extended_size)?;
                     curr_delta *= &C::Scalar::DELTA;
 
                     ctx.extended_allocator.push(l_res);
@@ -505,9 +502,9 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                     ctx.extended_allocator.push(p_coset_buf);
                 }
 
-                field_sub::<C::ScalarExt>(&device, &l, &r, ctx.extended_size)?;
-                field_mul::<C::ScalarExt>(&device, &l, &l_active_buf, ctx.extended_size)?;
-                field_op_v2::<C::ScalarExt>(
+                field_sub::<C::Scalar>(&device, &l, &r, ctx.extended_size)?;
+                field_mul::<C::Scalar>(&device, &l, &l_active_buf, ctx.extended_size)?;
+                field_op_v2::<C::Scalar>(
                     &device,
                     &h_buf,
                     Some(&h_buf),
@@ -563,7 +560,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
             )?;
             ctx.extended_allocator.push(tmp_buf);
 
-            let coeff = pick_from_buf::<C::ScalarExt>(device, &buf, 0, 0, ctx.size)?;
+            let coeff = pick_from_buf::<C::Scalar>(device, &buf, 0, 0, ctx.size)?;
             let short = vec![coeff + beta];
             device.copy_from_host_to_device(&buf, &short[..])?;
             do_extended_ntt(device, &mut ctx, &mut buf)?;
@@ -588,7 +585,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
             )?;
             ctx.extended_allocator.push(tmp_buf);
 
-            let coeff = pick_from_buf::<C::ScalarExt>(device, &buf, 0, 0, ctx.size)?;
+            let coeff = pick_from_buf::<C::Scalar>(device, &buf, 0, 0, ctx.size)?;
             let short = vec![coeff + gamma];
             device.copy_from_host_to_device(&buf, &short[..])?;
             do_extended_ntt(device, &mut ctx, &mut buf)?;
@@ -647,7 +644,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     Ok((ctx, h_buf))
 }
 
-fn get_expr_degree<F: FieldExt>(expr: &Vec<halo2_proofs::plonk::circuit::Expression<F>>) -> usize {
+fn get_expr_degree<F: FieldExt>(expr: &Vec<Expression<F>>) -> usize {
     let mut deg = 0;
     for expr in expr {
         deg = deg.max(expr.degree());
@@ -656,8 +653,8 @@ fn get_expr_degree<F: FieldExt>(expr: &Vec<halo2_proofs::plonk::circuit::Express
 }
 
 fn flatten_lookup_expression<F: FieldExt>(
-    input: &Vec<halo2_proofs::plonk::circuit::Expression<F>>,
-    table: &Vec<halo2_proofs::plonk::circuit::Expression<F>>,
+    input: &Vec<Expression<F>>,
+    table: &Vec<Expression<F>>,
     beta: F,
     gamma: F,
     theta: F,
