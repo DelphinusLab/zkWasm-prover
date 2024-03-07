@@ -4,6 +4,106 @@
 
 #include "bn254.cuh"
 
+__global__ void _eval_lookup_z_step1(
+    Bn254FrField *z,
+    Bn254FrField *permuted_input,
+    Bn254FrField *permuted_table,
+    Bn254FrField *beta_gamma)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    z[i] = (permuted_input[i] + beta_gamma[0]) * (permuted_table[i] + beta_gamma[1]);
+}
+
+__global__ void _eval_lookup_z_batch_invert(
+    Bn254FrField *z,
+    Bn254FrField *tmp,
+    int size_per_worker)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    Bn254FrField t(1);
+    Bn254FrField u(1);
+    for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++) {
+        u = t * z[j];
+        tmp[j] = t;
+        t = u;
+    }
+
+    t = t.inv();
+
+    for (int j = i * size_per_worker + size_per_worker - 1; j >= i * size_per_worker; j--) {
+        u = z[j];
+        z[j] = t * tmp[j];
+        t = t * u;
+        tmp[j] = u;
+    }
+}
+
+__global__ void _eval_lookup_z_step2(
+    Bn254FrField *z,
+    Bn254FrField *input,
+    Bn254FrField *table,
+    Bn254FrField *beta_gamma)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    z[i] = z[i] * (input[i] + beta_gamma[0]) * (table[i] + beta_gamma[1]);
+}
+
+__global__ void _eval_lookup_z_product_batch(
+    Bn254FrField *z,
+    Bn254FrField *res,
+    int size_per_worker)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i != 0) {
+        i--;
+        Bn254FrField t(1);
+        for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++) {
+            t *= z[j];
+        }
+        res[i + 1] = t;
+    } else {
+        res[i] = Bn254FrField(1);
+    }
+}
+
+__global__ void _eval_lookup_z_product_single_spread(
+    Bn254FrField *res,
+    int size_per_worker)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = 1; i < size_per_worker; i++) {
+        res[i] *= res[i - 1];
+    }
+}
+
+__global__ void _eval_lookup_z_product_batch_spread(
+    Bn254FrField *z,
+    Bn254FrField *res,
+    int size_per_worker)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    z[i * size_per_worker] *= res[i];
+    for (int j = i * size_per_worker + 1; j < i * size_per_worker + size_per_worker; j++) {
+        z[j] *= z[j - 1];
+    }
+}
+
+// Place a Bn254FrField::one() in the front
+__global__ void _eval_lookup_z_product_batch_spread_skip(
+    Bn254FrField *z,
+    Bn254FrField *res,
+    int size_per_worker)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    Bn254FrField t = res[i];
+    Bn254FrField u;
+    for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++) {
+        u = z[j] * t;
+        z[j] = t;
+        t = u;
+    }
+}
+
 __global__ void _poly_eval(
     Bn254FrField *p,
     Bn254FrField *out,
@@ -913,6 +1013,45 @@ extern "C"
         {
             cudaMemcpy(res, out, sizeof(Bn254FrField), cudaMemcpyDeviceToDevice);
         }
+
+        return cudaGetLastError();
+    }
+
+    cudaError_t eval_lookup_z(
+        Bn254FrField *z,
+        Bn254FrField *input,
+        Bn254FrField *table,
+        Bn254FrField *permuted_input,
+        Bn254FrField *permuted_table,
+        Bn254FrField *beta_gamma,
+        int n,
+        CUstream_st *stream)
+    {
+        int threads = n >= 64 ? 64 : 1;
+        int blocks = n / threads;
+        _eval_lookup_z_step1<<<blocks, threads, 0, stream>>>(
+            z, permuted_input, permuted_table, beta_gamma);
+
+        int worker = 64 * 128;
+        int size_per_worker = n / worker;
+        _eval_lookup_z_batch_invert<<<128, 64, 0, stream>>>(
+            z, permuted_input, size_per_worker);
+
+        _eval_lookup_z_step2<<<blocks, threads, 0, stream>>>(
+            z, input, table, beta_gamma);
+
+        worker = 64 * 64;
+        size_per_worker = n / worker;
+        _eval_lookup_z_product_batch<<<64, 64, 0, stream>>>(
+            z, permuted_input, size_per_worker);
+        _eval_lookup_z_product_batch<<<8, 8, 0, stream>>>(
+            permuted_input, permuted_table, 64);
+        _eval_lookup_z_product_single_spread<<<1, 1, 0, stream>>>(
+            permuted_table, 64);
+        _eval_lookup_z_product_batch_spread<<<8, 8, 0, stream>>>(
+            permuted_input, permuted_table, 64);
+        _eval_lookup_z_product_batch_spread_skip<<<64, 64, 0, stream>>>(
+            z, permuted_input, size_per_worker);
 
         return cudaGetLastError();
     }

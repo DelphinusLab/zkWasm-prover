@@ -634,137 +634,78 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         lookups.sort_by(|l, r| usize::cmp(&l.0, &r.0));
 
         let timer = start_timer!(|| "generate lookup z");
-        let quart = lookups.len() >> 2;
+        {
+            let mut last_stream = None;
+            let mut last_z_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let mut last_input_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let mut last_table_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let mut last_permuted_input_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let mut last_permuted_table_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
 
-        lookups.par_iter_mut().for_each(
-            |(i, (permuted_input, permuted_table, input, table, z))| {
-                // use GPU to reduce cpu costs
-                if *i >= quart {
-                    for ((z, permuted_input_value), permuted_table_value) in z
-                        .iter_mut()
-                        .zip(permuted_input.iter())
-                        .zip(permuted_table.iter())
-                    {
-                        *z = (beta + permuted_input_value) * &(gamma + permuted_table_value);
+            let mut z_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let mut input_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let mut table_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let mut permuted_input_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let mut permuted_table_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+
+            let beta_gamma_buf = device.alloc_device_buffer_from_slice(&[beta, gamma])?;
+            for (i, (permuted_input, permuted_table, input, table, z)) in lookups.iter_mut() {
+                unsafe {
+                    use crate::cuda::bn254_c::eval_lookup_z;
+                    use crate::device::cuda::to_result;
+                    use crate::device::cuda::CudaBuffer;
+
+                    let mut stream = std::mem::zeroed();
+                    let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+                    crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
+
+                    for (d_buf, h_buf) in [
+                        (&input_buf, input),
+                        (&table_buf, table),
+                        (&permuted_input_buf, permuted_input),
+                        (&permuted_table_buf, permuted_table),
+                    ] {
+                        device.copy_from_host_to_device_async(d_buf, &h_buf[..], stream)?;
                     }
 
-                    z.batch_invert();
+                    let err = eval_lookup_z(
+                        z_buf.ptr(),
+                        input_buf.ptr(),
+                        table_buf.ptr(),
+                        permuted_input_buf.ptr(),
+                        permuted_table_buf.ptr(),
+                        beta_gamma_buf.ptr(),
+                        size as i32,
+                        stream,
+                    );
 
-                    for ((z, input_value), table_value) in
-                        z.iter_mut().zip(input.iter()).zip(table.iter())
-                    {
-                        *z *= (beta + input_value) * &(gamma + table_value);
-                    }
-
-                    let mut tmp = C::Scalar::one();
-                    for i in 0..=unusable_rows_start {
-                        std::mem::swap(&mut tmp, &mut z[i]);
-                        tmp = tmp * z[i];
-                    }
-
-                    if ADD_RANDOM {
-                        for cell in &mut z[unusable_rows_start + 1..] {
-                            *cell = C::Scalar::random(&mut OsRng);
-                        }
-                    } else {
-                        for cell in &mut z[unusable_rows_start + 1..] {
-                            *cell = C::Scalar::zero();
-                        }
-                    }
-                } else {
-                    use crate::cuda::bn254::field_mul;
-                    use crate::cuda::bn254::field_op_v2;
-                    use crate::cuda::bn254::FieldOp;
-
-                    let z_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
-                    let input_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
-                    let table_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
-
+                    to_result((), err, "failed to run eval_lookup_z")?;
+ 
                     device
-                        .copy_from_host_to_device(&input_buf, &permuted_input[..])
+                        .copy_from_device_to_host_async(&mut z[..], &z_buf, stream)
                         .unwrap();
-                    device
-                        .copy_from_host_to_device(&table_buf, &permuted_table[..])
-                        .unwrap();
-                    field_op_v2(
-                        &device,
-                        &z_buf,
-                        Some(&input_buf),
-                        None,
-                        None,
-                        Some(beta),
-                        size,
-                        FieldOp::Add,
-                    )
-                    .unwrap();
-                    field_op_v2(
-                        &device,
-                        &table_buf,
-                        Some(&table_buf),
-                        None,
-                        None,
-                        Some(gamma),
-                        size,
-                        FieldOp::Add,
-                    )
-                    .unwrap();
-                    field_mul::<C::Scalar>(&device, &z_buf, &table_buf, size).unwrap();
-                    device.copy_from_device_to_host(&mut z[..], &z_buf).unwrap();
 
-                    z.batch_invert();
-
-                    device.copy_from_host_to_device(&z_buf, &z[..]).unwrap();
-                    device
-                        .copy_from_host_to_device(&input_buf, &input[..])
-                        .unwrap();
-                    device
-                        .copy_from_host_to_device(&table_buf, &table[..])
-                        .unwrap();
-                    field_op_v2(
-                        &device,
-                        &input_buf,
-                        Some(&input_buf),
-                        None,
-                        None,
-                        Some(beta),
-                        size,
-                        FieldOp::Add,
-                    )
-                    .unwrap();
-                    field_op_v2(
-                        &device,
-                        &table_buf,
-                        Some(&table_buf),
-                        None,
-                        None,
-                        Some(gamma),
-                        size,
-                        FieldOp::Add,
-                    )
-                    .unwrap();
-                    field_mul::<C::Scalar>(&device, &z_buf, &input_buf, size).unwrap();
-                    field_mul::<C::Scalar>(&device, &z_buf, &table_buf, size).unwrap();
-                    device.copy_from_device_to_host(&mut z[..], &z_buf).unwrap();
-
-                    let mut tmp = C::Scalar::one();
-                    for i in 0..=unusable_rows_start {
-                        std::mem::swap(&mut tmp, &mut z[i]);
-                        tmp = tmp * z[i];
+                    if let Some(last_stream) = last_stream {
+                        cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                        cuda_runtime_sys::cudaStreamDestroy(last_stream);
                     }
 
-                    if ADD_RANDOM {
-                        for cell in &mut z[unusable_rows_start + 1..] {
-                            *cell = C::Scalar::random(&mut OsRng);
-                        }
-                    } else {
-                        for cell in &mut z[unusable_rows_start + 1..] {
-                            *cell = C::Scalar::zero();
-                        }
-                    }
+                    last_stream = Some(stream);
+                    std::mem::swap(&mut z_buf, &mut last_z_buf);
+                    std::mem::swap(&mut input_buf, &mut last_input_buf);
+                    std::mem::swap(&mut table_buf, &mut last_table_buf);
+                    std::mem::swap(&mut permuted_input_buf, &mut last_permuted_input_buf);
+                    std::mem::swap(&mut permuted_table_buf, &mut last_permuted_table_buf);
                 }
-            },
-        );
+            }
 
+            unsafe {
+                if let Some(last_stream) = last_stream {
+                    cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                    cuda_runtime_sys::cudaStreamDestroy(last_stream);
+                }
+            }
+        }
         let mut lookups = lookups
             .into_iter()
             .map(|(_, (permuted_input, permuted_table, input, table, z))| {
@@ -1276,7 +1217,7 @@ fn vanish_commit<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E
 
     // Commit
     device.copy_from_host_to_device(&s_buf, &random_poly[..])?;
-    let commitment = msm_single_buffer( &g_buf, &s_buf, size)?;
+    let commitment = msm_single_buffer(&g_buf, &s_buf, size)?;
     transcript.write_point(commitment).unwrap();
 
     Ok(random_poly)

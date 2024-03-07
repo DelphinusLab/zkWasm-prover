@@ -546,12 +546,10 @@ pub mod shplonk {
             lx[0] = tmp;
         }
 
-        let timer = start_timer!(|| "msm for lx");
         let commitments = batch_msm::<C>(&g_buf, s_buf, vec![&lx[..]], size)?;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }
-        end_timer!(timer);
 
         Ok(())
     }
