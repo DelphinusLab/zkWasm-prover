@@ -415,16 +415,26 @@ pub fn batch_msm_and_intt<C: CurveAffine>(
     };
 
     let to_affine = |g: G1Projective| {
-        use halo2_proofs::pairing::bn256::{Fq, G1Affine};
         if g.z == BaseField::zero() {
             C::identity()
         } else {
-            let mut g_affine = [icicle_bn254::curve::G1Affine::zero()];
-            CurveCfg::to_affine(&g, &mut g_affine[0]);
-            let mut res = [G1Affine::identity()];
-            res[0].x = Fq::from_repr(g_affine[0].x.to_bytes_le().try_into().unwrap()).unwrap();
-            res[0].y = Fq::from_repr(g_affine[0].y.to_bytes_le().try_into().unwrap()).unwrap();
-            unsafe { core::mem::transmute::<_, &[C]>(&res[..])[0] }
+            use halo2_proofs::arithmetic::BaseExt;
+            use halo2_proofs::arithmetic::Field;
+
+            let mut t: Vec<_> = g.x.to_bytes_le();
+            t.resize(64, 0u8);
+            let x = C::Base::from_bytes_wide(&t.try_into().unwrap());
+
+            let mut t: Vec<_> = g.y.to_bytes_le();
+            t.resize(64, 0u8);
+            let y = C::Base::from_bytes_wide(&t.try_into().unwrap());
+
+            let mut t: Vec<_> = g.z.to_bytes_le();
+            t.resize(64, 0u8);
+            let z = C::Base::from_bytes_wide(&t.try_into().unwrap());
+
+            let z_inv = z.invert().unwrap();
+            C::from_xy(x * z_inv, y * z_inv).unwrap()
         }
     };
 
