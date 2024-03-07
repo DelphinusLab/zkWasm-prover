@@ -591,6 +591,43 @@ __global__ void _field_mul_zip(
     buf[i] = buf[i] * coeff[i % coeff_n];
 }
 
+__global__ void _shplonk_h_x_merge(
+    Bn254FrField *res,
+    Bn254FrField *v,
+    Bn254FrField *values,
+    Bn254FrField *omegas,
+    Bn254FrField *diff_points,
+    int diff_points_n,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = gid;
+
+    Bn254FrField t = values[i];
+    for (int j = 0; j < diff_points_n; j++) {
+        t = t * (omegas[i] - diff_points[j]);
+    }
+    res[i] = res[i] * v[0] + t;
+}
+
+__global__ void _shplonk_h_x_div_points(
+    Bn254FrField *values,
+    Bn254FrField *omegas,
+    Bn254FrField *points,
+    int points_n,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = gid;
+
+    Bn254FrField t = omegas[i] - points[0];
+    for (int j = 1; j < points_n; j++) {
+        t = t * (omegas[i] - points[j]);
+    }
+    assert(!(t.inv() == Bn254FrField(0)));
+    values[i] = values[i] * t.inv();
+}
+
 extern "C"
 {
     cudaError_t field_sum(
@@ -806,6 +843,34 @@ extern "C"
         int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
         _field_mul_zip<<<blocks, threads>>>(buf, coeff, coeff_n, n);
+        return cudaGetLastError();
+    }
+
+    cudaError_t shplonk_h_x_merge(
+        Bn254FrField *res,
+        Bn254FrField *v,
+        Bn254FrField *values,
+        Bn254FrField *omegas,
+        Bn254FrField *diff_points,
+        int diff_points_n,
+        int n)
+    {
+        int threads = n >= 64 ? 64 : 1;
+        int blocks = n / threads;
+        _shplonk_h_x_merge<<<blocks, threads>>>(res, v, values, omegas, diff_points, diff_points_n, n);
+        return cudaGetLastError();
+    }
+
+    cudaError_t shplonk_h_x_div_points(
+        Bn254FrField *values,
+        Bn254FrField *omegas,
+        Bn254FrField *points,
+        int points_n,
+        int n)
+    {
+        int threads = n >= 64 ? 64 : 1;
+        int blocks = n / threads;
+        _shplonk_h_x_div_points<<<blocks, threads>>>(values, omegas, points, points_n, n);
         return cudaGetLastError();
     }
 

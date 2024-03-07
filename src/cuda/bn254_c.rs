@@ -114,5 +114,29 @@ extern "C" {
 
     pub fn field_mul_zip(buf: *mut c_void, coeff: *mut c_void, coeff_n: i32, n: i32) -> cudaError;
 
-    pub fn poly_eval(p: *mut c_void, res: *mut c_void, tmp: *mut c_void, x: *mut c_void, n: i32) -> cudaError;
+    pub fn poly_eval(
+        p: *mut c_void,
+        res: *mut c_void,
+        tmp: *mut c_void,
+        x: *mut c_void,
+        n: i32,
+    ) -> cudaError;
+
+    pub fn shplonk_h_x_merge(
+        res: *mut c_void,
+        v: *mut c_void,
+        values: *mut c_void,
+        omegas: *mut c_void,
+        diff_points: *mut c_void,
+        diff_points_n: i32,
+        n: i32,
+    ) -> cudaError;
+
+    pub fn shplonk_h_x_div_points(
+        values: *mut c_void,
+        omegas: *mut c_void,
+        points: *mut c_void,
+        points_n: i32,
+        n: i32,
+    ) -> cudaError;
 }

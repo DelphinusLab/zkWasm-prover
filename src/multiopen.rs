@@ -180,6 +180,7 @@ pub mod shplonk {
     use halo2_proofs::arithmetic::CurveAffine;
     use halo2_proofs::arithmetic::Field;
     use halo2_proofs::arithmetic::FieldExt;
+    use halo2_proofs::plonk::ProvingKey;
     use halo2_proofs::poly::Rotation;
     use halo2_proofs::transcript::EncodedChallenge;
     use halo2_proofs::transcript::TranscriptWrite;
@@ -191,6 +192,7 @@ pub mod shplonk {
     use crate::cuda::bn254::field_op_v3;
     use crate::cuda::bn254::msm_single_buffer;
     use crate::cuda::bn254::FieldOp;
+    use crate::device::cuda::CudaBuffer;
     use crate::device::cuda::CudaDevice;
     use crate::device::cuda::CudaDeviceBufRaw;
     use crate::device::Device as _;
@@ -280,6 +282,7 @@ pub mod shplonk {
         E: EncodedChallenge<C>,
         T: TranscriptWrite<C, E>,
     >(
+        pk: &ProvingKey<C>,
         device: &CudaDevice,
         g_buf: &CudaDeviceBufRaw,
         queries: I,
@@ -349,51 +352,87 @@ pub mod shplonk {
             .collect::<DeviceResult<Vec<(&Vec<_>, Vec<_, _>, Vec<_>)>>>()?;
         end_timer!(timer);
 
-        let timer = start_timer!(|| "compute hx cpu part");
-        let rotation_sets_bufs = rotation_sets
-            .par_iter()
-            .enumerate()
-            .map(|(_, (points, poly, evals))| {
-                let mut tmp_hx = poly.clone();
+        let timer = start_timer!(|| "compute hx");
+        let timer1 = start_timer!(|| "compute hx prepare");
+        let k = pk.vk.domain.k as usize;
+        let (ntt_omegas_buf, ntt_pq_buf) =
+            crate::ntt_prepare(&device, pk.get_vk().domain.get_omega(), k)?;
+        let (intt_omegas_buf, intt_pq_buf) =
+            crate::ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
+        let intt_divisor_buf = device
+            .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
 
-                for i in 0..evals.len() {
-                    tmp_hx[i] = tmp_hx[i] - evals[i];
-                }
-
-                for z in points.iter() {
-                    let mut tmp = *tmp_hx.last().unwrap();
-                    *tmp_hx.last_mut().unwrap() = C::Scalar::zero();
-                    for i in (1..tmp_hx.len() - 1).rev() {
-                        let p = tmp_hx[i] + tmp * z;
-                        tmp_hx[i] = tmp;
-                        tmp = p;
-                    }
-                    tmp_hx[0] = tmp;
-                }
-
-                tmp_hx
-            })
-            .collect::<Vec<_>>();
-        end_timer!(timer);
-
-        let timer = start_timer!(|| "compute hx gpu part");
-        let hx_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-        let tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let mut hx_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let mut poly_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let mut tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let point_buf = device.alloc_device_buffer::<C::Scalar>(super_point_set.len())?;
         let v_buf = device.alloc_device_buffer_from_slice(&[v][..])?;
-        for tmp_hx in rotation_sets_bufs.iter() {
-            device.copy_from_host_to_device(&tmp_buf, &tmp_hx[..])?;
-            field_op_v3(
-                device,
-                &hx_buf,
-                Some(&hx_buf),
-                Some(&v_buf),
-                Some(&tmp_buf),
-                None,
-                size,
-                FieldOp::Add,
+        end_timer!(timer1);
+
+        for (points, poly, evals) in rotation_sets.iter() {
+            let mut evals = evals.clone();
+            for i in 0..evals.len() {
+                evals[i] = poly[i] - evals[i];
+            }
+
+            device.copy_from_host_to_device(&poly_buf, &poly[..])?;
+            device.copy_from_host_to_device(&poly_buf, &evals[..])?;
+
+            let diffs: Vec<C::Scalar> = super_point_set
+                .iter()
+                .filter(|point| !points.contains(point))
+                .copied()
+                .collect();
+
+            crate::cuda::bn254::ntt_raw(
+                &device,
+                &mut poly_buf,
+                &mut tmp_buf,
+                &ntt_pq_buf,
+                &ntt_omegas_buf,
+                k,
                 None,
             )?;
+
+            device.copy_from_host_to_device(&point_buf, &diffs[..])?;
+
+            unsafe {
+                let err = crate::cuda::bn254_c::shplonk_h_x_merge(
+                    hx_buf.ptr(),
+                    v_buf.ptr(),
+                    poly_buf.ptr(),
+                    ntt_omegas_buf.ptr(),
+                    point_buf.ptr(),
+                    diffs.len() as i32,
+                    size as i32,
+                );
+
+                crate::device::cuda::to_result((), err, "failed to run shplonk_h_x_merge")?;
+            }
         }
+
+        device.copy_from_host_to_device(&point_buf, &super_point_set[..])?;
+        unsafe {
+            let err = crate::cuda::bn254_c::shplonk_h_x_div_points(
+                hx_buf.ptr(),
+                ntt_omegas_buf.ptr(),
+                point_buf.ptr(),
+                super_point_set.len() as i32,
+                size as i32,
+            );
+
+            crate::device::cuda::to_result((), err, "failed to run shplonk_h_x_div_points")?;
+        }
+
+        crate::intt_raw(
+            &device,
+            &mut hx_buf,
+            &mut tmp_buf,
+            &intt_pq_buf,
+            &intt_omegas_buf,
+            &intt_divisor_buf,
+            k,
+        )?;
         end_timer!(timer);
 
         let timer = start_timer!(|| "msm for hx");

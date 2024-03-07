@@ -1182,6 +1182,7 @@ pub fn create_proof_from_advices<
             );
 
         shplonk::multiopen(
+            &pk,
             &device,
             &g_buf,
             queries,
