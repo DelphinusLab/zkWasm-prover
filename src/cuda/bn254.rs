@@ -2,12 +2,10 @@ use super::bn254_c;
 use crate::device::cuda::{to_result, CudaBuffer, CudaDevice, CudaDeviceBufRaw};
 use crate::device::Error;
 use crate::device::{Device, DeviceResult};
-use cuda_runtime_sys::cudaStream_t;
+use cuda_runtime_sys::{cudaDeviceSynchronize, cudaStream_t};
 use halo2_proofs::arithmetic::{CurveAffine, FieldExt};
 use halo2_proofs::pairing::group::ff::PrimeField as _;
 use halo2_proofs::pairing::group::prime::PrimeCurveAffine as _;
-use halo2_proofs::pairing::group::Curve;
-use halo2_proofs::pairing::group::Group;
 
 pub(crate) fn extended_prepare(
     device: &CudaDevice,
@@ -227,6 +225,11 @@ pub fn msm_single_buffer<C: CurveAffine>(
     use icicle_core::msm;
     use icicle_cuda_runtime::memory::HostOrDeviceSlice;
 
+    unsafe {
+        // Ensure s_buf and p_buf are ready
+        cudaDeviceSynchronize();
+    }
+
     let mut msm_results = HostOrDeviceSlice::cuda_malloc(1).unwrap();
 
     let points = {
@@ -275,6 +278,11 @@ pub fn batch_msm<C: CurveAffine>(
     use icicle_core::traits::FieldImpl;
     use icicle_cuda_runtime::memory::HostOrDeviceSlice;
     use icicle_cuda_runtime::stream::CudaStream;
+
+    unsafe {
+        // Ensure s_buf and p_buf are ready
+        cudaDeviceSynchronize();
+    }
 
     let mut res_vec = vec![];
     let mut last_stream: Option<CudaStream> = None;
@@ -398,6 +406,12 @@ pub fn batch_msm_and_intt<C: CurveAffine>(
     use icicle_core::msm;
     use icicle_cuda_runtime::memory::HostOrDeviceSlice;
     use icicle_cuda_runtime::stream::CudaStream;
+
+    unsafe {
+        // Ensure s_buf and p_buf are ready
+        cudaDeviceSynchronize();
+    }
+
     let len = 1 << k;
 
     let mut res_vec = vec![];
