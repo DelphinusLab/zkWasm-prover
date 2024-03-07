@@ -302,7 +302,8 @@ __global__ void _field_op(
         else
             fr = r[(i + r_rot) & (n - 1)];
     else
-        fr = r_c[0];
+        if (r_c)
+            fr = r_c[0];
 
     // add
     if (op == 0)
@@ -314,10 +315,10 @@ __global__ void _field_op(
     {
         res[i] = fl * fr;
     }
-    // neg
+    // uop
     else if (op == 2)
     {
-        res[i] = -fl;
+        res[i] = fl;
     }
     // sub
     else if (op == 3)

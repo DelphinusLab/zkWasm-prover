@@ -326,7 +326,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
                 Some(&curr_ptr),
                 None,
                 size,
-                FieldOp::Sum,
+                FieldOp::Add,
                 None,
             )?;
         }
@@ -512,7 +512,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                     Some(&l),
                     None,
                     ctx.extended_size,
-                    FieldOp::Sum,
+                    FieldOp::Add,
                 )?;
 
                 ctx.extended_allocator.push(l);

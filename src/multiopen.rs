@@ -13,11 +13,6 @@ pub struct ProverQuery<'a, F: FieldExt> {
     pub poly: &'a [F],
 }
 
-pub struct CommitmentData<'a, F: FieldExt> {
-    queries: Vec<ProverQuery<'a, F>>,
-    point: F,
-}
-
 pub(crate) mod gwc {
     use ark_std::end_timer;
     use ark_std::start_timer;
@@ -34,6 +29,7 @@ pub(crate) mod gwc {
     use rayon::iter::ParallelIterator;
     use std::collections::BTreeMap;
 
+    use crate::cuda::bn254::batch_msm;
     use crate::cuda::bn254::field_op_v3;
     use crate::cuda::bn254::FieldOp;
     use crate::device::cuda::CudaDevice;
@@ -41,8 +37,12 @@ pub(crate) mod gwc {
     use crate::device::Device as _;
     use crate::device::DeviceResult;
     use crate::hugetlb::HugePageAllocator;
-    use crate::multiopen::CommitmentData;
     use crate::multiopen::ProverQuery;
+
+    pub struct CommitmentData<'a, F: FieldExt> {
+        queries: Vec<ProverQuery<'a, F>>,
+        point: F,
+    }
 
     fn construct_intermediate_sets<'a, F: FieldExt, I>(queries: I) -> Vec<CommitmentData<'a, F>>
     where
@@ -121,12 +121,12 @@ pub(crate) mod gwc {
                     Some(&tmp_buf),
                     Some(&v_buf),
                     size,
-                    FieldOp::Sum,
+                    FieldOp::Add,
                     None,
                 )?;
 
                 let eval = eval_map.get(&(poly.as_ptr() as usize, x));
-                eval_batch[rot_idx] += eval.cloned().unwrap_or(C::Scalar::zero()) * vs[inner_idx];
+                eval_batch[rot_idx] += eval.cloned().unwrap() * vs[inner_idx];
             }
         }
 
@@ -161,12 +161,7 @@ pub(crate) mod gwc {
 
         let timer = start_timer!(|| "msm");
 
-        let commitments = crate::cuda::bn254::batch_msm::<C>(
-            &g_buf,
-            s_buf,
-            ws.iter().map(|x| &x[..]).collect(),
-            size,
-        )?;
+        let commitments = batch_msm::<C>(&g_buf, s_buf, ws.iter().map(|x| &x[..]).collect(), size)?;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }
@@ -181,127 +176,349 @@ pub mod shplonk {
     use ark_std::end_timer;
     use ark_std::start_timer;
 
+    use halo2_proofs::arithmetic::eval_polynomial_st;
     use halo2_proofs::arithmetic::CurveAffine;
     use halo2_proofs::arithmetic::Field;
     use halo2_proofs::arithmetic::FieldExt;
     use halo2_proofs::poly::Rotation;
     use halo2_proofs::transcript::EncodedChallenge;
     use halo2_proofs::transcript::TranscriptWrite;
-    use rayon::iter::IndexedParallelIterator;
-    use rayon::iter::IntoParallelRefIterator;
-    use rayon::iter::IntoParallelRefMutIterator;
-    use rayon::iter::ParallelIterator;
+    use rayon::iter::*;
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
+    use crate::cuda::bn254::batch_msm;
     use crate::cuda::bn254::field_op_v3;
+    use crate::cuda::bn254::msm_single_buffer;
     use crate::cuda::bn254::FieldOp;
     use crate::device::cuda::CudaDevice;
     use crate::device::cuda::CudaDeviceBufRaw;
     use crate::device::Device as _;
     use crate::device::DeviceResult;
     use crate::hugetlb::HugePageAllocator;
-    use crate::multiopen::CommitmentData;
     use crate::multiopen::ProverQuery;
-    /*
-       fn construct_intermediate_sets<'a, F: FieldExt, I>(queries: I) -> Vec<CommitmentData<'a, F>>
-       where
-           I: IntoIterator<Item = ProverQuery<'a, F>>,
-       {
-           let queries = queries.into_iter().collect::<Vec<_>>();
 
-       // Find evaluation of a commitment at a rotation
-       let get_eval = |commitment: Q::Commitment, rotation: Rotation| -> F {
-           queries
-               .iter()
-               .find(|query| query.get_commitment() == commitment && query.get_rotation() == rotation)
-               .unwrap()
-               .get_eval()
-       };
+    fn construct_intermediate_sets<'a, F: FieldExt, I>(
+        queries: I,
+        eval_map: BTreeMap<(usize, F), F>,
+    ) -> (Vec<(Vec<(&'a [F], Vec<F>)>, Vec<F>)>, Vec<F>)
+    where
+        I: IntoIterator<Item = ProverQuery<'a, F>>,
+    {
+        let queries = queries.into_iter().collect::<Vec<_>>();
 
-       // Order points according to their rotation
-       let mut rotation_point_map = BTreeMap::new();
-       for query in queries.clone() {
-           let point = rotation_point_map
-               .entry(query.get_rotation())
-               .or_insert_with(|| query.get_point());
+        let mut rotation_point_map = BTreeMap::new();
+        for query in queries.clone() {
+            rotation_point_map
+                .entry(query.rotation)
+                .or_insert_with(|| query.point);
+        }
 
-           // Assert rotation point matching consistency
-           assert_eq!(*point, query.get_point());
-       }
-       // All points appear in queries
-       let super_point_set: Vec<F> = rotation_point_map.values().cloned().collect();
+        let super_point_set: Vec<F> = rotation_point_map.values().cloned().collect();
 
-       // Collect rotation sets for each commitment
-       // Example elements in the vector:
-       // (C_0, {r_5}),
-       // (C_1, {r_1, r_2, r_3}),
-       // (C_2, {r_2, r_3, r_4}),
-       // (C_3, {r_2, r_3, r_4}),
-       // ...
-       let mut commitment_rotation_set_map: Vec<(Q::Commitment, BTreeSet<Rotation>)> = vec![];
-       for query in queries.clone() {
-           let rotation = query.get_rotation();
-           if let Some(pos) = commitment_rotation_set_map
-               .iter()
-               .position(|(commitment, _)| *commitment == query.get_commitment())
-           {
-               let (_, rotation_set) = &mut commitment_rotation_set_map[pos];
-               rotation_set.insert(rotation);
-           } else {
-               let rotation_set = BTreeSet::from([rotation]);
-               commitment_rotation_set_map.push((query.get_commitment(), rotation_set));
-           };
-       }
+        let mut poly_rotation_set_map: Vec<(&[F], BTreeSet<Rotation>)> = vec![];
+        for query in queries.clone() {
+            let rotation = query.rotation;
+            if let Some(pos) = poly_rotation_set_map
+                .iter()
+                .position(|(poly, _)| (*poly).as_ptr() == query.poly.as_ptr())
+            {
+                let (_, rotation_set) = &mut poly_rotation_set_map[pos];
+                rotation_set.insert(rotation);
+            } else {
+                let rotation_set = BTreeSet::from([rotation]);
+                poly_rotation_set_map.push((query.poly, rotation_set));
+            };
+        }
 
-       // Flatten rotation sets and collect commitments that opens against each commitment set
-       // Example elements in the vector:
-       // {r_5}: [C_0],
-       // {r_1, r_2, r_3} : [C_1]
-       // {r_2, r_3, r_4} : [C_2, C_3],
-       // ...
-       let mut rotation_set_commitment_map = BTreeMap::<BTreeSet<_>, Vec<Q::Commitment>>::new();
-       for (commitment, rotation_set) in commitment_rotation_set_map.iter() {
-           let commitments = rotation_set_commitment_map
-               .entry(rotation_set.clone())
-               .or_insert_with(Vec::new);
-           if !commitments.contains(commitment) {
-               commitments.push(commitment.clone());
-           }
-       }
+        let mut rotation_set_poly_map = BTreeMap::<BTreeSet<_>, Vec<_>>::new();
+        for (commitment, rotation_set) in poly_rotation_set_map.iter() {
+            let commitments = rotation_set_poly_map
+                .entry(rotation_set.clone())
+                .or_insert_with(Vec::new);
+            commitments.push(*commitment);
+        }
 
-       let rotation_sets = rotation_set_commitment_map
-           .into_iter()
-           .map(|(rotation_set, commitments)| {
-               let rotations: Vec<Rotation> = rotation_set.iter().cloned().collect();
+        let rotation_sets = rotation_set_poly_map
+            .into_iter()
+            .enumerate()
+            .map(|(i, (rotation_set, polys))| {
+                let rotations: Vec<Rotation> = rotation_set.iter().cloned().collect();
+                let points: Vec<_> = rotations
+                    .iter()
+                    .map(|rotation| *rotation_point_map.get(rotation).unwrap())
+                    .collect();
 
-               let commitments: Vec<Commitment<F, Q::Commitment>> = commitments
-                   .iter()
-                   .map(|commitment| {
-                       let evals: Vec<F> = rotations
-                           .iter()
-                           .map(|rotation| get_eval(commitment.clone(), *rotation))
-                           .collect();
-                       Commitment((commitment.clone(), evals))
-                   })
-                   .collect();
+                let polys: Vec<_> = polys
+                    .iter()
+                    .map(|poly| {
+                        let evals: Vec<F> = points
+                            .iter()
+                            .map(|x| {
+                                let eval = eval_map.get(&(poly.as_ptr() as usize, *x)).cloned();
+                                if eval.is_none() {
+                                    println!("miss eval on {:?} on set {}", *x, i);
+                                }
+                                eval.unwrap()
+                            })
+                            .collect();
+                        (*poly, evals)
+                    })
+                    .collect();
 
-               RotationSet {
-                   commitments,
-                   points: rotations
-                       .iter()
-                       .map(|rotation| *rotation_point_map.get(rotation).unwrap())
-                       .collect(),
-               }
-           })
-           .collect::<Vec<RotationSet<_, _>>>();
+                (polys, points)
+            })
+            .collect::<Vec<_>>();
 
-       IntermediateSets {
-           rotation_sets,
-           super_point_set,
-       }
-       }
-    */
+        (rotation_sets, super_point_set)
+    }
+
+    pub(crate) fn multiopen<
+        'a,
+        I,
+        C: CurveAffine,
+        E: EncodedChallenge<C>,
+        T: TranscriptWrite<C, E>,
+    >(
+        device: &CudaDevice,
+        g_buf: &CudaDeviceBufRaw,
+        queries: I,
+        size: usize,
+        s_buf: [&CudaDeviceBufRaw; 2],
+        eval_map: BTreeMap<(usize, C::Scalar), C::Scalar>,
+        transcript: &mut T,
+    ) -> DeviceResult<()>
+    where
+        I: IntoIterator<Item = ProverQuery<'a, C::Scalar>>,
+    {
+        let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
+        let v: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
+
+        let timer = start_timer!(|| "construct_intermediate_sets");
+        let (rotation_sets, super_point_set) = construct_intermediate_sets(queries, eval_map);
+        end_timer!(timer);
+
+        let timer = start_timer!(|| "collect by rotation sets");
+        let rotation_sets: Vec<(&Vec<_>, Vec<_, _>, Vec<_>)> = rotation_sets
+            .iter()
+            .map(
+                |(queries, points)| -> DeviceResult<(&Vec<_>, Vec<_, _>, Vec<_>)> {
+                    use halo2_proofs::arithmetic::lagrange_interpolate;
+
+                    let mut polys_acc = Vec::new_in(HugePageAllocator);
+                    polys_acc.resize(size, C::Scalar::zero());
+
+                    if queries.len() == 1 {
+                        let evals_acc = lagrange_interpolate(&points[..], &queries[0].1[..]);
+                        polys_acc[..].clone_from_slice(&queries[0].0[..]);
+                        Ok((points, polys_acc, evals_acc))
+                    } else {
+                        let mut evals_acc = vec![];
+                        evals_acc.resize(points.len(), C::Scalar::zero());
+
+                        let v_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+                        let tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+                        let y_buf = device.alloc_device_buffer_from_slice(&[y][..])?;
+
+                        // do streamly
+                        for (poly, evals) in queries.iter() {
+                            device.copy_from_host_to_device(&tmp_buf, &poly[..])?;
+                            field_op_v3(
+                                device,
+                                &v_buf,
+                                Some(&v_buf),
+                                Some(&y_buf),
+                                Some(&tmp_buf),
+                                None,
+                                size,
+                                FieldOp::Add,
+                                None,
+                            )?;
+
+                            let evals = lagrange_interpolate(&points[..], &evals[..]);
+
+                            for i in 0..evals_acc.len() {
+                                evals_acc[i] = evals_acc[i] * y + evals[i];
+                            }
+                        }
+                        device.copy_from_device_to_host(&mut polys_acc[..], &v_buf)?;
+                        Ok((points, polys_acc, evals_acc))
+                    }
+                },
+            )
+            .collect::<DeviceResult<Vec<(&Vec<_>, Vec<_, _>, Vec<_>)>>>()?;
+        end_timer!(timer);
+
+        let timer = start_timer!(|| "compute hx cpu part");
+        let rotation_sets_bufs = rotation_sets
+            .par_iter()
+            .enumerate()
+            .map(|(_, (points, poly, evals))| {
+                let mut tmp_hx = poly.clone();
+
+                for i in 0..evals.len() {
+                    tmp_hx[i] = tmp_hx[i] - evals[i];
+                }
+
+                for z in points.iter() {
+                    let mut tmp = *tmp_hx.last().unwrap();
+                    *tmp_hx.last_mut().unwrap() = C::Scalar::zero();
+                    for i in (1..tmp_hx.len() - 1).rev() {
+                        let p = tmp_hx[i] + tmp * z;
+                        tmp_hx[i] = tmp;
+                        tmp = p;
+                    }
+                    tmp_hx[0] = tmp;
+                }
+
+                tmp_hx
+            })
+            .collect::<Vec<_>>();
+        end_timer!(timer);
+
+        let timer = start_timer!(|| "compute hx gpu part");
+        let hx_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let v_buf = device.alloc_device_buffer_from_slice(&[v][..])?;
+        for tmp_hx in rotation_sets_bufs.iter() {
+            device.copy_from_host_to_device(&tmp_buf, &tmp_hx[..])?;
+            field_op_v3(
+                device,
+                &hx_buf,
+                Some(&hx_buf),
+                Some(&v_buf),
+                Some(&tmp_buf),
+                None,
+                size,
+                FieldOp::Add,
+                None,
+            )?;
+        }
+        end_timer!(timer);
+
+        let timer = start_timer!(|| "msm for hx");
+        let commitments = msm_single_buffer::<C>(&g_buf, &hx_buf, size)?;
+        for commitment in commitments {
+            transcript.write_point(commitment).unwrap();
+        }
+        end_timer!(timer);
+
+        let u: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
+
+        let timer = start_timer!(|| "zt_eval");
+        let zt_eval = super_point_set
+            .iter()
+            .map(|root| u - root)
+            .reduce(|a, b| a * b)
+            .unwrap();
+        end_timer!(timer);
+
+        let timer = start_timer!(|| "lx parts");
+        let lx_parts = rotation_sets
+            .into_par_iter()
+            .map(|(points, mut poly, evals)| {
+                poly[0] -= eval_polynomial_st(&evals[..], u);
+
+                let diffs: Vec<C::Scalar> = super_point_set
+                    .iter()
+                    .filter(|point| !points.contains(point))
+                    .copied()
+                    .collect();
+
+                assert_eq!(diffs.len() + points.len(), super_point_set.len());
+
+                let z_i = diffs
+                    .iter()
+                    .map(|root| u - root)
+                    .reduce(|a, b| a * b)
+                    .unwrap();
+                (poly, z_i)
+            })
+            .collect::<Vec<_>>();
+        end_timer!(timer);
+
+        let z_diff_0_inv = lx_parts[0].1.invert().unwrap();
+
+        let timer = start_timer!(|| "lx parts merge");
+        let fz_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let z_buf = device.alloc_device_buffer::<C::Scalar>(1)?;
+        for (_, (poly, z_i)) in lx_parts.into_iter().enumerate() {
+            device.copy_from_host_to_device(&tmp_buf, &poly[..])?;
+            device.copy_from_host_to_device(&z_buf, &[z_i][..])?;
+            field_op_v3(
+                device,
+                &fz_buf,
+                Some(&fz_buf),
+                Some(&v_buf),
+                Some(&tmp_buf),
+                Some(&z_buf),
+                size,
+                FieldOp::Add,
+                None,
+            )?;
+        }
+        end_timer!(timer);
+        let timer = start_timer!(|| "hx merge");
+        let zt_eval_buf = v_buf;
+        device.copy_from_host_to_device(&zt_eval_buf, &[zt_eval][..])?;
+        field_op_v3(
+            device,
+            &fz_buf,
+            Some(&fz_buf),
+            None,
+            Some(&hx_buf),
+            Some(&zt_eval_buf),
+            size,
+            FieldOp::Sub,
+            None,
+        )?;
+        device.synchronize()?;
+        end_timer!(timer);
+
+        let timer = start_timer!(|| "hx z diff inv");
+        let z_diff_0_inv_buf = zt_eval_buf;
+        device.copy_from_host_to_device(&z_diff_0_inv_buf, &[z_diff_0_inv][..])?;
+        field_op_v3(
+            device,
+            &fz_buf,
+            Some(&fz_buf),
+            Some(&z_diff_0_inv_buf),
+            None,
+            None,
+            size,
+            FieldOp::UOp,
+            None,
+        )?;
+        end_timer!(timer);
+
+        let mut lx = Vec::new_in(HugePageAllocator);
+        lx.resize(size, C::Scalar::zero());
+
+        device.copy_from_device_to_host(&mut lx[..], &fz_buf)?;
+
+        let timer = start_timer!(|| "xz div lx");
+        {
+            let z = u;
+            let mut tmp = *lx.last().unwrap();
+            *lx.last_mut().unwrap() = C::Scalar::zero();
+            for i in (1..lx.len() - 1).rev() {
+                let p = lx[i] + tmp * z;
+                lx[i] = tmp;
+                tmp = p;
+            }
+            lx[0] = tmp;
+        }
+        end_timer!(timer);
+
+        let timer = start_timer!(|| "msm for xz div lx");
+        let commitments = batch_msm::<C>(&g_buf, s_buf, vec![&lx[..]], size)?;
+        for commitment in commitments {
+            transcript.write_point(commitment).unwrap();
+        }
+        end_timer!(timer);
+
+        Ok(())
+    }
 }
 
 pub(crate) fn permutation_product_open<'a, C: CurveAffine>(

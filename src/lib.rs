@@ -41,6 +41,7 @@ use crate::hugetlb::HugePageAllocator;
 use crate::multiopen::gwc;
 use crate::multiopen::lookup_open;
 use crate::multiopen::permutation_product_open;
+use crate::multiopen::shplonk;
 use crate::multiopen::ProverQuery;
 
 pub mod cuda;
@@ -50,7 +51,7 @@ mod eval_h;
 mod hugetlb;
 mod multiopen;
 
-const ADD_RANDOM: bool = true;
+const ADD_RANDOM: bool = false;
 
 pub fn prepare_advice_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
@@ -202,6 +203,13 @@ fn handle_lookup_pair<F: FieldExt>(
         }
         for cell in &mut permuted_table[unusable_rows_start..] {
             *cell = F::random(&mut OsRng);
+        }
+    } else {
+        for cell in &mut permuted_input[unusable_rows_start..] {
+            *cell = F::zero();
+        }
+        for cell in &mut permuted_table[unusable_rows_start..] {
+            *cell = F::zero();
         }
     }
 
@@ -647,7 +655,7 @@ pub fn create_proof_from_advices<
                         None,
                         Some(beta),
                         size,
-                        FieldOp::Sum,
+                        FieldOp::Add,
                     )
                     .unwrap();
                     field_op_v2(
@@ -658,7 +666,7 @@ pub fn create_proof_from_advices<
                         None,
                         Some(gamma),
                         size,
-                        FieldOp::Sum,
+                        FieldOp::Add,
                     )
                     .unwrap();
                     field_mul::<C::Scalar>(&device, &z_buf, &table_buf, size).unwrap();
@@ -681,7 +689,7 @@ pub fn create_proof_from_advices<
                         None,
                         Some(beta),
                         size,
-                        FieldOp::Sum,
+                        FieldOp::Add,
                     )
                     .unwrap();
                     field_op_v2(
@@ -692,7 +700,7 @@ pub fn create_proof_from_advices<
                         None,
                         Some(gamma),
                         size,
-                        FieldOp::Sum,
+                        FieldOp::Add,
                     )
                     .unwrap();
                     field_mul::<C::Scalar>(&device, &z_buf, &input_buf, size).unwrap();
@@ -833,6 +841,10 @@ pub fn create_proof_from_advices<
                 if ADD_RANDOM {
                     for v in z[unusable_rows_start + 1..].iter_mut() {
                         *v = C::Scalar::random(&mut OsRng);
+                    }
+                } else {
+                    for v in z[unusable_rows_start + 1..].iter_mut() {
+                        *v = C::Scalar::zero();
                     }
                 }
 
@@ -994,7 +1006,7 @@ pub fn create_proof_from_advices<
         )?;
         end_timer!(timer);
 
-        let mut inputs = vec![];
+        let mut inputs = vec![(&h_pieces[..], x)];
 
         for instance in instance.iter() {
             meta.instance_queries.iter().for_each(|&(column, at)| {
@@ -1085,7 +1097,7 @@ pub fn create_proof_from_advices<
             }
         }
 
-        for (_i, eval) in evals.into_iter().enumerate() {
+        for (_i, eval) in evals.into_iter().skip(1).enumerate() {
             transcript.write_scalar(eval).unwrap();
         }
 
@@ -1169,7 +1181,7 @@ pub fn create_proof_from_advices<
                     })),
             );
 
-        gwc::multiopen(
+        shplonk::multiopen(
             &device,
             &g_buf,
             queries,
@@ -1196,7 +1208,7 @@ fn vanish_commit<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E
 
     let random_nr = 32;
     let mut random_poly = Vec::new_in(HugePageAllocator);
-    random_poly.resize(size, C::Scalar::one());
+    random_poly.resize(size, C::Scalar::zero());
 
     let random = vec![0; 32usize]
         .iter()
@@ -1204,9 +1216,11 @@ fn vanish_commit<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E
         .collect::<Vec<_>>();
 
     random_poly.par_iter_mut().for_each(|coeff| {
-        let mut rng = thread_rng();
-        *coeff = (C::Scalar::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
-            * (C::Scalar::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
+        if ADD_RANDOM {
+            let mut rng = thread_rng();
+            *coeff = (C::Scalar::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
+                * (C::Scalar::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
+        }
     });
 
     // Commit

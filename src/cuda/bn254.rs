@@ -61,9 +61,9 @@ pub(crate) fn extended_intt_after(
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum FieldOp {
-    Sum = 0,
+    Add = 0,
     Mul = 1,
-    _Neg = 2,
+    UOp = 2,
     Sub = 3,
 }
 
@@ -215,6 +215,69 @@ pub(crate) fn field_op<F: FieldExt>(
         to_result((), err, "fail to run field_op")?;
     }
     Ok(())
+}
+
+pub fn msm_single_buffer<C: CurveAffine>(
+    p_buf: &CudaDeviceBufRaw,
+    s_buf: &CudaDeviceBufRaw,
+    len: usize,
+) -> Result<Vec<C>, Error> {
+    use core::mem::ManuallyDrop;
+    use icicle_bn254::curve::BaseField;
+    use icicle_bn254::curve::CurveCfg;
+    use icicle_bn254::curve::G1Projective;
+    use icicle_core::curve::Curve;
+    use icicle_core::msm;
+    use icicle_core::traits::FieldImpl;
+    use icicle_cuda_runtime::memory::HostOrDeviceSlice;
+
+    let mut res_vec = vec![];
+    let mut msm_results = HostOrDeviceSlice::cuda_malloc(1).unwrap();
+
+    let points = {
+        unsafe {
+            ManuallyDrop::new(HostOrDeviceSlice::Device(
+                std::slice::from_raw_parts_mut(p_buf.ptr() as _, len),
+                0,
+            ))
+        }
+    };
+
+    let to_affine = |g: G1Projective| {
+        use halo2_proofs::pairing::bn256::{Fq, G1Affine};
+        if g.z == BaseField::zero() {
+            C::identity()
+        } else {
+            let mut g_affine = [icicle_bn254::curve::G1Affine::zero()];
+            CurveCfg::to_affine(&g, &mut g_affine[0]);
+            let mut res = [G1Affine::identity()];
+            res[0].x = Fq::from_repr(g_affine[0].x.to_bytes_le().try_into().unwrap()).unwrap();
+            res[0].y = Fq::from_repr(g_affine[0].y.to_bytes_le().try_into().unwrap()).unwrap();
+            unsafe { core::mem::transmute::<_, &[C]>(&res[..])[0] }
+        }
+    };
+
+    let scalars = {
+        unsafe {
+            ManuallyDrop::new(HostOrDeviceSlice::Device(
+                std::slice::from_raw_parts_mut(s_buf.ptr() as _, len),
+                0,
+            ))
+        }
+    };
+    //Use async would cause failure on multi-open;
+    //scalars.copy_from_host_async(value, &stream).unwrap();
+    let mut cfg = msm::MSMConfig::default();
+    cfg.are_scalars_montgomery_form = true;
+    cfg.are_points_montgomery_form = true;
+    msm::msm(&scalars, &points, &cfg, &mut msm_results).unwrap();
+
+    let mut msm_host_result = [G1Projective::zero()];
+    msm_results.copy_to_host(&mut msm_host_result[..]).unwrap();
+    let res = to_affine(msm_host_result[0]);
+    res_vec.push(res);
+
+    Ok(res_vec)
 }
 
 pub fn batch_msm<C: CurveAffine>(
