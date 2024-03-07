@@ -13,7 +13,6 @@ use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
 use halo2_proofs::pairing::group::ff::BatchInvert as _;
-use halo2_proofs::plonk::create_single_instances;
 use halo2_proofs::plonk::Any;
 use halo2_proofs::plonk::Expression;
 use halo2_proofs::plonk::ProvingKey;
@@ -366,10 +365,19 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let domain = &pk.vk.domain;
 
-        let timer = start_timer!(|| "create single instances");
-        let instance = create_single_instances(params, &pk, &[instances], transcript).unwrap();
-        let instance = Arc::new(instance);
-        end_timer!(timer);
+        pk.vk.hash_into(transcript).unwrap();
+
+        let mut instances = Arc::new(
+            instances
+                .par_iter()
+                .map(|x| {
+                    let mut instance = Vec::new_in(HugePageAllocator);
+                    instance.resize(size, C::Scalar::zero());
+                    instance[0..x.len()].clone_from_slice(&x[..]);
+                    instance
+                })
+                .collect::<Vec<_>>(),
+        );
 
         let device = CudaDevice::get_device(0).unwrap();
 
@@ -397,11 +405,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         // thread for part of lookups
         let sub_pk = pk.clone();
         let sub_advices = advices.clone();
-        let sub_instance = instance.clone();
+        let sub_instances = instances.clone();
         let lookup_handler = s.spawn(move || {
             let pk = sub_pk;
             let advices = sub_advices;
-            let instance = sub_instance;
+            let instances = sub_instances;
             let timer =
                 start_timer!(|| format!("prepare lookup buffer, count {}", pk.vk.cs.lookups.len()));
             let lookups = pk
@@ -435,7 +443,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         } else if let Some(idx) = expr.is_pure_fixed() {
                             target.clone_from_slice(&pk.fixed_values[idx].values[..]);
                         } else if let Some(idx) = expr.is_pure_instance() {
-                            target.clone_from_slice(&instance[0].instance_values[idx].values[..]);
+                            target.clone_from_slice(&instances[idx][..]);
                         } else if let Some(idx) = expr.is_pure_advice() {
                             target.clone_from_slice(&advices[idx][..]);
                         } else {
@@ -454,11 +462,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
             let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
             let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let instance_ref = &instance[0]
-                .instance_values
-                .iter()
-                .map(|x| &x[..])
-                .collect::<Vec<_>>()[..];
+            let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
 
             let timer =
                 start_timer!(|| format!("permute lookup comp {}", single_comp_lookups.len()));
@@ -487,14 +491,24 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let mut tmp_buf_ext = device.alloc_device_buffer::<C::Scalar>(size)?;
 
         // Advice MSM
-        let timer = start_timer!(|| format!("advices msm {}", advices.len()));
+        let timer = start_timer!(|| format!(
+            "instances and advices msm {}",
+            instances.len() + advices.len()
+        ));
         let commitments = crate::cuda::bn254::batch_msm::<C>(
             &g_lagrange_buf,
             [&s_buf, &s_buf_ext],
-            advices.iter().map(|x| &x[..]).collect(),
+            instances
+                .iter()
+                .chain(advices.iter())
+                .map(|x| &x[..])
+                .collect(),
             size,
         )?;
-        for commitment in commitments {
+        for commitment in commitments.iter().take(instances.len()) {
+            transcript.common_point(*commitment).unwrap();
+        }
+        for commitment in commitments.into_iter().skip(instances.len()) {
             transcript.write_point(commitment).unwrap();
         }
         end_timer!(timer);
@@ -509,20 +523,16 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         // After theta
         let sub_pk = pk.clone();
         let sub_advices = advices.clone();
-        let sub_instance = instance.clone();
+        let sub_instance = instances.clone();
         let tuple_lookup_handler = s.spawn(move || {
             let pk = sub_pk;
             let advices = sub_advices;
-            let instance = sub_instance;
+            let instances = sub_instance;
             let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
 
             let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
             let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let instance_ref = &instance[0]
-                .instance_values
-                .iter()
-                .map(|x| &x[..])
-                .collect::<Vec<_>>()[..];
+            let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
 
             let mut buffers = vec![];
             for (i, (input, table, _)) in tuple_lookups.iter_mut() {
@@ -649,7 +659,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let mut permuted_table_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
 
             let beta_gamma_buf = device.alloc_device_buffer_from_slice(&[beta, gamma])?;
-            for (i, (permuted_input, permuted_table, input, table, z)) in lookups.iter_mut() {
+            for (_, (permuted_input, permuted_table, input, table, z)) in lookups.iter_mut() {
                 unsafe {
                     use crate::cuda::bn254_c::eval_lookup_z;
                     use crate::device::cuda::to_result;
@@ -680,7 +690,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     );
 
                     to_result((), err, "failed to run eval_lookup_z")?;
- 
+
                     device
                         .copy_from_device_to_host_async(&mut z[..], &z_buf, stream)
                         .unwrap();
@@ -730,19 +740,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let sub_pk = pk.clone();
         let sub_advices = advices.clone();
-        let sub_instance = instance.clone();
+        let sub_instance = instances.clone();
         let permutation_products_handler = s.spawn(move || {
             let pk = sub_pk;
             let advices = sub_advices;
-            let instance = sub_instance;
+            let instances = sub_instance;
 
             let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
             let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let instance_ref = &instance[0]
-                .instance_values
-                .iter()
-                .map(|x| &x[..])
-                .collect::<Vec<_>>()[..];
+            let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
             let mut p_z = pk
                 .vk
                 .cs
@@ -912,17 +918,21 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let timer = start_timer!(|| "h_poly");
         {
-            let timer = start_timer!(|| "advices intt");
+            let timer = start_timer!(|| "instances and advices intt");
 
             let mut last_stream = None;
             let mut last_tmp_buf = Some(device.alloc_device_buffer::<C::Scalar>(size)?);
             let mut last_ntt_buf = Some(device.alloc_device_buffer::<C::Scalar>(size)?);
-            for advices in unsafe { Arc::get_mut_unchecked(&mut advices) }.iter_mut() {
+            for col in unsafe {
+                Arc::get_mut_unchecked(&mut instances)
+                    .iter_mut()
+                    .chain(Arc::get_mut_unchecked(&mut advices).iter_mut())
+            } {
                 unsafe {
                     let mut stream = std::mem::zeroed();
                     let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
                     crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
-                    device.copy_from_host_to_device_async(&s_buf, &advices[..], stream)?;
+                    device.copy_from_host_to_device_async(&s_buf, &col[..], stream)?;
                     intt_raw_async(
                         &device,
                         &mut s_buf,
@@ -933,7 +943,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         k,
                         Some(stream),
                     )?;
-                    device.copy_from_device_to_host_async(&mut advices[..], &s_buf, stream)?;
+                    device.copy_from_device_to_host_async(&mut col[..], &s_buf, stream)?;
                     if let Some(last_stream) = last_stream {
                         cuda_runtime_sys::cudaStreamSynchronize(last_stream);
                         cuda_runtime_sys::cudaStreamDestroy(last_stream);
@@ -954,11 +964,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let fixed_ref = &pk.fixed_polys.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
         let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-        let instance_ref = &instance[0]
-            .instance_polys
-            .iter()
-            .map(|x| &x[..])
-            .collect::<Vec<_>>()[..];
+        let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
 
         let (x, _xn, h_pieces) = evaluate_h_gates_and_vanishing_construct(
             &device,
@@ -988,14 +994,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let mut inputs = vec![(&h_pieces[..], x)];
 
-        for instance in instance.iter() {
-            meta.instance_queries.iter().for_each(|&(column, at)| {
-                inputs.push((
-                    &instance.instance_polys[column.index()].values[..],
-                    domain.rotate_omega(x, at),
-                ))
-            })
-        }
+        meta.instance_queries.iter().for_each(|&(column, at)| {
+            inputs.push((&instances[column.index()][..], domain.rotate_omega(x, at)))
+        });
 
         meta.advice_queries.iter().for_each(|&(column, at)| {
             inputs.push((&advices[column.index()], domain.rotate_omega(x, at)))
@@ -1084,11 +1085,12 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "multi open");
+        let instance_arr = [instances];
         let advices_arr = [advices];
         let permutation_products_arr = [permutation_products];
         let lookups_arr = [lookups];
 
-        let queries = instance
+        let queries = instance_arr
             .iter()
             .zip(advices_arr.iter())
             .zip(permutation_products_arr.iter())
@@ -1104,7 +1106,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             .map(|&(column, at)| ProverQuery {
                                 point: domain.rotate_omega(x, at),
                                 rotation: at,
-                                poly: &instance.instance_polys[column.index()].values[..],
+                                poly: &instance[column.index()][..],
                             }),
                     )
                     .chain(
