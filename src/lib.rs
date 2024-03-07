@@ -276,9 +276,8 @@ pub fn evaluate_exprs<F: FieldExt>(
         (((idx as i32) + (rot * rot_scale)).rem_euclid(isize)) as usize
     };
     for (idx, value) in res.iter_mut().enumerate() {
-        for expression in expressions {
-            *value = *value * theta;
-            *value += expression.evaluate(
+        for (i, expression) in expressions.iter().enumerate() {
+            let v = expression.evaluate(
                 &|scalar| scalar,
                 &|_| panic!("virtual selectors are removed during optimization"),
                 &|_, column_index, rotation| {
@@ -302,6 +301,13 @@ pub fn evaluate_exprs<F: FieldExt>(
                 },
                 &|a, scalar| a * scalar,
             );
+
+            if i > 0 {
+                *value = *value * theta;
+                *value += v;
+            } else {
+                *value = v;
+            }
         }
     }
 }
