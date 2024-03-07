@@ -221,17 +221,12 @@ pub fn msm_single_buffer<C: CurveAffine>(
     p_buf: &CudaDeviceBufRaw,
     s_buf: &CudaDeviceBufRaw,
     len: usize,
-) -> Result<Vec<C>, Error> {
+) -> Result<C, Error> {
     use core::mem::ManuallyDrop;
-    use icicle_bn254::curve::BaseField;
-    use icicle_bn254::curve::CurveCfg;
     use icicle_bn254::curve::G1Projective;
-    use icicle_core::curve::Curve;
     use icicle_core::msm;
-    use icicle_core::traits::FieldImpl;
     use icicle_cuda_runtime::memory::HostOrDeviceSlice;
 
-    let mut res_vec = vec![];
     let mut msm_results = HostOrDeviceSlice::cuda_malloc(1).unwrap();
 
     let points = {
@@ -240,20 +235,6 @@ pub fn msm_single_buffer<C: CurveAffine>(
                 std::slice::from_raw_parts_mut(p_buf.ptr() as _, len),
                 0,
             ))
-        }
-    };
-
-    let to_affine = |g: G1Projective| {
-        use halo2_proofs::pairing::bn256::{Fq, G1Affine};
-        if g.z == BaseField::zero() {
-            C::identity()
-        } else {
-            let mut g_affine = [icicle_bn254::curve::G1Affine::zero()];
-            CurveCfg::to_affine(&g, &mut g_affine[0]);
-            let mut res = [G1Affine::identity()];
-            res[0].x = Fq::from_repr(g_affine[0].x.to_bytes_le().try_into().unwrap()).unwrap();
-            res[0].y = Fq::from_repr(g_affine[0].y.to_bytes_le().try_into().unwrap()).unwrap();
-            unsafe { core::mem::transmute::<_, &[C]>(&res[..])[0] }
         }
     };
 
@@ -274,10 +255,9 @@ pub fn msm_single_buffer<C: CurveAffine>(
 
     let mut msm_host_result = [G1Projective::zero()];
     msm_results.copy_to_host(&mut msm_host_result[..]).unwrap();
-    let res = to_affine(msm_host_result[0]);
-    res_vec.push(res);
+    let res = to_affine(&msm_host_result[0]);
 
-    Ok(res_vec)
+    Ok(res)
 }
 
 pub fn batch_msm<C: CurveAffine>(
@@ -376,6 +356,32 @@ pub fn batch_msm<C: CurveAffine>(
     Ok(res_vec)
 }
 
+fn to_affine<C: CurveAffine>(g: &icicle_bn254::curve::G1Projective) -> C {
+    use icicle_bn254::curve::BaseField;
+    use icicle_core::traits::FieldImpl;
+    if g.z == BaseField::zero() {
+        C::identity()
+    } else {
+        use halo2_proofs::arithmetic::BaseExt;
+        use halo2_proofs::arithmetic::Field;
+
+        let mut t: Vec<_> = g.x.to_bytes_le();
+        t.resize(64, 0u8);
+        let x = C::Base::from_bytes_wide(&t.try_into().unwrap());
+
+        let mut t: Vec<_> = g.y.to_bytes_le();
+        t.resize(64, 0u8);
+        let y = C::Base::from_bytes_wide(&t.try_into().unwrap());
+
+        let mut t: Vec<_> = g.z.to_bytes_le();
+        t.resize(64, 0u8);
+        let z = C::Base::from_bytes_wide(&t.try_into().unwrap());
+
+        let z_inv = z.invert().unwrap();
+        C::from_xy(x * z_inv, y * z_inv).unwrap()
+    }
+}
+
 pub fn batch_msm_and_intt<C: CurveAffine>(
     device: &CudaDevice,
     pq_buf: &CudaDeviceBufRaw,
@@ -388,12 +394,8 @@ pub fn batch_msm_and_intt<C: CurveAffine>(
     k: usize,
 ) -> Result<Vec<C>, Error> {
     use core::mem::ManuallyDrop;
-    use icicle_bn254::curve::BaseField;
-    use icicle_bn254::curve::CurveCfg;
     use icicle_bn254::curve::G1Projective;
-    use icicle_core::curve::Curve;
     use icicle_core::msm;
-    use icicle_core::traits::FieldImpl;
     use icicle_cuda_runtime::memory::HostOrDeviceSlice;
     use icicle_cuda_runtime::stream::CudaStream;
     let len = 1 << k;
@@ -411,30 +413,6 @@ pub fn batch_msm_and_intt<C: CurveAffine>(
                 std::slice::from_raw_parts_mut(p_buf.ptr() as _, len),
                 0,
             ))
-        }
-    };
-
-    let to_affine = |g: G1Projective| {
-        if g.z == BaseField::zero() {
-            C::identity()
-        } else {
-            use halo2_proofs::arithmetic::BaseExt;
-            use halo2_proofs::arithmetic::Field;
-
-            let mut t: Vec<_> = g.x.to_bytes_le();
-            t.resize(64, 0u8);
-            let x = C::Base::from_bytes_wide(&t.try_into().unwrap());
-
-            let mut t: Vec<_> = g.y.to_bytes_le();
-            t.resize(64, 0u8);
-            let y = C::Base::from_bytes_wide(&t.try_into().unwrap());
-
-            let mut t: Vec<_> = g.z.to_bytes_le();
-            t.resize(64, 0u8);
-            let z = C::Base::from_bytes_wide(&t.try_into().unwrap());
-
-            let z_inv = z.invert().unwrap();
-            C::from_xy(x * z_inv, y * z_inv).unwrap()
         }
     };
 
@@ -481,7 +459,7 @@ pub fn batch_msm_and_intt<C: CurveAffine>(
             msm_results[last_idx]
                 .copy_to_host(&mut msm_host_result[..])
                 .unwrap();
-            let res = to_affine(msm_host_result[0]);
+            let res = to_affine(&msm_host_result[0]);
             res_vec.push(res);
         }
         last_stream = Some(stream);
@@ -494,141 +472,11 @@ pub fn batch_msm_and_intt<C: CurveAffine>(
         msm_results[last_idx]
             .copy_to_host(&mut msm_host_result[..])
             .unwrap();
-        let res = to_affine(msm_host_result[0]);
+        let res = to_affine(&msm_host_result[0]);
         res_vec.push(res);
     }
 
     Ok(res_vec)
-}
-
-pub fn msm<C: CurveAffine>(
-    device: &CudaDevice,
-    p_buf: &CudaDeviceBufRaw,
-    s_buf: &CudaDeviceBufRaw,
-    len: usize,
-) -> Result<C, Error> {
-    msm_with_groups(device, p_buf, s_buf, len, 4)
-}
-
-pub fn msm_with_groups<C: CurveAffine>(
-    device: &CudaDevice,
-    p_buf: &CudaDeviceBufRaw,
-    s_buf: &CudaDeviceBufRaw,
-    len: usize,
-    msm_groups: usize,
-) -> Result<C, Error> {
-    if false {
-        _msm_with_groups::<C>(device, p_buf, s_buf, len, msm_groups)?;
-        unreachable!();
-    } else {
-        use core::mem::ManuallyDrop;
-        use icicle_bn254::curve::BaseField;
-        use icicle_bn254::curve::CurveCfg;
-        use icicle_bn254::curve::G1Projective;
-        use icicle_core::curve::Curve;
-        use icicle_core::msm;
-        use icicle_core::traits::FieldImpl;
-        use icicle_cuda_runtime::memory::HostOrDeviceSlice;
-        use icicle_cuda_runtime::stream::CudaStream;
-
-        let points = {
-            unsafe {
-                ManuallyDrop::new(HostOrDeviceSlice::Device(
-                    std::slice::from_raw_parts_mut(p_buf.ptr() as _, len),
-                    0,
-                ))
-            }
-        };
-
-        let scalars = {
-            unsafe {
-                ManuallyDrop::new(HostOrDeviceSlice::Device(
-                    std::slice::from_raw_parts_mut(s_buf.ptr() as _, len),
-                    0,
-                ))
-            }
-        };
-        let mut msm_results: HostOrDeviceSlice<'_, G1Projective> =
-            HostOrDeviceSlice::cuda_malloc(1).unwrap();
-        let mut msm_host_result = vec![G1Projective::zero(); 1];
-        let mut msm_host_affine_result = vec![icicle_bn254::curve::G1Affine::zero(); 1];
-        let mut cfg = msm::MSMConfig::default();
-        let stream = CudaStream::create().unwrap();
-        cfg.ctx.stream = &stream;
-        cfg.is_async = true;
-        cfg.are_scalars_montgomery_form = true;
-        cfg.are_points_montgomery_form = true;
-        msm::msm(&scalars, &points, &cfg, &mut msm_results).unwrap();
-        stream.synchronize().unwrap();
-        msm_results.copy_to_host(&mut msm_host_result[..]).unwrap();
-        let res = if msm_host_result[0].z == BaseField::zero() {
-            C::identity()
-        } else {
-            CurveCfg::to_affine(&mut msm_host_result[0], &mut msm_host_affine_result[0]);
-            let mut res = [halo2_proofs::pairing::bn256::G1Affine::identity()];
-            res[0].x = halo2_proofs::pairing::bn256::Fq::from_repr(
-                msm_host_affine_result[0]
-                    .x
-                    .to_bytes_le()
-                    .try_into()
-                    .unwrap(),
-            )
-            .unwrap();
-            res[0].y = halo2_proofs::pairing::bn256::Fq::from_repr(
-                msm_host_affine_result[0]
-                    .y
-                    .to_bytes_le()
-                    .try_into()
-                    .unwrap(),
-            )
-            .unwrap();
-            unsafe { core::mem::transmute::<_, &[C]>(&res[..])[0] }
-        };
-        Ok(res)
-    }
-}
-
-pub fn _msm_with_groups<C: CurveAffine>(
-    device: &CudaDevice,
-    p_buf: &CudaDeviceBufRaw,
-    s_buf: &CudaDeviceBufRaw,
-    len: usize,
-    msm_groups: usize,
-) -> Result<C, Error> {
-    let threads = 128;
-    let windows = 32;
-    let windows_bits = 8;
-    let mut tmp = vec![C::Curve::identity(); msm_groups * windows];
-    let res_buf = device.alloc_device_buffer_from_slice(&tmp[..])?;
-    unsafe {
-        device.acitve_ctx()?;
-        let err = bn254_c::msm(
-            msm_groups as i32,
-            threads,
-            res_buf.ptr(),
-            p_buf.ptr(),
-            s_buf.ptr(),
-            len as i32,
-        );
-        to_result((), err, "fail to run msm")?;
-    }
-    device.copy_from_device_to_host(&mut tmp[..], &res_buf)?;
-
-    for i in 0..windows {
-        for j in 1..msm_groups {
-            tmp[i] = tmp[i] + tmp[i + j * windows];
-        }
-    }
-
-    let mut msm_res = tmp[windows - 1];
-    for i in 0..windows - 1 {
-        for _ in 0..windows_bits {
-            msm_res = msm_res + msm_res;
-        }
-        msm_res = msm_res + tmp[windows - 2 - i];
-    }
-
-    Ok(msm_res.to_affine())
 }
 
 pub const MAX_DEG: usize = 8;

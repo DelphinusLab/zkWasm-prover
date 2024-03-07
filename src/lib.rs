@@ -31,7 +31,7 @@ use rayon::slice::ParallelSlice as _;
 
 use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::intt_raw_async;
-use crate::cuda::bn254::msm;
+use crate::cuda::bn254::msm_single_buffer;
 use crate::cuda::bn254::ntt_prepare;
 use crate::device::cuda::CudaDevice;
 use crate::device::cuda::CudaDeviceBufRaw;
@@ -1276,7 +1276,7 @@ fn vanish_commit<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E
 
     // Commit
     device.copy_from_host_to_device(&s_buf, &random_poly[..])?;
-    let commitment = msm(&device, &g_buf, &s_buf, size)?;
+    let commitment = msm_single_buffer( &g_buf, &s_buf, size)?;
     transcript.write_point(commitment).unwrap();
 
     Ok(random_poly)

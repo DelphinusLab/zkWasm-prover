@@ -28,7 +28,7 @@ use crate::cuda::bn254::field_op_v2;
 use crate::cuda::bn254::field_op_v3;
 use crate::cuda::bn254::field_sub;
 use crate::cuda::bn254::intt_raw;
-use crate::cuda::bn254::msm;
+use crate::cuda::bn254::msm_single_buffer;
 use crate::cuda::bn254::ntt_prepare;
 use crate::cuda::bn254::ntt_raw;
 use crate::cuda::bn254::permutation_eval_h_l;
@@ -285,7 +285,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
                     device: device.clone(),
                 })
             };
-            let commitment = msm(&device, &g_buf, &s_buf, size)?;
+            let commitment = msm_single_buffer(&g_buf, &s_buf, size)?;
             transcript.write_point(commitment).unwrap();
         }
         end_timer!(timer);

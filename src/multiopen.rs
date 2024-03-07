@@ -444,10 +444,8 @@ pub mod shplonk {
             k,
         )?;
 
-        let commitments = msm_single_buffer::<C>(&g_buf, &hx_buf, size)?;
-        for commitment in commitments {
-            transcript.write_point(commitment).unwrap();
-        }
+        let commitment = msm_single_buffer::<C>(&g_buf, &hx_buf, size)?;
+        transcript.write_point(commitment).unwrap();
 
         let u: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
@@ -516,7 +514,7 @@ pub mod shplonk {
             None,
         )?;
         device.synchronize()?;
-        
+
         let z_diff_0_inv_buf = zt_eval_buf;
         device.copy_from_host_to_device(&z_diff_0_inv_buf, &[z_diff_0_inv][..])?;
         field_op_v3(
