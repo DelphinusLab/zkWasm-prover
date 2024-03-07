@@ -430,7 +430,9 @@ pub fn batch_msm_and_intt<C: CurveAffine>(
 
         let stream = CudaStream::create().unwrap();
         let value: &mut [_] = unsafe { core::mem::transmute::<_, _>(value) };
-        scalars.copy_from_host_async(&*value, &stream).unwrap();
+        //Use async would cause failure on multi-open;
+        //scalars.copy_from_host_async(value, &stream).unwrap();
+        scalars.copy_from_host(value).unwrap();
         let mut cfg = msm::MSMConfig::default();
         cfg.ctx.stream = &stream;
         cfg.is_async = true;
