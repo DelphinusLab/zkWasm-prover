@@ -290,17 +290,17 @@ __global__ void _field_op(
 
     if (l)
         if (l_c)
-            fl = l[(i + l_rot) & (n - 1)] * l_c[0];
+            fl = l[(i + l_rot) % n] * l_c[0];
         else
-            fl = l[(i + l_rot) & (n - 1)];
+            fl = l[(i + l_rot) % n];
     else
         fl = l_c[0];
 
     if (r)
         if (r_c)
-            fr = r[(i + r_rot) & (n - 1)] * r_c[0];
+            fr = r[(i + r_rot) % n] * r_c[0];
         else
-            fr = r[(i + r_rot) & (n - 1)];
+            fr = r[(i + r_rot) % n];
     else
         if (r_c)
             fr = r_c[0];
@@ -695,6 +695,7 @@ extern "C"
     {
         int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
+        assert(threads * blocks == n);
         _field_op<<<blocks, threads, 0, stream>>>(res, l, l_rot, l_c, r, r_rot, r_c, n, op);
         return cudaGetLastError();
     }

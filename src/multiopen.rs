@@ -184,7 +184,6 @@ pub mod shplonk {
     use halo2_proofs::poly::Rotation;
     use halo2_proofs::transcript::EncodedChallenge;
     use halo2_proofs::transcript::TranscriptWrite;
-    use rayon::iter::*;
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
@@ -297,35 +296,43 @@ pub mod shplonk {
         let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
         let v: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
-        let timer = start_timer!(|| "construct_intermediate_sets");
         let (rotation_sets, super_point_set) = construct_intermediate_sets(queries, eval_map);
-        end_timer!(timer);
 
-        let timer = start_timer!(|| "collect by rotation sets");
-        let rotation_sets: Vec<(&Vec<_>, Vec<_, _>, Vec<_>)> = rotation_sets
+        let rotation_sets: Vec<(_, _, Vec<_>)> = rotation_sets
             .iter()
-            .map(
-                |(queries, points)| -> DeviceResult<(&Vec<_>, Vec<_, _>, Vec<_>)> {
-                    use halo2_proofs::arithmetic::lagrange_interpolate;
+            .map(|(queries, points)| -> DeviceResult<(_, _, Vec<_>)> {
+                use halo2_proofs::arithmetic::lagrange_interpolate;
 
-                    let mut polys_acc = Vec::new_in(HugePageAllocator);
-                    polys_acc.resize(size, C::Scalar::zero());
+                let v_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
 
-                    if queries.len() == 1 {
-                        let evals_acc = lagrange_interpolate(&points[..], &queries[0].1[..]);
-                        polys_acc[..].clone_from_slice(&queries[0].0[..]);
-                        Ok((points, polys_acc, evals_acc))
-                    } else {
-                        let mut evals_acc = vec![];
-                        evals_acc.resize(points.len(), C::Scalar::zero());
+                if queries.len() == 1 {
+                    device.copy_from_host_to_device(&v_buf, &queries[0].0[..])?;
+                    let evals_acc = lagrange_interpolate(&points[..], &queries[0].1[..]);
+                    Ok((points, v_buf, evals_acc))
+                } else {
+                    let mut evals_acc = vec![];
+                    evals_acc.resize(points.len(), C::Scalar::zero());
 
-                        let v_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-                        let tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-                        let y_buf = device.alloc_device_buffer_from_slice(&[y][..])?;
+                    let mut tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+                    let y_buf = device.alloc_device_buffer_from_slice(&[y][..])?;
 
-                        // do streamly
-                        for (poly, evals) in queries.iter() {
-                            device.copy_from_host_to_device(&tmp_buf, &poly[..])?;
+                    let mut last_stream = None;
+                    let mut last_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+
+                    for (poly, evals) in queries.iter() {
+                        unsafe {
+                            let mut stream = std::mem::zeroed();
+                            let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+                            crate::device::cuda::to_result(
+                                (),
+                                err,
+                                "fail to run cudaStreamCreate",
+                            )?;
+                            device.copy_from_host_to_device_async(&tmp_buf, &poly[..], stream)?;
+                            if let Some(last_stream) = last_stream {
+                                cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                                cuda_runtime_sys::cudaStreamDestroy(last_stream);
+                            }
                             field_op_v3(
                                 device,
                                 &v_buf,
@@ -335,25 +342,23 @@ pub mod shplonk {
                                 None,
                                 size,
                                 FieldOp::Add,
-                                None,
+                                Some(stream),
                             )?;
-
-                            let evals = lagrange_interpolate(&points[..], &evals[..]);
-
-                            for i in 0..evals_acc.len() {
-                                evals_acc[i] = evals_acc[i] * y + evals[i];
-                            }
+                            last_stream = Some(stream);
+                            std::mem::swap(&mut last_buf, &mut tmp_buf);
                         }
-                        device.copy_from_device_to_host(&mut polys_acc[..], &v_buf)?;
-                        Ok((points, polys_acc, evals_acc))
-                    }
-                },
-            )
-            .collect::<DeviceResult<Vec<(&Vec<_>, Vec<_, _>, Vec<_>)>>>()?;
-        end_timer!(timer);
 
-        let timer = start_timer!(|| "compute hx");
-        let timer1 = start_timer!(|| "compute hx prepare");
+                        let evals = lagrange_interpolate(&points[..], &evals[..]);
+
+                        for i in 0..evals_acc.len() {
+                            evals_acc[i] = evals_acc[i] * y + evals[i];
+                        }
+                    }
+                    Ok((points, v_buf, evals_acc))
+                }
+            })
+            .collect::<DeviceResult<Vec<_>>>()?;
+
         let k = pk.vk.domain.k as usize;
         let (ntt_omegas_buf, ntt_pq_buf) =
             crate::ntt_prepare(&device, pk.get_vk().domain.get_omega(), k)?;
@@ -367,16 +372,21 @@ pub mod shplonk {
         let mut tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         let point_buf = device.alloc_device_buffer::<C::Scalar>(super_point_set.len())?;
         let v_buf = device.alloc_device_buffer_from_slice(&[v][..])?;
-        end_timer!(timer1);
 
-        for (points, poly, evals) in rotation_sets.iter() {
-            let mut evals = evals.clone();
-            for i in 0..evals.len() {
-                evals[i] = poly[i] - evals[i];
-            }
+        for (_, (points, poly, evals)) in rotation_sets.iter().enumerate() {
+            device.copy_from_device_to_device::<C::Scalar>(&poly_buf, 0, poly, 0, size)?;
+            device.copy_from_host_to_device(&point_buf, &evals[..])?;
 
-            device.copy_from_host_to_device(&poly_buf, &poly[..])?;
-            device.copy_from_host_to_device(&poly_buf, &evals[..])?;
+            crate::cuda::bn254::field_op_v2::<C::ScalarExt>(
+                &device,
+                &poly_buf,
+                Some(&poly),
+                None,
+                Some(&point_buf),
+                None,
+                evals.len(),
+                FieldOp::Sub,
+            )?;
 
             let diffs: Vec<C::Scalar> = super_point_set
                 .iter()
@@ -433,30 +443,28 @@ pub mod shplonk {
             &intt_divisor_buf,
             k,
         )?;
-        end_timer!(timer);
 
-        let timer = start_timer!(|| "msm for hx");
         let commitments = msm_single_buffer::<C>(&g_buf, &hx_buf, size)?;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }
-        end_timer!(timer);
 
         let u: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
-        let timer = start_timer!(|| "zt_eval");
         let zt_eval = super_point_set
             .iter()
             .map(|root| u - root)
             .reduce(|a, b| a * b)
             .unwrap();
-        end_timer!(timer);
 
-        let timer = start_timer!(|| "lx parts");
         let lx_parts = rotation_sets
-            .into_par_iter()
-            .map(|(points, mut poly, evals)| {
-                poly[0] -= eval_polynomial_st(&evals[..], u);
+            .into_iter()
+            .map(|(points, poly, evals)| -> DeviceResult<_> {
+                let eval = eval_polynomial_st(&evals[..], u);
+                let coeff =
+                    crate::cuda::bn254::pick_from_buf::<C::Scalar>(device, &poly, 0, 0, size)?
+                        - eval;
+                device.copy_from_host_to_device(&poly, &[coeff])?;
 
                 let diffs: Vec<C::Scalar> = super_point_set
                     .iter()
@@ -471,33 +479,29 @@ pub mod shplonk {
                     .map(|root| u - root)
                     .reduce(|a, b| a * b)
                     .unwrap();
-                (poly, z_i)
+                Ok((poly, z_i))
             })
-            .collect::<Vec<_>>();
-        end_timer!(timer);
+            .collect::<DeviceResult<Vec<_>>>()?;
 
         let z_diff_0_inv = lx_parts[0].1.invert().unwrap();
 
-        let timer = start_timer!(|| "lx parts merge");
         let fz_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         let z_buf = device.alloc_device_buffer::<C::Scalar>(1)?;
-        for (_, (poly, z_i)) in lx_parts.into_iter().enumerate() {
-            device.copy_from_host_to_device(&tmp_buf, &poly[..])?;
+        for (_, (poly_buf, z_i)) in lx_parts.into_iter().enumerate() {
             device.copy_from_host_to_device(&z_buf, &[z_i][..])?;
             field_op_v3(
                 device,
                 &fz_buf,
                 Some(&fz_buf),
                 Some(&v_buf),
-                Some(&tmp_buf),
+                Some(&poly_buf),
                 Some(&z_buf),
                 size,
                 FieldOp::Add,
                 None,
             )?;
         }
-        end_timer!(timer);
-        let timer = start_timer!(|| "hx merge");
+
         let zt_eval_buf = v_buf;
         device.copy_from_host_to_device(&zt_eval_buf, &[zt_eval][..])?;
         field_op_v3(
@@ -512,9 +516,7 @@ pub mod shplonk {
             None,
         )?;
         device.synchronize()?;
-        end_timer!(timer);
-
-        let timer = start_timer!(|| "hx z diff inv");
+        
         let z_diff_0_inv_buf = zt_eval_buf;
         device.copy_from_host_to_device(&z_diff_0_inv_buf, &[z_diff_0_inv][..])?;
         field_op_v3(
@@ -528,14 +530,12 @@ pub mod shplonk {
             FieldOp::UOp,
             None,
         )?;
-        end_timer!(timer);
 
         let mut lx = Vec::new_in(HugePageAllocator);
         lx.resize(size, C::Scalar::zero());
 
         device.copy_from_device_to_host(&mut lx[..], &fz_buf)?;
 
-        let timer = start_timer!(|| "xz div lx");
         {
             let z = u;
             let mut tmp = *lx.last().unwrap();
@@ -547,9 +547,8 @@ pub mod shplonk {
             }
             lx[0] = tmp;
         }
-        end_timer!(timer);
 
-        let timer = start_timer!(|| "msm for xz div lx");
+        let timer = start_timer!(|| "msm for lx");
         let commitments = batch_msm::<C>(&g_buf, s_buf, vec![&lx[..]], size)?;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
