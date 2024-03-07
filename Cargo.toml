@@ -10,7 +10,7 @@ build = "build.rs"
 icicle-cuda-runtime = { git = "https://github.com/ingonyama-zk/icicle.git", tag="v1.7.0" }
 icicle-core = { git = "https://github.com/ingonyama-zk/icicle.git", tag="v1.7.0" }
 icicle-bn254 = { git = "https://github.com/ingonyama-zk/icicle.git", tag="v1.7.0" }
-halo2_proofs = { git = "https://github.com/DelphinusLab/halo2-gpu-specific", default-features = true }
+halo2_proofs = { git = "https://github.com/DelphinusLab/halo2-gpu-specific", branch="zhangjunyu/para-synthesize", default-features = true }
 cuda-runtime-sys = "0.3.0-alpha.1"
 ark-std = { version = "0.4.0", features = ["print-trace"] }
 lazy_static = "1.4.0"
@@ -22,9 +22,6 @@ ec-gpu-gen = { git = "https://github.com/lanbones/ec-gpu", branch = "halo2-opt-v
 
 [build-dependencies]
 cc = "1.0.83"
-
-[patch."https://github.com/DelphinusLab/halo2-gpu-specific"]
-halo2_proofs = { path = "../halo2-gpu-specific/halo2_proofs", default-features = true }
 
 [features]
 default = ["halo2_proofs/cuda"]
