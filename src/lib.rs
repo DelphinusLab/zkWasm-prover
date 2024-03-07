@@ -51,7 +51,7 @@ mod eval_h;
 mod hugetlb;
 mod multiopen;
 
-const ADD_RANDOM: bool = false;
+const ADD_RANDOM: bool = true;
 
 pub fn prepare_advice_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
@@ -315,8 +315,47 @@ pub fn create_proof_from_advices<
     params: &Params<C>,
     pk: &ProvingKey<C>,
     instances: &[&[C::Scalar]],
+    advices: Arc<Vec<Vec<C::Scalar, HugePageAllocator>>>,
+    transcript: &mut T,
+) -> Result<(), Error> {
+    create_proof_from_advices_with_shplonk(params, pk, instances, advices, transcript)
+}
+
+pub fn create_proof_from_advices_with_gwc<
+    C: CurveAffine,
+    E: EncodedChallenge<C>,
+    T: TranscriptWrite<C, E>,
+>(
+    params: &Params<C>,
+    pk: &ProvingKey<C>,
+    instances: &[&[C::Scalar]],
+    advices: Arc<Vec<Vec<C::Scalar, HugePageAllocator>>>,
+    transcript: &mut T,
+) -> Result<(), Error> {
+    _create_proof_from_advices(params, pk, instances, advices, transcript, true)
+}
+
+pub fn create_proof_from_advices_with_shplonk<
+    C: CurveAffine,
+    E: EncodedChallenge<C>,
+    T: TranscriptWrite<C, E>,
+>(
+    params: &Params<C>,
+    pk: &ProvingKey<C>,
+    instances: &[&[C::Scalar]],
+    advices: Arc<Vec<Vec<C::Scalar, HugePageAllocator>>>,
+    transcript: &mut T,
+) -> Result<(), Error> {
+    _create_proof_from_advices(params, pk, instances, advices, transcript, false)
+}
+
+fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
+    params: &Params<C>,
+    pk: &ProvingKey<C>,
+    instances: &[&[C::Scalar]],
     mut advices: Arc<Vec<Vec<C::Scalar, HugePageAllocator>>>,
     transcript: &mut T,
+    use_gwc: bool,
 ) -> Result<(), Error> {
     thread::scope(|s| {
         let k = pk.get_vk().domain.k() as usize;
@@ -1180,17 +1219,28 @@ pub fn create_proof_from_advices<
                         poly: &random_poly,
                     })),
             );
-
-        shplonk::multiopen(
-            &pk,
-            &device,
-            &g_buf,
-            queries,
-            size,
-            [&s_buf, &s_buf_ext],
-            eval_map,
-            transcript,
-        )?;
+        if use_gwc {
+            gwc::multiopen(
+                &device,
+                &g_buf,
+                queries,
+                size,
+                [&s_buf, &s_buf_ext],
+                eval_map,
+                transcript,
+            )?;
+        } else {
+            shplonk::multiopen(
+                &pk,
+                &device,
+                &g_buf,
+                queries,
+                size,
+                [&s_buf, &s_buf_ext],
+                eval_map,
+                transcript,
+            )?;
+        }
         end_timer!(timer);
 
         Ok(())
