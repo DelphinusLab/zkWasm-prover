@@ -234,8 +234,6 @@ pub fn msm_single_buffer<C: CurveAffine>(
         if res.is_ok() {
             return res;
         }
-
-        println!("failed to run msm_single_buffer, retrying ...");
     }
 
     unreachable!()
@@ -294,8 +292,6 @@ pub fn batch_msm<C: CurveAffine>(
         if res.is_ok() {
             return res;
         }
-
-        println!("failed to run batch_msm, retrying ...");
     }
 
     unreachable!()
