@@ -541,8 +541,8 @@ dependencies = [
 
 [[package]]
 name = "icicle-bn254"
-version = "1.4.0"
-source = "git+https://github.com/ingonyama-zk/icicle.git?tag=v1.4.0#15a63cc5496ddd1b97885459eb3b31a439f9e1a4"
+version = "1.7.0"
+source = "git+https://github.com/ingonyama-zk/icicle.git?tag=v1.7.0#1abd2ef9c9b4e387ded2333b18e22e95d90f6653"
 dependencies = [
  "cmake",
  "icicle-core",
@@ -551,8 +551,8 @@ dependencies = [
 
 [[package]]
 name = "icicle-core"
-version = "1.4.0"
-source = "git+https://github.com/ingonyama-zk/icicle.git?tag=v1.4.0#15a63cc5496ddd1b97885459eb3b31a439f9e1a4"
+version = "1.7.0"
+source = "git+https://github.com/ingonyama-zk/icicle.git?tag=v1.7.0#1abd2ef9c9b4e387ded2333b18e22e95d90f6653"
 dependencies = [
  "icicle-cuda-runtime",
  "rayon",
@@ -560,8 +560,8 @@ dependencies = [
 
 [[package]]
 name = "icicle-cuda-runtime"
-version = "1.4.0"
-source = "git+https://github.com/ingonyama-zk/icicle.git?tag=v1.4.0#15a63cc5496ddd1b97885459eb3b31a439f9e1a4"
+version = "1.7.0"
+source = "git+https://github.com/ingonyama-zk/icicle.git?tag=v1.7.0#1abd2ef9c9b4e387ded2333b18e22e95d90f6653"
 dependencies = [
  "bindgen",
  "bitflags 1.3.2",

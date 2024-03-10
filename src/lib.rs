@@ -387,6 +387,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let device = CudaDevice::get_device(0).unwrap();
 
+        device.synchronize()?;
+
         // add random value
         if ADD_RANDOM {
             let named = &pk.vk.cs.named_advices;
