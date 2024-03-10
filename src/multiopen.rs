@@ -354,6 +354,12 @@ pub mod shplonk {
                             evals_acc[i] = evals_acc[i] * y + evals[i];
                         }
                     }
+                    unsafe {
+                        if let Some(last_stream) = last_stream {
+                            cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                            cuda_runtime_sys::cudaStreamDestroy(last_stream);
+                        }
+                    }
                     Ok((points, v_buf, evals_acc))
                 }
             })
