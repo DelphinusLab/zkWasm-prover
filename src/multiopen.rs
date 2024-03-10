@@ -173,9 +173,6 @@ pub(crate) mod gwc {
 }
 
 pub mod shplonk {
-    use ark_std::end_timer;
-    use ark_std::start_timer;
-
     use halo2_proofs::arithmetic::eval_polynomial_st;
     use halo2_proofs::arithmetic::CurveAffine;
     use halo2_proofs::arithmetic::Field;
