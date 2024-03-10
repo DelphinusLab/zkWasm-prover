@@ -227,7 +227,25 @@ pub fn msm_single_buffer<C: CurveAffine>(
     p_buf: &CudaDeviceBufRaw,
     s_buf: &CudaDeviceBufRaw,
     len: usize,
-) -> Result<C, Error> {
+) -> DeviceResult<C> {
+    for _ in 0..100 {
+        let res = msm_single_buffer_core(p_buf, s_buf, len);
+
+        if res.is_ok() {
+            return res;
+        }
+
+        println!("failed to run msm_single_buffer, retrying ...");
+    }
+
+    unreachable!()
+}
+
+fn msm_single_buffer_core<C: CurveAffine>(
+    p_buf: &CudaDeviceBufRaw,
+    s_buf: &CudaDeviceBufRaw,
+    len: usize,
+) -> DeviceResult<C> {
     unsafe {
         // Ensure s_buf and p_buf are ready
         cudaDeviceSynchronize();
@@ -259,12 +277,31 @@ pub fn msm_single_buffer<C: CurveAffine>(
     cfg.are_points_montgomery_form = true;
     msm::msm(&scalars, &points, &cfg, &mut msm_results).unwrap();
 
-    let res = copy_and_to_affine(&msm_results);
+    let res = copy_and_to_affine(&msm_results)?;
 
     Ok(res)
 }
 
 pub fn batch_msm<C: CurveAffine>(
+    p_buf: &CudaDeviceBufRaw,
+    s_buf: [&CudaDeviceBufRaw; 2],
+    values: Vec<&[C::Scalar]>,
+    len: usize,
+) -> Result<Vec<C>, Error> {
+    for _ in 0..100 {
+        let res = batch_msm_core(p_buf, s_buf, values.clone(), len);
+
+        if res.is_ok() {
+            return res;
+        }
+
+        println!("failed to run batch_msm, retrying ...");
+    }
+
+    unreachable!()
+}
+
+fn batch_msm_core<C: CurveAffine>(
     p_buf: &CudaDeviceBufRaw,
     s_buf: [&CudaDeviceBufRaw; 2],
     values: Vec<&[C::Scalar]>,
@@ -293,7 +330,7 @@ pub fn batch_msm<C: CurveAffine>(
 
     let msm_counts = values.len();
 
-    for (idx, value) in values.into_iter().enumerate() {
+    for (idx, value) in values.iter().enumerate() {
         let mut scalars = {
             unsafe {
                 ManuallyDrop::new(HostOrDeviceSlice::Device(
@@ -303,7 +340,7 @@ pub fn batch_msm<C: CurveAffine>(
             }
         };
         let stream = CudaStream::create().unwrap();
-        let value = unsafe { core::mem::transmute::<_, _>(value) };
+        let value = unsafe { core::mem::transmute::<_, _>(*value) };
         //Use async would cause failure on multi-open;
         //scalars.copy_from_host_async(value, &stream).unwrap();
         scalars.copy_from_host(value).unwrap();
@@ -317,8 +354,8 @@ pub fn batch_msm<C: CurveAffine>(
         if let Some(last_stream) = last_stream {
             let last_idx = 1 - (idx & 1);
             last_stream.synchronize().unwrap();
-            let res = copy_and_to_affine(&msm_results[last_idx]);
-            
+            let res = copy_and_to_affine(&msm_results[last_idx])?;
+
             res_vec.push(res);
         }
         last_stream = Some(stream);
@@ -327,7 +364,7 @@ pub fn batch_msm<C: CurveAffine>(
     if let Some(last_stream) = last_stream {
         let last_idx = 1 - (msm_counts & 1);
         last_stream.synchronize().unwrap();
-        let res = copy_and_to_affine(&msm_results[last_idx]);
+        let res = copy_and_to_affine(&msm_results[last_idx])?;
         res_vec.push(res);
     }
 
@@ -336,18 +373,21 @@ pub fn batch_msm<C: CurveAffine>(
 
 fn copy_and_to_affine<C: CurveAffine>(
     msm_result: &HostOrDeviceSlice<'_, Projective<CurveCfg>>,
-) -> C {
-    let retry_limit = 10000;
+) -> DeviceResult<C> {
+    let retry_limit = 3;
 
-    for _ in 0..retry_limit {
+    for i in 0..retry_limit {
         let mut msm_host_result = [G1Projective::zero()];
         msm_result.copy_to_host(&mut msm_host_result[..]).unwrap();
         let res = to_affine(&msm_host_result[0]);
         if res.is_some() {
-            return res.unwrap();
+            return Ok(res.unwrap());
         }
+
+        println!("bad msm result at round {} is {:?}", i, msm_host_result);
     }
-    unreachable!()
+
+    Err(Error::MsmError)
 }
 
 // msm sometimes return bad point, retry to make it correct
@@ -373,98 +413,6 @@ fn to_affine<C: CurveAffine>(g: &icicle_bn254::curve::G1Projective) -> Option<C>
         let z_inv = z.invert().unwrap();
         C::from_xy(x * z_inv, y * z_inv).into()
     }
-}
-
-pub fn batch_msm_and_intt<C: CurveAffine>(
-    device: &CudaDevice,
-    pq_buf: &CudaDeviceBufRaw,
-    omegas_buf: &CudaDeviceBufRaw,
-    divisor_buf: &CudaDeviceBufRaw,
-    p_buf: &CudaDeviceBufRaw,
-    s_buf: [&mut CudaDeviceBufRaw; 2],
-    tmp_buf: [&mut CudaDeviceBufRaw; 2],
-    values: Vec<&mut [C::Scalar]>,
-    k: usize,
-) -> Result<Vec<C>, Error> {
-    unsafe {
-        // Ensure s_buf and p_buf are ready
-        cudaDeviceSynchronize();
-    }
-
-    let len = 1 << k;
-
-    let mut res_vec = vec![];
-    let mut last_stream: Option<CudaStream> = None;
-    let mut msm_results = [
-        HostOrDeviceSlice::cuda_malloc(1).unwrap(),
-        HostOrDeviceSlice::cuda_malloc(1).unwrap(),
-    ];
-
-    let points = {
-        unsafe {
-            ManuallyDrop::new(HostOrDeviceSlice::Device(
-                std::slice::from_raw_parts_mut(p_buf.ptr() as _, len),
-                0,
-            ))
-        }
-    };
-
-    let msm_counts = values.len();
-
-    for (idx, value) in values.into_iter().enumerate() {
-        let mut scalars = {
-            unsafe {
-                ManuallyDrop::new(HostOrDeviceSlice::Device(
-                    std::slice::from_raw_parts_mut(s_buf[idx & 1].ptr() as _, len),
-                    0,
-                ))
-            }
-        };
-
-        let stream = CudaStream::create().unwrap();
-        let value: &mut [_] = unsafe { core::mem::transmute::<_, _>(value) };
-        //Use async would cause failure on multi-open;
-        //scalars.copy_from_host_async(value, &stream).unwrap();
-        scalars.copy_from_host(value).unwrap();
-        let mut cfg = msm::MSMConfig::default();
-        cfg.ctx.stream = &stream;
-        cfg.is_async = true;
-        cfg.are_scalars_montgomery_form = true;
-        cfg.are_points_montgomery_form = true;
-        msm::msm(&scalars, &points, &cfg, &mut msm_results[idx & 1]).unwrap();
-
-        intt_raw_async(
-            device,
-            s_buf[idx & 1],
-            tmp_buf[idx & 1],
-            pq_buf,
-            omegas_buf,
-            divisor_buf,
-            k,
-            Some(unsafe { *(&stream as *const _ as *const _) }),
-        )?;
-        device.copy_from_device_to_host_async(value, &s_buf[idx & 1], unsafe {
-            *(&stream as *const _ as *const _)
-        })?;
-
-        if let Some(stream) = last_stream {
-            let last_idx = 1 - (idx & 1);
-            stream.synchronize().unwrap();
-            let res = copy_and_to_affine(&msm_results[last_idx]);
-            res_vec.push(res);
-        }
-        last_stream = Some(stream);
-    }
-
-    if let Some(stream) = last_stream {
-        let last_idx = 1 - (msm_counts & 1);
-        stream.synchronize().unwrap();
-
-        let res = copy_and_to_affine(&msm_results[last_idx]);
-        res_vec.push(res);
-    }
-
-    Ok(res_vec)
 }
 
 pub const MAX_DEG: usize = 8;

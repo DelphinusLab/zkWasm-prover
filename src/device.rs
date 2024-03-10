@@ -3,6 +3,7 @@ pub mod cuda;
 #[derive(Debug)]
 pub enum Error {
     DeviceError(String),
+    MsmError,
 }
 
 pub type DeviceResult<T> = Result<T, Error>;
