@@ -339,7 +339,7 @@ pub fn create_proof_from_advices<
     advices: Arc<Vec<Vec<C::Scalar, HugePageAllocator>>>,
     transcript: &mut T,
 ) -> Result<(), Error> {
-    create_proof_from_advices_with_shplonk(params, pk, instances, advices, transcript)
+    create_proof_from_advices_with_gwc(params, pk, instances, advices, transcript)
 }
 
 pub fn create_proof_from_advices_with_gwc<
