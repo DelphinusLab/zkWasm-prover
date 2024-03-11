@@ -389,6 +389,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         pk.vk.hash_into(transcript).unwrap();
 
+        assert!(instances.len() == pk.get_vk().cs.num_instance_columns);
+
         let mut instances = Arc::new(
             instances
                 .par_iter()
