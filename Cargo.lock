@@ -493,6 +493,7 @@ dependencies = [
 [[package]]
 name = "halo2_proofs"
 version = "0.1.0-beta.1"
+source = "git+https://github.com/DelphinusLab/halo2-gpu-specific#9a81f601607bdc3ff3360a9ad66885c9796f487b"
 dependencies = [
  "ark-std 0.4.0",
  "blake2b_simd",
@@ -1101,16 +1102,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "thread_local"
-version = "1.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fdd6f064ccff2d6567adcb3873ca630700f00b5ad3f060c25b5dcfd9a4ce152"
-dependencies = [
- "cfg-if 1.0.0",
- "once_cell",
-]
-
-[[package]]
 name = "typenum"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1338,7 +1329,6 @@ dependencies = [
  "ark-std 0.4.0",
  "cc",
  "cuda-runtime-sys",
- "ec-gpu-gen",
  "halo2_proofs",
  "icicle-bn254",
  "icicle-core",
@@ -1347,5 +1337,4 @@ dependencies = [
  "libc",
  "rand",
  "rayon",
- "thread_local",
 ]
