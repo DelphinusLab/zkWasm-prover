@@ -72,6 +72,7 @@ impl<F: FieldExt> EvalHContext<F> {
 
 pub(crate) fn analyze_expr_tree<F: FieldExt>(
     expr: &ProveExpression<F>,
+    k: usize,
 ) -> Vec<Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>> {
     let tree = expr.clone().flatten();
     let tree = tree
@@ -89,7 +90,7 @@ pub(crate) fn analyze_expr_tree<F: FieldExt>(
         })
         .collect::<Vec<_, _>>();
 
-    let limit = 20;
+    let limit = if k < 23 { 20 } else { 10 };
     let mut v = HashSet::new();
 
     let mut expr_group = vec![];
@@ -390,7 +391,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
         println!("Multi-GPU detected, please set CUDA_VISIBLE_DEVICES to use one GPU");
         assert!(false);
     }
-    let exprs = analyze_expr_tree(&pk.ev.gpu_gates_expr[0]);
+    let exprs = analyze_expr_tree(&pk.ev.gpu_gates_expr[0], k);
     let h_buf =
         evaluate_prove_expr_with_async_ntt(device, &exprs, fixed, advice, instance, &mut ctx)?;
     end_timer!(timer);
