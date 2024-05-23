@@ -39,6 +39,7 @@ use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
 use crate::hugetlb::HugePageAllocator;
 use crate::multiopen::gwc;
 use crate::multiopen::lookup_open;
+use crate::multiopen::shuffle_open;
 use crate::multiopen::permutation_product_open;
 use crate::multiopen::shplonk;
 use crate::multiopen::ProverQuery;
@@ -896,6 +897,148 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let mut permutation_products = permutation_products_handler.join().unwrap();
         end_timer!(timer);
 
+
+        let timer = start_timer!(|| format!(
+            "product shuffles total={}",
+            (&pk).vk.cs.shuffles.0.len()
+        ));
+
+        let sub_pk = pk.clone();
+        let sub_advices = advices.clone();
+        let sub_instance = instances.clone();
+        let shuffle_products_handler = s.spawn(move || {
+            let pk = sub_pk;
+            let advices = sub_advices;
+            let instances = sub_instance;
+
+            let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+            let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+            let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+
+            let shuffle_groups = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
+            println!("product shuffles groups={}", shuffle_groups.len());
+
+            let mut buffer_groups = shuffle_groups.iter().map(|group|{
+                group.0.iter().map(|_|{
+                    let mut input_buffer = Vec::new_in(HugePageAllocator);
+                    input_buffer.resize(size, C::Scalar::zero());
+                    let mut shuffle_buffer = Vec::new_in(HugePageAllocator);
+                    shuffle_buffer.resize(size, C::Scalar::zero());
+                    (input_buffer, shuffle_buffer)
+                }).collect::<Vec<_>>()
+            }).collect::<Vec<_>>();
+
+            let mut pure_expressions = vec![];
+            let mut tuple_expressions = vec![];
+
+            shuffle_groups.iter().zip(buffer_groups.iter_mut())
+                .for_each(|(group,buffers)|{
+                group.0.iter().zip(buffers.iter_mut()).for_each(|(elements,buffer)|{
+                    //TODO correct the pointer in the closure used by outside
+                    // let expr_clarify = |expr: &[Expression<_>], buff:&mut [_] |{
+                    //     if expr.len() ==1 && is_expression_pure_unit(&expr[0]){
+                    //         pure_expressions.push((&expr[0],buff))
+                    //     }else{
+                    //         tuple_expressions.push((expr,buff))
+                    //     }
+                    // };
+                    // expr_clarify(&elements.input_expressions,&mut buffer.0[..]);
+                    // expr_clarify(&elements.shuffle_expressions,&mut buffer.1[..]);
+
+                    if elements.input_expressions.len() ==1 && is_expression_pure_unit(&elements.input_expressions[0]){
+                        pure_expressions.push((&elements.input_expressions[0],&mut buffer.0[..]))
+                    }else {
+                        tuple_expressions.push((&elements.input_expressions[..],&mut buffer.0[..]))
+                    }
+                    if elements.shuffle_expressions.len() ==1 && is_expression_pure_unit(&elements.input_expressions[0]){
+                        pure_expressions.push((&elements.shuffle_expressions[0],&mut buffer.1[..]))
+                    }else {
+                        tuple_expressions.push((&elements.shuffle_expressions[..],&mut buffer.1[..]))
+                    }
+
+                })
+            });
+
+            let f = |expr: &Expression<_>, target: &mut [_]| {
+                if let Some(v) = expr.is_constant() {
+                    target.fill(v);
+                } else if let Some(idx) = expr.is_pure_fixed() {
+                    target.clone_from_slice(&fixed_ref[idx][..]);
+                } else if let Some(idx) = expr.is_pure_instance() {
+                    target.clone_from_slice(&instance_ref[idx][..]);
+                } else if let Some(idx) = expr.is_pure_advice() {
+                    target.clone_from_slice(&advice_ref[idx][..]);
+                } else {
+                    unreachable!()
+                }
+            };
+
+            pure_expressions.into_par_iter().for_each(|(expr,buffer)|{
+                f(expr,buffer)
+            });
+            tuple_expressions.into_par_iter().for_each(|(expr,buffer)|{
+                evaluate_exprs(
+                    expr,
+                    size,
+                    1,
+                    fixed_ref,
+                    advice_ref,
+                    instance_ref,
+                    theta,
+                    buffer,
+                )
+            });
+
+             let mut p_z = buffer_groups.par_iter().map(|group|{
+                 let beta_pows: Vec<C::Scalar> = (0..group.len())
+                     .map(|i| beta.pow_vartime([1 + i as u64, 0, 0, 0]))
+                     .collect();
+
+                 let mut modified_values = Vec::new_in(HugePageAllocator);
+                 modified_values.resize(size, C::Scalar::one());
+                 let chunk_size = size>>2;
+                 group.iter().zip(beta_pows.iter()).for_each(|(e,beta_pow_i)|{
+                     modified_values.par_chunks_mut(chunk_size).zip(e.1.par_chunks(chunk_size)).for_each(|(values,shuffles)|{
+                         for i in 0..chunk_size{
+                             values[i] *= &(shuffles[i]+beta_pow_i);
+                         }
+                     })
+                 });
+                 modified_values.iter_mut().batch_invert();
+                 group.iter().zip(beta_pows.iter()).for_each(|(e,beta_pow_i)|{
+                     modified_values.par_chunks_mut(chunk_size).zip(e.0.par_chunks(chunk_size)).for_each(|(values,inputs)|{
+                         for i in 0..chunk_size{
+                             values[i] *= &(inputs[i]+beta_pow_i);
+                         }
+                     })
+                 });
+                 modified_values
+             }).collect::<Vec<_>>();
+            //todo parallel
+            for z in p_z.iter_mut() {
+                let mut tmp = C::Scalar::one();
+                for i in 0..size {
+                    std::mem::swap(&mut tmp, &mut z[i]);
+                    tmp = tmp * z[i];
+                }
+
+                if ADD_RANDOM {
+                    for v in z[unusable_rows_start + 1..].iter_mut() {
+                        *v = C::Scalar::random(&mut OsRng);
+                    }
+                } else {
+                    for v in z[unusable_rows_start + 1..].iter_mut() {
+                        *v = C::Scalar::zero();
+                    }
+                }
+
+            }
+            p_z
+        });
+        end_timer!(timer);
+
+
+
         let timer = start_timer!(|| "permutation z msm and intt");
         let permutation_commitments = crate::cuda::bn254::batch_msm::<C>(
             &g_lagrange_buf,
@@ -922,11 +1065,45 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         }
         end_timer!(timer);
 
+        let timer = start_timer!(|| "wait shuffle_products");
+        let mut shuffle_products = shuffle_products_handler.join().unwrap();
+        end_timer!(timer);
+
+        let timer = start_timer!(|| "shuffle z msm and intt");
+        let shuffle_commitments = crate::cuda::bn254::batch_msm::<C>(
+            &g_lagrange_buf,
+            [&s_buf, &t_buf],
+            shuffle_products
+                .iter()
+                .map(|x| &x[..])
+                .collect::<Vec<_>>(),
+            size,
+        )?;
+
+        for values in shuffle_products.iter_mut() {
+            device.copy_from_host_to_device(&s_buf, &values[..])?;
+            intt_raw(
+                &device,
+                &mut s_buf,
+                &mut t_buf,
+                &intt_pq_buf,
+                &intt_omegas_buf,
+                &intt_divisor_buf,
+                k,
+            )?;
+            device.copy_from_device_to_host(&mut values[..], &s_buf)?;
+        }
+        end_timer!(timer);
+
         for commitment in permutation_commitments {
             transcript.write_point(commitment).unwrap();
         }
 
         for (_i, commitment) in lookup_z_commitments.into_iter().enumerate() {
+            transcript.write_point(commitment).unwrap();
+        }
+
+        for commitment in shuffle_commitments {
             transcript.write_point(commitment).unwrap();
         }
 
@@ -1004,6 +1181,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .iter()
                 .map(|(v0, v1, v2, v3, v4)| (&v0[..], &v1[..], &v2[..], &v3[..], &v4[..]))
                 .collect::<Vec<_>>()[..],
+            &shuffle_products.iter().map(|x|&x[..])
+                .collect::<Vec<_>>()[..],
             y,
             beta,
             gamma,
@@ -1057,6 +1236,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             inputs.push((&permuted_input, x));
             inputs.push((&permuted_input, x_inv));
             inputs.push((&permuted_table, x));
+        }
+        for z in shuffle_products.iter() {
+            inputs.push((&z,x));
+            inputs.push((&z,x_next));
         }
 
         let timer = start_timer!(|| format!("compute eval {}", inputs.len()));
@@ -1114,13 +1297,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let advices_arr = [advices];
         let permutation_products_arr = [permutation_products];
         let lookups_arr = [lookups];
+        let shuffles_arr = [shuffle_products];
 
         let queries = instance_arr
             .iter()
             .zip(advices_arr.iter())
             .zip(permutation_products_arr.iter())
             .zip(lookups_arr.iter())
-            .flat_map(|(((instance, advice), permutation), lookups)| {
+            .zip(shuffles_arr.iter())
+            .flat_map(|((((instance, advice), permutation), lookups), shuffles)| {
                 iter::empty()
                     .chain(
                         (&pk)
@@ -1154,6 +1339,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                 lookup_open(&pk, (&lookup.0[..], &lookup.1[..], &lookup.4[..]), x)
                             })
                             .into_iter(),
+                    )
+                    .chain(
+                        shuffles.iter().flat_map(|shuffle|{
+                            shuffle_open(&pk,&shuffle[..],x)
+                        }).into_iter(),
                     )
             })
             .chain(

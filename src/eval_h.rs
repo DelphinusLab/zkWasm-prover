@@ -39,6 +39,7 @@ use crate::cuda::bn254::FieldOp;
 use crate::cuda::bn254_c;
 use crate::cuda::bn254_c::field_op_batch_mul_sum;
 use crate::cuda::bn254_c::lookup_eval_h;
+use crate::cuda::bn254_c::shuffle_eval_h;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
@@ -133,6 +134,7 @@ pub fn _export_evaluate_h_gates<C: CurveAffine>(
         &[C::Scalar],
         &[C::Scalar],
     )],
+    shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
     beta: C::Scalar,
     gamma: C::Scalar,
@@ -158,6 +160,7 @@ pub fn _export_evaluate_h_gates<C: CurveAffine>(
         instance,
         permutation_products,
         lookup_products,
+        shuffle_products,
         y,
         beta,
         gamma,
@@ -189,6 +192,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
         &[C::Scalar],
         &[C::Scalar],
     )],
+    shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
     beta: C::Scalar,
     gamma: C::Scalar,
@@ -211,6 +215,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
         instance,
         permutation_products,
         lookup_products,
+        shuffle_products,
         y,
         beta,
         gamma,
@@ -351,6 +356,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
         &[C::Scalar],
         &[C::Scalar],
     )],
+    shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
     beta: C::Scalar,
     gamma: C::Scalar,
@@ -642,6 +648,61 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     }
     end_timer!(timer);
 
+    let timer = start_timer!(|| "evaluate_h shuffle");
+    let shuffle_group = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
+    for (_i, (shuffle,z)) in shuffle_group
+        .iter()
+        .zip(shuffle_products.iter())
+        .enumerate()
+    {
+
+        let (input_expressions,table_expressions) = shuffle.0.iter().map(|x|{
+            (x.input_expressions.clone(),x.shuffle_expressions.clone())
+        }).collect::<Vec<_>>().into_iter().unzip();
+
+        let [e1, e2] = flatten_shuffle_expression(
+            &input_expressions,
+            &table_expressions,
+            beta,
+            theta,
+        );
+
+        let input_buf = evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx)?;
+        let table_buf = evaluate_prove_expr(device, &vec![e2], fixed, advice, instance, &mut ctx)?;
+
+        let (z_buf, tmp0, stream0) = do_extended_ntt_v2_async(device, &mut ctx, z)?;
+
+        unsafe {
+            cuda_runtime_sys::cudaStreamSynchronize(stream0);
+            cuda_runtime_sys::cudaStreamDestroy(stream0);
+            ctx.extended_allocator.push(tmp0);
+        }
+
+        unsafe {
+            let err = shuffle_eval_h(
+                h_buf.ptr(),
+                input_buf.ptr(),
+                table_buf.ptr(),
+                z_buf.ptr(),
+                l0_buf.ptr(),
+                l_last_buf.ptr(),
+                l_active_buf.ptr(),
+                y_buf.ptr(),
+                1 << (extended_k - k),
+                ctx.extended_size as i32,
+            );
+
+            to_result((), err, "fail to run field_op_batch_mul_sum")?;
+            device.synchronize()?;
+        }
+
+        ctx.extended_allocator.push(input_buf);
+        ctx.extended_allocator.push(table_buf);
+        ctx.extended_allocator.push(z_buf);
+    }
+    end_timer!(timer);
+
+
     Ok((ctx, h_buf))
 }
 
@@ -736,6 +797,79 @@ fn flatten_lookup_expression<F: FieldExt>(
 
     [expr_input, expr_table]
 }
+
+fn flatten_shuffle_expression<F: FieldExt>(
+    inputs: &Vec<Vec<Expression<F>>>,
+    tables: &Vec<Vec<Expression<F>>>,
+    beta: F,
+    theta: F,
+) -> [Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>; 2] {
+
+    let construct_expr_input = |inputs :&Vec<Vec<Expression<F>>>| {
+        let expr_inputs = inputs.iter().map(|input| {
+            let mut expr_input = ProveExpression::<F>::from_expr(&input[0]);
+            for input in input.iter().skip(1) {
+                expr_input = ProveExpression::Scale(
+                    Box::new(expr_input),
+                    BTreeMap::from_iter([(0, theta)].into_iter()),
+                );
+                expr_input = ProveExpression::Op(
+                    Box::new(expr_input),
+                    Box::new(ProveExpression::<F>::from_expr(input)),
+                    Bop::Sum,
+                );
+            }
+            expr_input
+        }).collect::<Vec<_>>();
+
+
+        let mut expr_input = ProveExpression::Op(
+            Box::new(expr_inputs[0].clone()),
+            Box::new(ProveExpression::Y(BTreeMap::from_iter(
+                [(0, beta)].into_iter(),
+            ))),
+            Bop::Sum,
+        );
+        for (i, input) in expr_inputs.iter().enumerate().skip(1) {
+            let beta_pow_i =
+                beta.pow_vartime([1 + i as u64]);
+            let next_input = ProveExpression::Op(
+                Box::new(input.clone()),
+                Box::new(ProveExpression::Y(BTreeMap::from_iter(
+                    [(0, beta_pow_i)].into_iter(),
+                ))),
+                Bop::Sum,
+            );
+            expr_input = ProveExpression::Op(
+                Box::new(expr_input.clone()),
+                Box::new(next_input.clone()),
+                Bop::Product,
+            );
+        }
+
+        let expr_input = expr_input
+            .flatten()
+            .into_iter()
+            .map(|(us, v)| {
+                let mut map = BTreeMap::new();
+                for mut u in us {
+                    if let Some(c) = map.get_mut(&mut u) {
+                        *c = *c + 1;
+                    } else {
+                        map.insert(u.clone(), 1);
+                    }
+                }
+                (map, v.clone())
+            })
+            .collect::<Vec<_, _>>();
+        expr_input
+    };
+    let expr_input = construct_expr_input(inputs);
+    let expr_table = construct_expr_input(tables);
+
+    [expr_input, expr_table]
+}
+
 
 fn do_extended_ntt_v2<F: FieldExt>(
     device: &CudaDevice,
