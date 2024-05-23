@@ -635,3 +635,25 @@ pub(crate) fn lookup_open<'a, C: CurveAffine>(
             poly: z,
         }))
 }
+
+pub(crate) fn shuffle_open<'a, C: CurveAffine>(
+    pk: &'a ProvingKey<C>,
+    shuffle_z: &'a [C::Scalar],
+    x: C::Scalar,
+) -> impl Iterator<Item = ProverQuery<'a, C::Scalar>> + Clone {
+    let x_next = pk.vk.domain.rotate_omega(x, Rotation::next());
+
+    iter::empty()
+        // Open lookup product commitments at x
+        .chain(Some(ProverQuery {
+            point: x,
+            rotation: Rotation::cur(),
+            poly: shuffle_z,
+        }))
+        // Open lookup product commitments at x_next
+        .chain(Some(ProverQuery {
+            point: x_next,
+            rotation: Rotation::next(),
+            poly: shuffle_z,
+        }))
+}

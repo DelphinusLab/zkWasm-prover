@@ -24,3 +24,5 @@ cc = "1.0.83"
 [features]
 default = ["halo2_proofs/cuda"]
 hugetlb = []
+[patch."https://github.com/DelphinusLab/halo2-gpu-specific"]
+halo2_proofs = { git = "https://github.com/mooreland/halo2-gpu-specific", branch = "add_shuffle"}
