@@ -897,10 +897,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let mut permutation_products = permutation_products_handler.join().unwrap();
         end_timer!(timer);
 
-
+        let shuffle_groups = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
         let timer = start_timer!(|| format!(
-            "product shuffles total={}",
-            (&pk).vk.cs.shuffles.0.len()
+            "product shuffles total={},group={}",
+            (&pk).vk.cs.shuffles.0.len(),shuffle_groups.len()
         ));
 
         let sub_pk = pk.clone();
@@ -915,11 +915,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
             let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
 
-            let shuffle_groups = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
-            println!("product shuffles groups={}", shuffle_groups.len());
-
-            let mut buffer_groups = shuffle_groups.iter().map(|group|{
-                group.0.iter().map(|_|{
+            let mut buffer_groups = shuffle_groups.par_iter().map(|group|{
+                group.0.par_iter().map(|_|{
                     let mut input_buffer = Vec::new_in(HugePageAllocator);
                     input_buffer.resize(size, C::Scalar::zero());
                     let mut shuffle_buffer = Vec::new_in(HugePageAllocator);
@@ -927,37 +924,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     (input_buffer, shuffle_buffer)
                 }).collect::<Vec<_>>()
             }).collect::<Vec<_>>();
-
-            let mut pure_expressions = vec![];
-            let mut tuple_expressions = vec![];
-
-            shuffle_groups.iter().zip(buffer_groups.iter_mut())
-                .for_each(|(group,buffers)|{
-                group.0.iter().zip(buffers.iter_mut()).for_each(|(elements,buffer)|{
-                    //TODO correct the pointer in the closure used by outside
-                    // let expr_clarify = |expr: &[Expression<_>], buff:&mut [_] |{
-                    //     if expr.len() ==1 && is_expression_pure_unit(&expr[0]){
-                    //         pure_expressions.push((&expr[0],buff))
-                    //     }else{
-                    //         tuple_expressions.push((expr,buff))
-                    //     }
-                    // };
-                    // expr_clarify(&elements.input_expressions,&mut buffer.0[..]);
-                    // expr_clarify(&elements.shuffle_expressions,&mut buffer.1[..]);
-
-                    if elements.input_expressions.len() ==1 && is_expression_pure_unit(&elements.input_expressions[0]){
-                        pure_expressions.push((&elements.input_expressions[0],&mut buffer.0[..]))
-                    }else {
-                        tuple_expressions.push((&elements.input_expressions[..],&mut buffer.0[..]))
-                    }
-                    if elements.shuffle_expressions.len() ==1 && is_expression_pure_unit(&elements.input_expressions[0]){
-                        pure_expressions.push((&elements.shuffle_expressions[0],&mut buffer.1[..]))
-                    }else {
-                        tuple_expressions.push((&elements.shuffle_expressions[..],&mut buffer.1[..]))
-                    }
-
-                })
-            });
 
             let f = |expr: &Expression<_>, target: &mut [_]| {
                 if let Some(v) = expr.is_constant() {
@@ -973,21 +939,35 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 }
             };
 
-            pure_expressions.into_par_iter().for_each(|(expr,buffer)|{
-                f(expr,buffer)
-            });
-            tuple_expressions.into_par_iter().for_each(|(expr,buffer)|{
-                evaluate_exprs(
-                    expr,
-                    size,
-                    1,
-                    fixed_ref,
-                    advice_ref,
-                    instance_ref,
-                    theta,
-                    buffer,
-                )
-            });
+            shuffle_groups.par_iter().zip(buffer_groups.par_iter_mut())
+                .for_each(|(group,buffers)| {
+                    group.0.par_iter().zip(buffers.par_iter_mut())
+                        .for_each(|(elements, buffer)| {
+                            let mut tuple_expres = vec![];
+                            if elements.input_expressions.len() == 1 && is_expression_pure_unit(&elements.input_expressions[0]) {
+                                f(&elements.input_expressions[0], &mut buffer.0[..])
+                            } else {
+                                tuple_expres.push((&elements.input_expressions[..], &mut buffer.0[..]))
+                            }
+                            if elements.shuffle_expressions.len() == 1 && is_expression_pure_unit(&elements.shuffle_expressions[0]) {
+                                f(&elements.shuffle_expressions[0], &mut buffer.1[..])
+                            } else {
+                                tuple_expres.push((&elements.shuffle_expressions[..], &mut buffer.1[..]))
+                            }
+                            tuple_expres.into_par_iter().for_each(|(expr, buffer)| {
+                                evaluate_exprs(
+                                    expr,
+                                    size,
+                                    1,
+                                    fixed_ref,
+                                    advice_ref,
+                                    instance_ref,
+                                    theta,
+                                    buffer,
+                                )
+                            });
+                        });
+                });
 
              let mut p_z = buffer_groups.par_iter().map(|group|{
                  let beta_pows: Vec<C::Scalar> = (0..group.len())
@@ -1014,8 +994,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                  });
                  modified_values
              }).collect::<Vec<_>>();
-            //todo parallel
-            for z in p_z.iter_mut() {
+
+            p_z.par_iter_mut().for_each(|z|{
                 let mut tmp = C::Scalar::one();
                 for i in 0..size {
                     std::mem::swap(&mut tmp, &mut z[i]);
@@ -1032,7 +1012,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     }
                 }
 
-            }
+            });
             p_z
         });
         end_timer!(timer);
