@@ -793,6 +793,162 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             permutation_products_handler
         };
 
+        let shuffle_products_handler = {
+            let shuffle_groups = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
+            let timer = start_timer!(|| format!(
+                "product shuffles total={},group={}",
+                (&pk).vk.cs.shuffles.0.len(),
+                shuffle_groups.len()
+            ));
+
+            let sub_pk = pk.clone();
+            let sub_advices = advices.clone();
+            let sub_instance = instances.clone();
+            let shuffle_products_handler = s.spawn(move || {
+                let pk = sub_pk;
+                let advices = sub_advices;
+                let instances = sub_instance;
+
+                let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+                let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+                let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+
+                let mut buffer_groups = shuffle_groups
+                    .par_iter()
+                    .map(|group| {
+                        group
+                            .0
+                            .par_iter()
+                            .map(|_| {
+                                let mut input_buffer = Vec::new_in(HugePageAllocator);
+                                input_buffer.resize(size, C::Scalar::zero());
+                                let mut shuffle_buffer = Vec::new_in(HugePageAllocator);
+                                shuffle_buffer.resize(size, C::Scalar::zero());
+                                (input_buffer, shuffle_buffer)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+
+                let f = |expr: &Expression<_>, target: &mut [_]| {
+                    if let Some(v) = expr.is_constant() {
+                        target.fill(v);
+                    } else if let Some(idx) = expr.is_pure_fixed() {
+                        target.clone_from_slice(&fixed_ref[idx][..]);
+                    } else if let Some(idx) = expr.is_pure_instance() {
+                        target.clone_from_slice(&instance_ref[idx][..]);
+                    } else if let Some(idx) = expr.is_pure_advice() {
+                        target.clone_from_slice(&advice_ref[idx][..]);
+                    } else {
+                        unreachable!()
+                    }
+                };
+
+                shuffle_groups
+                    .par_iter()
+                    .zip(buffer_groups.par_iter_mut())
+                    .for_each(|(group, buffers)| {
+                        group.0.par_iter().zip(buffers.par_iter_mut()).for_each(
+                            |(elements, buffer)| {
+                                let mut tuple_expres = vec![];
+                                if elements.input_expressions.len() == 1
+                                    && is_expression_pure_unit(&elements.input_expressions[0])
+                                {
+                                    f(&elements.input_expressions[0], &mut buffer.0[..])
+                                } else {
+                                    tuple_expres
+                                        .push((&elements.input_expressions[..], &mut buffer.0[..]))
+                                }
+                                if elements.shuffle_expressions.len() == 1
+                                    && is_expression_pure_unit(&elements.shuffle_expressions[0])
+                                {
+                                    f(&elements.shuffle_expressions[0], &mut buffer.1[..])
+                                } else {
+                                    tuple_expres.push((
+                                        &elements.shuffle_expressions[..],
+                                        &mut buffer.1[..],
+                                    ))
+                                }
+                                tuple_expres.into_par_iter().for_each(|(expr, buffer)| {
+                                    evaluate_exprs(
+                                        expr,
+                                        size,
+                                        1,
+                                        fixed_ref,
+                                        advice_ref,
+                                        instance_ref,
+                                        theta,
+                                        buffer,
+                                    )
+                                });
+                            },
+                        );
+                    });
+
+                let mut p_z = buffer_groups
+                    .par_iter()
+                    .map(|group| {
+                        let beta_pows: Vec<C::Scalar> = (0..group.len())
+                            .map(|i| beta.pow_vartime([1 + i as u64, 0, 0, 0]))
+                            .collect();
+
+                        let mut modified_values = Vec::new_in(HugePageAllocator);
+                        modified_values.resize(size, C::Scalar::one());
+                        let chunk_size = size >> 2;
+                        group
+                            .iter()
+                            .zip(beta_pows.iter())
+                            .for_each(|(e, beta_pow_i)| {
+                                modified_values
+                                    .par_chunks_mut(chunk_size)
+                                    .zip(e.1.par_chunks(chunk_size))
+                                    .for_each(|(values, shuffles)| {
+                                        for i in 0..chunk_size {
+                                            values[i] *= &(shuffles[i] + beta_pow_i);
+                                        }
+                                    })
+                            });
+                        modified_values.iter_mut().batch_invert();
+                        group
+                            .iter()
+                            .zip(beta_pows.iter())
+                            .for_each(|(e, beta_pow_i)| {
+                                modified_values
+                                    .par_chunks_mut(chunk_size)
+                                    .zip(e.0.par_chunks(chunk_size))
+                                    .for_each(|(values, inputs)| {
+                                        for i in 0..chunk_size {
+                                            values[i] *= &(inputs[i] + beta_pow_i);
+                                        }
+                                    })
+                            });
+                        modified_values
+                    })
+                    .collect::<Vec<_>>();
+
+                p_z.par_iter_mut().for_each(|z| {
+                    let mut tmp = C::Scalar::one();
+                    for i in 0..size {
+                        std::mem::swap(&mut tmp, &mut z[i]);
+                        tmp = tmp * z[i];
+                    }
+
+                    if ADD_RANDOM {
+                        for v in z[unusable_rows_start + 1..].iter_mut() {
+                            *v = C::Scalar::random(&mut OsRng);
+                        }
+                    } else {
+                        for v in z[unusable_rows_start + 1..].iter_mut() {
+                            *v = C::Scalar::zero();
+                        }
+                    }
+                });
+                p_z
+            });
+            end_timer!(timer);
+            shuffle_products_handler
+        };
+
         let timer = start_timer!(|| "generate lookup z");
         {
             let mut last_stream = None;
@@ -910,157 +1066,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let timer = start_timer!(|| "wait permutation_products");
         let mut permutation_products = permutation_products_handler.join().unwrap();
-        end_timer!(timer);
-
-        let shuffle_groups = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
-        let timer = start_timer!(|| format!(
-            "product shuffles total={},group={}",
-            (&pk).vk.cs.shuffles.0.len(),
-            shuffle_groups.len()
-        ));
-
-        let sub_pk = pk.clone();
-        let sub_advices = advices.clone();
-        let sub_instance = instances.clone();
-        let shuffle_products_handler = s.spawn(move || {
-            let pk = sub_pk;
-            let advices = sub_advices;
-            let instances = sub_instance;
-
-            let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-
-            let mut buffer_groups = shuffle_groups
-                .par_iter()
-                .map(|group| {
-                    group
-                        .0
-                        .par_iter()
-                        .map(|_| {
-                            let mut input_buffer = Vec::new_in(HugePageAllocator);
-                            input_buffer.resize(size, C::Scalar::zero());
-                            let mut shuffle_buffer = Vec::new_in(HugePageAllocator);
-                            shuffle_buffer.resize(size, C::Scalar::zero());
-                            (input_buffer, shuffle_buffer)
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-
-            let f = |expr: &Expression<_>, target: &mut [_]| {
-                if let Some(v) = expr.is_constant() {
-                    target.fill(v);
-                } else if let Some(idx) = expr.is_pure_fixed() {
-                    target.clone_from_slice(&fixed_ref[idx][..]);
-                } else if let Some(idx) = expr.is_pure_instance() {
-                    target.clone_from_slice(&instance_ref[idx][..]);
-                } else if let Some(idx) = expr.is_pure_advice() {
-                    target.clone_from_slice(&advice_ref[idx][..]);
-                } else {
-                    unreachable!()
-                }
-            };
-
-            shuffle_groups
-                .par_iter()
-                .zip(buffer_groups.par_iter_mut())
-                .for_each(|(group, buffers)| {
-                    group.0.par_iter().zip(buffers.par_iter_mut()).for_each(
-                        |(elements, buffer)| {
-                            let mut tuple_expres = vec![];
-                            if elements.input_expressions.len() == 1
-                                && is_expression_pure_unit(&elements.input_expressions[0])
-                            {
-                                f(&elements.input_expressions[0], &mut buffer.0[..])
-                            } else {
-                                tuple_expres
-                                    .push((&elements.input_expressions[..], &mut buffer.0[..]))
-                            }
-                            if elements.shuffle_expressions.len() == 1
-                                && is_expression_pure_unit(&elements.shuffle_expressions[0])
-                            {
-                                f(&elements.shuffle_expressions[0], &mut buffer.1[..])
-                            } else {
-                                tuple_expres
-                                    .push((&elements.shuffle_expressions[..], &mut buffer.1[..]))
-                            }
-                            tuple_expres.into_par_iter().for_each(|(expr, buffer)| {
-                                evaluate_exprs(
-                                    expr,
-                                    size,
-                                    1,
-                                    fixed_ref,
-                                    advice_ref,
-                                    instance_ref,
-                                    theta,
-                                    buffer,
-                                )
-                            });
-                        },
-                    );
-                });
-
-            let mut p_z = buffer_groups
-                .par_iter()
-                .map(|group| {
-                    let beta_pows: Vec<C::Scalar> = (0..group.len())
-                        .map(|i| beta.pow_vartime([1 + i as u64, 0, 0, 0]))
-                        .collect();
-
-                    let mut modified_values = Vec::new_in(HugePageAllocator);
-                    modified_values.resize(size, C::Scalar::one());
-                    let chunk_size = size >> 2;
-                    group
-                        .iter()
-                        .zip(beta_pows.iter())
-                        .for_each(|(e, beta_pow_i)| {
-                            modified_values
-                                .par_chunks_mut(chunk_size)
-                                .zip(e.1.par_chunks(chunk_size))
-                                .for_each(|(values, shuffles)| {
-                                    for i in 0..chunk_size {
-                                        values[i] *= &(shuffles[i] + beta_pow_i);
-                                    }
-                                })
-                        });
-                    modified_values.iter_mut().batch_invert();
-                    group
-                        .iter()
-                        .zip(beta_pows.iter())
-                        .for_each(|(e, beta_pow_i)| {
-                            modified_values
-                                .par_chunks_mut(chunk_size)
-                                .zip(e.0.par_chunks(chunk_size))
-                                .for_each(|(values, inputs)| {
-                                    for i in 0..chunk_size {
-                                        values[i] *= &(inputs[i] + beta_pow_i);
-                                    }
-                                })
-                        });
-                    modified_values
-                })
-                .collect::<Vec<_>>();
-
-            p_z.par_iter_mut().for_each(|z| {
-                let mut tmp = C::Scalar::one();
-                for i in 0..size {
-                    std::mem::swap(&mut tmp, &mut z[i]);
-                    tmp = tmp * z[i];
-                }
-
-                if ADD_RANDOM {
-                    for v in z[unusable_rows_start + 1..].iter_mut() {
-                        *v = C::Scalar::random(&mut OsRng);
-                    }
-                } else {
-                    for v in z[unusable_rows_start + 1..].iter_mut() {
-                        *v = C::Scalar::zero();
-                    }
-                }
-            });
-            p_z
-        });
         end_timer!(timer);
 
         let timer = start_timer!(|| "permutation z msm and intt");
