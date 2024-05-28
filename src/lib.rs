@@ -292,41 +292,52 @@ pub fn evaluate_exprs<F: FieldExt>(
     let get_rotation_idx = |idx: usize, rot: i32, rot_scale: i32, isize: i32| -> usize {
         (((idx as i32) + (rot * rot_scale)).rem_euclid(isize)) as usize
     };
-    for (idx, value) in res.iter_mut().enumerate() {
-        for (i, expression) in expressions.iter().enumerate() {
-            let v = expression.evaluate(
-                &|scalar| scalar,
-                &|_| panic!("virtual selectors are removed during optimization"),
-                &|_, column_index, rotation| {
-                    fixed[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                },
-                &|_, column_index, rotation| {
-                    advice[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                },
-                &|_, column_index, rotation| {
-                    instance[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                },
-                &|a| -a,
-                &|a, b| a + &b,
-                &|a, b| {
-                    let a = a();
-                    if a == F::zero() {
-                        a
-                    } else {
-                        a * b()
-                    }
-                },
-                &|a, scalar| a * scalar,
-            );
 
-            if i > 0 {
-                *value = *value * theta;
-                *value += v;
-            } else {
-                *value = v;
+    let chunks = 4;
+    let chunk_size = size / chunks;
+
+    res.par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(chunk_idx, res_chunck)| {
+            for (i, value) in res_chunck.into_iter().enumerate() {
+                let idx = chunk_idx * chunk_size + i;
+                for (i, expression) in expressions.iter().enumerate() {
+                    let v = expression.evaluate(
+                        &|scalar| scalar,
+                        &|_| panic!("virtual selectors are removed during optimization"),
+                        &|_, column_index, rotation| {
+                            fixed[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
+                        },
+                        &|_, column_index, rotation| {
+                            advice[column_index]
+                                [get_rotation_idx(idx, rotation.0, rot_scale, isize)]
+                        },
+                        &|_, column_index, rotation| {
+                            instance[column_index]
+                                [get_rotation_idx(idx, rotation.0, rot_scale, isize)]
+                        },
+                        &|a| -a,
+                        &|a, b| a + &b,
+                        &|a, b| {
+                            let a = a();
+                            if a == F::zero() {
+                                a
+                            } else {
+                                a * b()
+                            }
+                        },
+                        &|a, scalar| a * scalar,
+                    );
+
+                    if i > 0 && *value != F::zero() {
+                        *value = *value * theta;
+                        *value += v;
+                    } else {
+                        *value = v;
+                    }
+                }
             }
-        }
-    }
+        });
 }
 
 pub fn create_proof_from_advices<
