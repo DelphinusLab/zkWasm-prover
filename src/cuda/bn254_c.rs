@@ -110,6 +110,19 @@ extern "C" {
         n: i32,
     ) -> cudaError;
 
+    pub fn shuffle_eval_h(
+        res: *mut c_void,
+        input: *mut c_void,
+        table: *mut c_void,
+        z: *mut c_void,
+        l0: *mut c_void,
+        l_last: *mut c_void,
+        l_active_row: *mut c_void,
+        y: *mut c_void,
+        rot: i32,
+        n: i32,
+    ) -> cudaError;
+
     pub fn expand_omega_buffer(buf: *mut c_void, n: i32) -> cudaError;
 
     pub fn field_mul_zip(buf: *mut c_void, coeff: *mut c_void, coeff_n: i32, n: i32) -> cudaError;
