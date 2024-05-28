@@ -680,6 +680,119 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         lookups.append(&mut tuple_lookups);
         lookups.sort_by(|l, r| usize::cmp(&l.0, &r.0));
 
+        let chunk_len = &pk.vk.cs.degree() - 2;
+
+        let permutation_products_handler = {
+            let timer = start_timer!(|| format!(
+                "product permutation {}",
+                (&pk).vk.cs.permutation.columns.chunks(chunk_len).len()
+            ));
+
+            let sub_pk = pk.clone();
+            let sub_advices = advices.clone();
+            let sub_instance = instances.clone();
+            let permutation_products_handler = s.spawn(move || {
+                let pk = sub_pk;
+                let advices = sub_advices;
+                let instances = sub_instance;
+
+                let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+                let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+                let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+                let mut p_z = pk
+                    .vk
+                    .cs
+                    .permutation
+                    .columns
+                    .par_chunks(chunk_len)
+                    .zip((&pk).permutation.permutations.par_chunks(chunk_len))
+                    .enumerate()
+                    .map(|(i, (columns, permutations))| {
+                        let mut delta_omega =
+                            C::Scalar::DELTA.pow_vartime([i as u64 * chunk_len as u64]);
+
+                        let mut modified_values = Vec::new_in(HugePageAllocator);
+                        modified_values.resize(size, C::Scalar::one());
+
+                        // Iterate over each column of the permutation
+                        for (&column, permuted_column_values) in
+                            columns.iter().zip(permutations.iter())
+                        {
+                            let values = match column.column_type() {
+                                Any::Advice => advice_ref,
+                                Any::Fixed => fixed_ref,
+                                Any::Instance => instance_ref,
+                            };
+                            let chunk_size = size >> 1;
+                            modified_values
+                                .par_chunks_mut(chunk_size)
+                                .zip(permuted_column_values.par_chunks(chunk_size))
+                                .zip(values[column.index()].par_chunks(chunk_size))
+                                .for_each(|((res, p), v)| {
+                                    for i in 0..chunk_size {
+                                        res[i] *= &(beta * p[i] + &gamma + v[i]);
+                                    }
+                                });
+                        }
+
+                        // Invert to obtain the denominator for the permutation product polynomial
+                        modified_values.iter_mut().batch_invert();
+
+                        // Iterate over each column again, this time finishing the computation
+                        // of the entire fraction by computing the numerators
+                        for &column in columns.iter() {
+                            let values = match column.column_type() {
+                                Any::Advice => advice_ref,
+                                Any::Fixed => fixed_ref,
+                                Any::Instance => instance_ref,
+                            };
+
+                            let chunk_size = size >> 1;
+                            modified_values
+                                .par_chunks_mut(chunk_size)
+                                .zip(values[column.index()].par_chunks(chunk_size))
+                                .enumerate()
+                                .for_each(|(idx, (res, v))| {
+                                    let mut delta_omega = delta_omega
+                                        * omega.pow_vartime([(idx * chunk_size) as u64]);
+                                    for i in 0..chunk_size {
+                                        res[i] *= &(delta_omega * &beta + &gamma + v[i]);
+                                        delta_omega *= &omega;
+                                    }
+                                });
+
+                            delta_omega *= &C::Scalar::DELTA;
+                        }
+
+                        modified_values
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut tmp = C::Scalar::one();
+                for z in p_z.iter_mut() {
+                    for i in 0..size {
+                        std::mem::swap(&mut tmp, &mut z[i]);
+                        tmp = tmp * z[i];
+                    }
+
+                    if ADD_RANDOM {
+                        for v in z[unusable_rows_start + 1..].iter_mut() {
+                            *v = C::Scalar::random(&mut OsRng);
+                        }
+                    } else {
+                        for v in z[unusable_rows_start + 1..].iter_mut() {
+                            *v = C::Scalar::zero();
+                        }
+                    }
+
+                    tmp = z[unusable_rows_start];
+                }
+                p_z
+            });
+            end_timer!(timer);
+            permutation_products_handler
+        };
+
         let timer = start_timer!(|| "generate lookup z");
         {
             let mut last_stream = None;
@@ -766,115 +879,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
         let intt_divisor_buf = device
             .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
-        end_timer!(timer);
-
-        let chunk_len = &pk.vk.cs.degree() - 2;
-
-        let timer = start_timer!(|| format!(
-            "product permutation {}",
-            (&pk).vk.cs.permutation.columns.chunks(chunk_len).len()
-        ));
-
-        let sub_pk = pk.clone();
-        let sub_advices = advices.clone();
-        let sub_instance = instances.clone();
-        let permutation_products_handler = s.spawn(move || {
-            let pk = sub_pk;
-            let advices = sub_advices;
-            let instances = sub_instance;
-
-            let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let mut p_z = pk
-                .vk
-                .cs
-                .permutation
-                .columns
-                .par_chunks(chunk_len)
-                .zip((&pk).permutation.permutations.par_chunks(chunk_len))
-                .enumerate()
-                .map(|(i, (columns, permutations))| {
-                    let mut delta_omega =
-                        C::Scalar::DELTA.pow_vartime([i as u64 * chunk_len as u64]);
-
-                    let mut modified_values = Vec::new_in(HugePageAllocator);
-                    modified_values.resize(size, C::Scalar::one());
-
-                    // Iterate over each column of the permutation
-                    for (&column, permuted_column_values) in columns.iter().zip(permutations.iter())
-                    {
-                        let values = match column.column_type() {
-                            Any::Advice => advice_ref,
-                            Any::Fixed => fixed_ref,
-                            Any::Instance => instance_ref,
-                        };
-                        let chunk_size = size >> 1;
-                        modified_values
-                            .par_chunks_mut(chunk_size)
-                            .zip(permuted_column_values.par_chunks(chunk_size))
-                            .zip(values[column.index()].par_chunks(chunk_size))
-                            .for_each(|((res, p), v)| {
-                                for i in 0..chunk_size {
-                                    res[i] *= &(beta * p[i] + &gamma + v[i]);
-                                }
-                            });
-                    }
-
-                    // Invert to obtain the denominator for the permutation product polynomial
-                    modified_values.iter_mut().batch_invert();
-
-                    // Iterate over each column again, this time finishing the computation
-                    // of the entire fraction by computing the numerators
-                    for &column in columns.iter() {
-                        let values = match column.column_type() {
-                            Any::Advice => advice_ref,
-                            Any::Fixed => fixed_ref,
-                            Any::Instance => instance_ref,
-                        };
-
-                        let chunk_size = size >> 1;
-                        modified_values
-                            .par_chunks_mut(chunk_size)
-                            .zip(values[column.index()].par_chunks(chunk_size))
-                            .enumerate()
-                            .for_each(|(idx, (res, v))| {
-                                let mut delta_omega =
-                                    delta_omega * omega.pow_vartime([(idx * chunk_size) as u64]);
-                                for i in 0..chunk_size {
-                                    res[i] *= &(delta_omega * &beta + &gamma + v[i]);
-                                    delta_omega *= &omega;
-                                }
-                            });
-
-                        delta_omega *= &C::Scalar::DELTA;
-                    }
-
-                    modified_values
-                })
-                .collect::<Vec<_>>();
-
-            let mut tmp = C::Scalar::one();
-            for z in p_z.iter_mut() {
-                for i in 0..size {
-                    std::mem::swap(&mut tmp, &mut z[i]);
-                    tmp = tmp * z[i];
-                }
-
-                if ADD_RANDOM {
-                    for v in z[unusable_rows_start + 1..].iter_mut() {
-                        *v = C::Scalar::random(&mut OsRng);
-                    }
-                } else {
-                    for v in z[unusable_rows_start + 1..].iter_mut() {
-                        *v = C::Scalar::zero();
-                    }
-                }
-
-                tmp = z[unusable_rows_start];
-            }
-            p_z
-        });
         end_timer!(timer);
 
         let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
