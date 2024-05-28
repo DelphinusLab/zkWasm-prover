@@ -866,7 +866,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         });
         end_timer!(timer);
 
-        let timer = start_timer!(|| "lookup z msm");
+        let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
         let lookup_z_commitments = crate::cuda::bn254::batch_msm::<C>(
             &g_lagrange_buf,
             [&s_buf, &t_buf],

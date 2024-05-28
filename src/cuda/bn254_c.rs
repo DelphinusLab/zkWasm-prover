@@ -4,12 +4,11 @@ use std::ffi::c_void;
 #[link(name = "zkwasm_prover_kernel", kind = "static")]
 extern "C" {
     pub fn msm(
-        blocks: i32,
-        threads: i32,
         res: *mut c_void,
         p: *mut c_void,
         s: *mut c_void,
         array_len: i32,
+        stream: *mut CUstream_st,
     ) -> cudaError;
 
     pub fn ntt(
