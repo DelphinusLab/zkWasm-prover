@@ -1,3 +1,4 @@
+//Code from https://github.com/matter-labs/z-prize-msm-gpu-combined/tree/7699c8f1e7cd093bf569ed364ee2b5faf71418c3
 #pragma once
 
 #include "common.cuh"
