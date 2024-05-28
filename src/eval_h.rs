@@ -650,22 +650,21 @@ fn evaluate_h_gates_core<C: CurveAffine>(
 
     let timer = start_timer!(|| "evaluate_h shuffle");
     let shuffle_group = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
-    for (_i, (shuffle,z)) in shuffle_group
+    for (_i, (shuffle, z)) in shuffle_group
         .iter()
         .zip(shuffle_products.iter())
         .enumerate()
     {
+        let (input_expressions, table_expressions) = shuffle
+            .0
+            .iter()
+            .map(|x| (x.input_expressions.clone(), x.shuffle_expressions.clone()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .unzip();
 
-        let (input_expressions,table_expressions) = shuffle.0.iter().map(|x|{
-            (x.input_expressions.clone(),x.shuffle_expressions.clone())
-        }).collect::<Vec<_>>().into_iter().unzip();
-
-        let [e1, e2] = flatten_shuffle_expression(
-            &input_expressions,
-            &table_expressions,
-            beta,
-            theta,
-        );
+        let [e1, e2] =
+            flatten_shuffle_expression(&input_expressions, &table_expressions, beta, theta);
 
         let input_buf = evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx)?;
         let table_buf = evaluate_prove_expr(device, &vec![e2], fixed, advice, instance, &mut ctx)?;
@@ -701,7 +700,6 @@ fn evaluate_h_gates_core<C: CurveAffine>(
         ctx.extended_allocator.push(z_buf);
     }
     end_timer!(timer);
-
 
     Ok((ctx, h_buf))
 }
@@ -804,24 +802,25 @@ fn flatten_shuffle_expression<F: FieldExt>(
     beta: F,
     theta: F,
 ) -> [Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>; 2] {
-
-    let construct_expr_input = |inputs :&Vec<Vec<Expression<F>>>| {
-        let expr_inputs = inputs.iter().map(|input| {
-            let mut expr_input = ProveExpression::<F>::from_expr(&input[0]);
-            for input in input.iter().skip(1) {
-                expr_input = ProveExpression::Scale(
-                    Box::new(expr_input),
-                    BTreeMap::from_iter([(0, theta)].into_iter()),
-                );
-                expr_input = ProveExpression::Op(
-                    Box::new(expr_input),
-                    Box::new(ProveExpression::<F>::from_expr(input)),
-                    Bop::Sum,
-                );
-            }
-            expr_input
-        }).collect::<Vec<_>>();
-
+    let construct_expr_input = |inputs: &Vec<Vec<Expression<F>>>| {
+        let expr_inputs = inputs
+            .iter()
+            .map(|input| {
+                let mut expr_input = ProveExpression::<F>::from_expr(&input[0]);
+                for input in input.iter().skip(1) {
+                    expr_input = ProveExpression::Scale(
+                        Box::new(expr_input),
+                        BTreeMap::from_iter([(0, theta)].into_iter()),
+                    );
+                    expr_input = ProveExpression::Op(
+                        Box::new(expr_input),
+                        Box::new(ProveExpression::<F>::from_expr(input)),
+                        Bop::Sum,
+                    );
+                }
+                expr_input
+            })
+            .collect::<Vec<_>>();
 
         let mut expr_input = ProveExpression::Op(
             Box::new(expr_inputs[0].clone()),
@@ -831,8 +830,7 @@ fn flatten_shuffle_expression<F: FieldExt>(
             Bop::Sum,
         );
         for (i, input) in expr_inputs.iter().enumerate().skip(1) {
-            let beta_pow_i =
-                beta.pow_vartime([1 + i as u64]);
+            let beta_pow_i = beta.pow_vartime([1 + i as u64]);
             let next_input = ProveExpression::Op(
                 Box::new(input.clone()),
                 Box::new(ProveExpression::Y(BTreeMap::from_iter(
@@ -869,7 +867,6 @@ fn flatten_shuffle_expression<F: FieldExt>(
 
     [expr_input, expr_table]
 }
-
 
 fn do_extended_ntt_v2<F: FieldExt>(
     device: &CudaDevice,
