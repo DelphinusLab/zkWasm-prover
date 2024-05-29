@@ -1,6 +1,9 @@
 #![feature(allocator_api)]
 #![feature(get_mut_unchecked)]
 
+#[macro_use]
+extern crate lazy_static;
+
 use std::collections::BTreeMap;
 use std::iter;
 use std::sync::Arc;
