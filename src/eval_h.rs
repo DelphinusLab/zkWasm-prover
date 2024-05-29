@@ -289,6 +289,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
                         .ptr()
                         .offset((i * size * core::mem::size_of::<C::Scalar>()) as isize),
                     device: device.clone(),
+                    size: size * core::mem::size_of::<C::Scalar>(),
                 })
             };
             let commitment = msm_single_buffer(&g_buf, &s_buf, size)?;
@@ -312,6 +313,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
                         * core::mem::size_of::<C::Scalar>()) as isize,
                 ),
                 device: device.clone(),
+                size: size * core::mem::size_of::<C::Scalar>(),
             })
         };
         let xn_buf = device.alloc_device_buffer_from_slice(&[xn][..])?;
@@ -322,6 +324,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
                         .ptr()
                         .offset((i * size * core::mem::size_of::<C::Scalar>()) as isize),
                     device: device.clone(),
+                    size: size * core::mem::size_of::<C::Scalar>(),
                 })
             };
             field_op_v3(
