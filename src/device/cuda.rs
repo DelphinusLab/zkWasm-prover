@@ -75,12 +75,8 @@ pub struct CudaDeviceBufRaw {
     pub(crate) device: CudaDevice,
 }
 
-
 extern "C" {
-    pub fn cudaFreeAsync(
-        ptr: *mut c_void,
-        stream: cudaStream_t,
-    ) -> cudaError;
+    pub fn cudaFreeAsync(ptr: *mut c_void, stream: cudaStream_t) -> cudaError;
 }
 
 impl Drop for CudaDeviceBufRaw {
@@ -271,11 +267,14 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
     fn pin_memory<T>(&self, dst: &[T]) -> DeviceResult<()> {
         self.acitve_ctx()?;
         unsafe {
-            let res = cuda_runtime_sys::cudaHostRegister(
+            let res: cudaError = cuda_runtime_sys::cudaHostRegister(
                 dst.as_ptr() as *mut _,
                 dst.len() * size_of::<T>(),
                 cuda_runtime_sys::cudaHostAllocMapped,
             );
+            if res == cudaError::cudaErrorHostMemoryAlreadyRegistered {
+                return Ok(());
+            }
             to_result((), res, "fail to synchronize")
         }
     }
