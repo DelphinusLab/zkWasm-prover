@@ -70,7 +70,7 @@ pub fn prepare_advice_buffer<C: CurveAffine>(
         .collect::<Vec<_>>();
 
     let device = CudaDevice::get_device(0).unwrap();
-    if pin_memory {
+    if true {
         for x in advices.iter() {
             device.pin_memory(&x[..]).unwrap();
         }
@@ -382,6 +382,106 @@ pub fn create_proof_from_advices_with_shplonk<
     _create_proof_from_advices(params, pk, instances, advices, transcript, false)
 }
 
+pub fn prepare_lookup_buffer<C: CurveAffine>(
+    pk: &ProvingKey<C>,
+) -> Result<
+    Vec<(
+        Vec<C::Scalar, HugePageAllocator>,
+        Vec<C::Scalar, HugePageAllocator>,
+        Vec<C::Scalar, HugePageAllocator>,
+    )>,
+    Error,
+> {
+    let size = 1 << pk.get_vk().domain.k();
+    let timer = start_timer!(|| format!("prepare lookup buffer, count {}", pk.vk.cs.lookups.len()));
+    let lookups = pk
+        .vk
+        .cs
+        .lookups
+        .par_iter()
+        .map(|_| {
+            let mut permuted_input = Vec::new_in(HugePageAllocator);
+            permuted_input.resize(size, C::Scalar::zero());
+            let mut permuted_table = Vec::new_in(HugePageAllocator);
+            permuted_table.resize(size, C::Scalar::zero());
+            let mut z = Vec::new_in(HugePageAllocator);
+            z.resize(size, C::Scalar::zero());
+
+            if true {
+                let device = CudaDevice::get_device(0).unwrap();
+                device.pin_memory(&permuted_input[..]).unwrap();
+                device.pin_memory(&permuted_table[..]).unwrap();
+                device.pin_memory(&z[..]).unwrap();
+            }
+
+            (permuted_input, permuted_table, z)
+        })
+        .collect::<Vec<_>>();
+    end_timer!(timer);
+    Ok(lookups)
+}
+
+pub fn prepare_permutation_buffers<C: CurveAffine>(
+    pk: &ProvingKey<C>,
+) -> Result<Vec<Vec<C::Scalar, HugePageAllocator>>, Error> {
+    let size = 1 << pk.get_vk().domain.k();
+    let chunk_len = &pk.vk.cs.degree() - 2;
+    let timer = start_timer!(|| format!(
+        "prepare permutation buffer, count {}",
+        pk.vk.cs.permutation.columns.par_chunks(chunk_len).len()
+    ));
+    let buffers = pk
+        .vk
+        .cs
+        .permutation
+        .columns
+        .par_chunks(chunk_len)
+        .map(|_| {
+            let mut z = Vec::new_in(HugePageAllocator);
+            z.resize(size, C::Scalar::one());
+
+            if true {
+                let device = CudaDevice::get_device(0).unwrap();
+                device.pin_memory(&z[..]).unwrap();
+            }
+
+            z
+        })
+        .collect::<Vec<_>>();
+    end_timer!(timer);
+    Ok(buffers)
+}
+
+pub fn prepare_shuffle_buffers<C: CurveAffine>(
+    pk: &ProvingKey<C>,
+) -> Result<Vec<Vec<C::Scalar, HugePageAllocator>>, Error> {
+    let size = 1 << pk.get_vk().domain.k();
+    let timer = start_timer!(|| format!(
+        "prepare shuffle buffer, count {}",
+        pk.vk.cs.shuffles.group(pk.vk.cs.degree()).len()
+    ));
+    let buffers = pk
+        .vk
+        .cs
+        .shuffles
+        .group(pk.vk.cs.degree())
+        .iter()
+        .map(|_| {
+            let mut z = Vec::new_in(HugePageAllocator);
+            z.resize(size, C::Scalar::one());
+
+            if true {
+                let device = CudaDevice::get_device(0).unwrap();
+                device.pin_memory(&z[..]).unwrap();
+            }
+
+            z
+        })
+        .collect::<Vec<_>>();
+    end_timer!(timer);
+    Ok(buffers)
+}
+
 fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
     params: &Params<C>,
     pk: &ProvingKey<C>,
@@ -390,6 +490,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
     transcript: &mut T,
     use_gwc: bool,
 ) -> Result<(), Error> {
+    println!("k is {}", pk.get_vk().domain.k());
+
     thread::scope(|s| {
         let k = pk.get_vk().domain.k() as usize;
         let size = 1 << pk.get_vk().domain.k();
@@ -410,6 +512,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     let mut instance = Vec::new_in(HugePageAllocator);
                     instance.resize(size, C::Scalar::zero());
                     instance[0..x.len()].clone_from_slice(&x[..]);
+
+                    let device = CudaDevice::get_device(0).unwrap();
+                    device.pin_memory(&instance[..]).unwrap();
+
                     instance
                 })
                 .collect::<Vec<_>>(),
@@ -441,6 +547,12 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             .unwrap();
         end_timer!(timer);
 
+        let timer = start_timer!(|| "prepare buffers");
+        let lookups = prepare_lookup_buffer(pk)?;
+        let permutations = prepare_permutation_buffers(pk)?;
+        let shuffles = prepare_shuffle_buffers(pk)?;
+        end_timer!(timer);
+
         // thread for part of lookups
         let sub_pk = pk.clone();
         let sub_advices = advices.clone();
@@ -449,25 +561,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let pk = sub_pk;
             let advices = sub_advices;
             let instances = sub_instances;
-            let timer =
-                start_timer!(|| format!("prepare lookup buffer, count {}", pk.vk.cs.lookups.len()));
-            let lookups = pk
-                .vk
-                .cs
-                .lookups
-                .par_iter()
-                .map(|_| {
-                    let mut permuted_input = Vec::new_in(HugePageAllocator);
-                    permuted_input.resize(size, C::Scalar::zero());
-                    let mut permuted_table = Vec::new_in(HugePageAllocator);
-                    permuted_table.resize(size, C::Scalar::zero());
-                    let mut z = Vec::new_in(HugePageAllocator);
-                    z.resize(size, C::Scalar::zero());
-
-                    (permuted_input, permuted_table, z)
-                })
-                .collect::<Vec<_>>();
-            end_timer!(timer);
 
             let [single_unit_lookups, single_comp_lookups, tuple_lookups] =
                 lookup_classify(&pk, lookups);
@@ -706,13 +799,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     .columns
                     .par_chunks(chunk_len)
                     .zip((&pk).permutation.permutations.par_chunks(chunk_len))
+                    .zip(permutations)
                     .enumerate()
-                    .map(|(i, (columns, permutations))| {
+                    .map(|(i, ((columns, permutations), mut modified_values))| {
                         let mut delta_omega =
                             C::Scalar::DELTA.pow_vartime([i as u64 * chunk_len as u64]);
-
-                        let mut modified_values = Vec::new_in(HugePageAllocator);
-                        modified_values.resize(size, C::Scalar::one());
 
                         // Iterate over each column of the permutation
                         for (&column, permuted_column_values) in
@@ -887,13 +978,12 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                 let mut p_z = buffer_groups
                     .par_iter()
-                    .map(|group| {
+                    .zip(shuffles.into_par_iter())
+                    .map(|(group, mut modified_values)| {
                         let beta_pows: Vec<C::Scalar> = (0..group.len())
                             .map(|i| beta.pow_vartime([1 + i as u64, 0, 0, 0]))
                             .collect();
 
-                        let mut modified_values = Vec::new_in(HugePageAllocator);
-                        modified_values.resize(size, C::Scalar::one());
                         let chunk_size = size >> 2;
                         group
                             .iter()
