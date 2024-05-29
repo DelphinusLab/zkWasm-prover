@@ -4,6 +4,8 @@
 use std::collections::BTreeMap;
 use std::iter;
 use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::thread;
 
 use ark_std::end_timer;
@@ -292,7 +294,7 @@ pub fn evaluate_exprs<F: FieldExt>(
         (((idx as i32) + (rot * rot_scale)).rem_euclid(isize)) as usize
     };
 
-    let chunks = 4;
+    let chunks = 8;
     let chunk_size = size / chunks;
 
     res.par_chunks_mut(chunk_size)
@@ -692,7 +694,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
 
             let mut buffers = vec![];
-            for (i, (input, table, permuted_input, permuted_table, _)) in tuple_lookups.iter_mut() {
+            for (i, (input, table, _, _, _)) in tuple_lookups.iter_mut() {
                 buffers.push((&pk.vk.cs.lookups[*i].input_expressions[..], &mut input[..]));
                 buffers.push((&pk.vk.cs.lookups[*i].table_expressions[..], &mut table[..]));
             }
@@ -809,6 +811,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let chunk_len = &pk.vk.cs.degree() - 2;
 
+        let waker = Arc::new((Mutex::new(false), Condvar::new()));
+        let waiter = Arc::clone(&waker);
         let permutation_products_handler = {
             let timer = start_timer!(|| format!(
                 "product permutation {}",
@@ -848,7 +852,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                 Any::Fixed => fixed_ref,
                                 Any::Instance => instance_ref,
                             };
-                            let chunk_size = size >> 1;
+                            let chunk_size = size >> 2;
                             modified_values
                                 .par_chunks_mut(chunk_size)
                                 .zip(permuted_column_values.par_chunks(chunk_size))
@@ -872,7 +876,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                 Any::Instance => instance_ref,
                             };
 
-                            let chunk_size = size >> 1;
+                            let chunk_size = size >> 2;
                             modified_values
                                 .par_chunks_mut(chunk_size)
                                 .zip(values[column.index()].par_chunks(chunk_size))
@@ -893,25 +897,44 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     })
                     .collect::<Vec<_>>();
 
-                let mut tmp = C::Scalar::one();
-                for z in p_z.iter_mut() {
-                    for i in 0..size {
-                        std::mem::swap(&mut tmp, &mut z[i]);
-                        tmp = tmp * z[i];
-                    }
+                let (lock, cvar) = &*waker;
+                let mut started = lock.lock().unwrap();
+                *started = true;
+                cvar.notify_one();
 
-                    if ADD_RANDOM {
-                        for v in z[unusable_rows_start + 1..].iter_mut() {
-                            *v = C::Scalar::random(&mut OsRng);
+                let mut tails: Vec<_> = p_z
+                    .par_iter_mut()
+                    .map(|z| {
+                        let mut tmp = C::Scalar::one();
+                        for i in 0..size {
+                            std::mem::swap(&mut tmp, &mut z[i]);
+                            tmp = tmp * z[i];
                         }
-                    } else {
-                        for v in z[unusable_rows_start + 1..].iter_mut() {
-                            *v = C::Scalar::zero();
-                        }
-                    }
 
-                    tmp = z[unusable_rows_start];
+                        if ADD_RANDOM {
+                            for v in z[unusable_rows_start + 1..].iter_mut() {
+                                *v = C::Scalar::random(&mut OsRng);
+                            }
+                        } else {
+                            for v in z[unusable_rows_start + 1..].iter_mut() {
+                                *v = C::Scalar::zero();
+                            }
+                        }
+
+                        z[unusable_rows_start]
+                    })
+                    .collect();
+
+                for i in 1..tails.len() {
+                    tails[i] = tails[i] * tails[i - 1];
                 }
+
+                p_z.par_iter_mut().skip(1).enumerate().for_each(|(i, z)| {
+                    for row in 0..=unusable_rows_start {
+                        z[row] = z[row] * tails[i];
+                    }
+                });
+
                 p_z
             });
             end_timer!(timer);
@@ -930,6 +953,12 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let sub_advices = advices.clone();
             let sub_instance = instances.clone();
             let shuffle_products_handler = s.spawn(move || {
+                let (lock, cvar) = &*waiter;
+                let mut started = lock.lock().unwrap();
+                while !*started {
+                    started = cvar.wait(started).unwrap();
+                }
+
                 let pk = sub_pk;
                 let advices = sub_advices;
                 let instances = sub_instance;
@@ -938,60 +967,76 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
                 let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
 
-                let mut buffer_groups = shuffle_groups
+                let mut more_buffer_groups = shuffle_groups
                     .par_iter()
                     .map(|group| {
                         group
                             .0
-                            .par_iter()
-                            .map(|_| {
-                                let mut input_buffer = Vec::new_in(HugePageAllocator);
-                                input_buffer.resize(size, C::Scalar::zero());
-                                let mut shuffle_buffer = Vec::new_in(HugePageAllocator);
-                                shuffle_buffer.resize(size, C::Scalar::zero());
+                            .iter()
+                            .map(|elements| {
+                                let input_buffer = if elements.input_expressions.len() == 1
+                                    && is_expression_pure_unit(&elements.input_expressions[0])
+                                {
+                                    None
+                                } else {
+                                    let mut buffer = Vec::new_in(HugePageAllocator);
+                                    buffer.resize(size, C::Scalar::zero());
+                                    Some(buffer)
+                                };
+
+                                let shuffle_buffer = if elements.shuffle_expressions.len() == 1
+                                    && is_expression_pure_unit(&elements.input_expressions[0])
+                                {
+                                    None
+                                } else {
+                                    let mut buffer = Vec::new_in(HugePageAllocator);
+                                    buffer.resize(size, C::Scalar::zero());
+                                    Some(buffer)
+                                };
                                 (input_buffer, shuffle_buffer)
                             })
                             .collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>();
 
-                let f = |expr: &Expression<_>, target: &mut [_]| {
-                    if let Some(v) = expr.is_constant() {
-                        target.fill(v);
+                let f = |expr: &Expression<_>| {
+                    if let Some(_) = expr.is_constant() {
+                        unreachable!()
                     } else if let Some(idx) = expr.is_pure_fixed() {
-                        target.clone_from_slice(&fixed_ref[idx][..]);
+                        &fixed_ref[idx][..]
                     } else if let Some(idx) = expr.is_pure_instance() {
-                        target.clone_from_slice(&instance_ref[idx][..]);
+                        &instance_ref[idx][..]
                     } else if let Some(idx) = expr.is_pure_advice() {
-                        target.clone_from_slice(&advice_ref[idx][..]);
+                        &advice_ref[idx][..]
                     } else {
                         unreachable!()
                     }
                 };
 
-                shuffle_groups
+                let buffer_groups = shuffle_groups
                     .par_iter()
-                    .zip(buffer_groups.par_iter_mut())
-                    .for_each(|(group, buffers)| {
-                        group.0.par_iter().zip(buffers.par_iter_mut()).for_each(
-                            |(elements, buffer)| {
+                    .zip(more_buffer_groups.par_iter_mut())
+                    .map(|(group, buffers)| {
+                        group
+                            .0
+                            .par_iter()
+                            .zip(buffers.par_iter_mut())
+                            .map(|(elements, buffer)| {
                                 let mut tuple_expres = vec![];
-                                if elements.input_expressions.len() == 1
-                                    && is_expression_pure_unit(&elements.input_expressions[0])
+                                if !(elements.input_expressions.len() == 1
+                                    && is_expression_pure_unit(&elements.input_expressions[0]))
                                 {
-                                    f(&elements.input_expressions[0], &mut buffer.0[..])
-                                } else {
-                                    tuple_expres
-                                        .push((&elements.input_expressions[..], &mut buffer.0[..]))
+                                    tuple_expres.push((
+                                        &elements.input_expressions[..],
+                                        buffer.0.as_mut().unwrap(),
+                                    ));
                                 }
-                                if elements.shuffle_expressions.len() == 1
-                                    && is_expression_pure_unit(&elements.shuffle_expressions[0])
+                                if !(elements.shuffle_expressions.len() == 1
+                                    && is_expression_pure_unit(&elements.shuffle_expressions[0]))
                                 {
-                                    f(&elements.shuffle_expressions[0], &mut buffer.1[..])
-                                } else {
                                     tuple_expres.push((
                                         &elements.shuffle_expressions[..],
-                                        &mut buffer.1[..],
+                                        buffer.1.as_mut().unwrap(),
                                     ))
                                 }
                                 tuple_expres.into_par_iter().for_each(|(expr, buffer)| {
@@ -1006,9 +1051,26 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                         buffer,
                                     )
                                 });
-                            },
-                        );
-                    });
+
+                                let input_buffer_ref = if elements.input_expressions.len() == 1
+                                    && is_expression_pure_unit(&elements.input_expressions[0])
+                                {
+                                    f(&elements.input_expressions[0])
+                                } else {
+                                    buffer.0.as_ref().unwrap()
+                                };
+                                let shuffle_buffer_ref = if elements.shuffle_expressions.len() == 1
+                                    && is_expression_pure_unit(&elements.shuffle_expressions[0])
+                                {
+                                    f(&elements.shuffle_expressions[0])
+                                } else {
+                                    buffer.1.as_ref().unwrap()
+                                };
+                                (input_buffer_ref, shuffle_buffer_ref)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
 
                 let mut p_z = buffer_groups
                     .par_iter()
@@ -1383,7 +1445,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let eval_buf = &t_buf;
         let tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         for (_, (p, arr)) in collection {
+            //let timer = start_timer!(|| "eval copy");
             device.copy_from_host_to_device(poly_buf, p)?;
+            //end_timer!(timer);
+            //let timer = start_timer!(|| "eval core");
             for (idx, x) in arr {
                 if !deg_buffer.contains_key(&x) {
                     let mut buf = vec![*x];
@@ -1405,9 +1470,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     crate::device::cuda::to_result((), err, "fail to run poly_eval")?;
                 }
                 device.copy_from_device_to_host(&mut evals[idx..idx + 1], eval_buf)?;
-
                 eval_map.insert((p.as_ptr() as usize, *x), evals[idx]);
             }
+            //end_timer!(timer);
         }
 
         for (_i, eval) in evals.into_iter().skip(1).enumerate() {
