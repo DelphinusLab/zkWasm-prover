@@ -489,6 +489,65 @@ pub fn intt_raw(
     )
 }
 
+pub fn batch_intt_raw<F: FieldExt>(
+    device: &CudaDevice,
+    value: Vec<&mut [F]>,
+    pq_buf: &CudaDeviceBufRaw,
+    omegas_buf: &CudaDeviceBufRaw,
+    divisor: &CudaDeviceBufRaw,
+    len_log: usize,
+) -> Result<(), Error> {
+    const MAX_CONCURRENCY: usize = 3;
+
+    let size = 1 << len_log;
+    let mut streams = [None; MAX_CONCURRENCY];
+    let mut t_buf =
+        [0; MAX_CONCURRENCY].map(|_| device.alloc_device_buffer::<F>(size).unwrap());
+    let mut s_buf =
+        [0; MAX_CONCURRENCY].map(|_| device.alloc_device_buffer::<F>(size).unwrap());
+
+    for (i, col) in value.into_iter().enumerate() {
+        let idx = i % MAX_CONCURRENCY;
+        let s_buf = &mut s_buf[idx];
+        let t_buf = &mut t_buf[idx];
+
+        unsafe {
+            if let Some(last_stream) = streams[idx] {
+                cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                cuda_runtime_sys::cudaStreamDestroy(last_stream);
+            }
+
+            let mut stream = std::mem::zeroed();
+            let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+            crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
+            device.copy_from_host_to_device_async(&s_buf, &col[..], stream)?;
+            intt_raw_async(
+                &device,
+                s_buf,
+                t_buf,
+                &pq_buf,
+                &omegas_buf,
+                &divisor,
+                len_log,
+                Some(stream),
+            )?;
+            device.copy_from_device_to_host_async(&mut col[..], &s_buf, stream)?;
+            streams[idx] = Some(stream);
+        }
+    }
+
+    for idx in 0..MAX_CONCURRENCY {
+        if let Some(last_stream) = streams[idx] {
+            unsafe {
+                cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                cuda_runtime_sys::cudaStreamDestroy(last_stream);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn intt_raw_async(
     device: &CudaDevice,
     s_buf: &mut CudaDeviceBufRaw,
