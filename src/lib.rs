@@ -42,6 +42,7 @@ use crate::device::cuda::CudaDeviceBufRaw;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
 use crate::hugetlb::HugePageAllocator;
+use crate::hugetlb::UnpinnedHugePageAllocator;
 use crate::multiopen::gwc;
 use crate::multiopen::lookup_open;
 use crate::multiopen::permutation_product_open;
@@ -60,7 +61,7 @@ const ADD_RANDOM: bool = true;
 
 pub fn prepare_advice_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
-    pin_memory: bool,
+    _pin_memory: bool,
 ) -> Vec<Vec<C::Scalar, HugePageAllocator>> {
     let rows = 1 << pk.get_vk().domain.k();
     let columns = pk.get_vk().cs.num_advice_columns;
@@ -75,7 +76,7 @@ pub fn prepare_advice_buffer<C: CurveAffine>(
         .collect::<Vec<_>>();
 
     let device = CudaDevice::get_device(0).unwrap();
-    if true {
+    if false {
         for x in advices.iter() {
             device.pin_memory(&x[..]).unwrap();
         }
@@ -159,8 +160,8 @@ fn lookup_classify<'a, 'b, C: CurveAffine, T>(
 }
 
 fn handle_lookup_pair<F: FieldExt>(
-    input: &mut Vec<F, HugePageAllocator>,
-    table: &mut Vec<F, HugePageAllocator>,
+    input: &mut Vec<F, UnpinnedHugePageAllocator>,
+    table: &mut Vec<F, UnpinnedHugePageAllocator>,
     mut permuted_input: Vec<F, HugePageAllocator>,
     mut permuted_table: Vec<F, HugePageAllocator>,
     unusable_rows_start: usize,
@@ -177,7 +178,7 @@ fn handle_lookup_pair<F: FieldExt>(
     permuted_input[0..unusable_rows_start].sort_unstable_by(compare);
     sorted_table[0..unusable_rows_start].sort_unstable_by(compare);
 
-    let mut permuted_table_state = Vec::new_in(HugePageAllocator);
+    let mut permuted_table_state = Vec::new_in(UnpinnedHugePageAllocator);
     permuted_table_state.resize(input.len(), false);
 
     permuted_input
@@ -390,8 +391,8 @@ pub fn prepare_lookup_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
 ) -> Result<
     Vec<(
-        Vec<C::Scalar, HugePageAllocator>,
-        Vec<C::Scalar, HugePageAllocator>,
+        Vec<C::Scalar, UnpinnedHugePageAllocator>,
+        Vec<C::Scalar, UnpinnedHugePageAllocator>,
         Vec<C::Scalar, HugePageAllocator>,
         Vec<C::Scalar, HugePageAllocator>,
         Vec<C::Scalar, HugePageAllocator>,
@@ -406,9 +407,9 @@ pub fn prepare_lookup_buffer<C: CurveAffine>(
         .lookups
         .par_iter()
         .map(|_| {
-            let mut input = Vec::new_in(HugePageAllocator);
+            let mut input = Vec::new_in(UnpinnedHugePageAllocator);
             input.resize(size, C::Scalar::zero());
-            let mut table = Vec::new_in(HugePageAllocator);
+            let mut table = Vec::new_in(UnpinnedHugePageAllocator);
             table.resize(size, C::Scalar::zero());
             let mut permuted_input = Vec::new_in(HugePageAllocator);
             permuted_input.resize(size, C::Scalar::zero());
@@ -417,7 +418,7 @@ pub fn prepare_lookup_buffer<C: CurveAffine>(
             let mut z = Vec::new_in(HugePageAllocator);
             z.resize(size, C::Scalar::zero());
 
-            if true {
+            if false {
                 let device = CudaDevice::get_device(0).unwrap();
                 device.pin_memory(&permuted_input[..]).unwrap();
                 device.pin_memory(&permuted_table[..]).unwrap();
@@ -450,7 +451,7 @@ pub fn prepare_permutation_buffers<C: CurveAffine>(
             let mut z = Vec::new_in(HugePageAllocator);
             z.resize(size, C::Scalar::one());
 
-            if true {
+            if false {
                 let device = CudaDevice::get_device(0).unwrap();
                 device.pin_memory(&z[..]).unwrap();
             }
@@ -480,7 +481,7 @@ pub fn prepare_shuffle_buffers<C: CurveAffine>(
             let mut z = Vec::new_in(HugePageAllocator);
             z.resize(size, C::Scalar::one());
 
-            if true {
+            if false {
                 let device = CudaDevice::get_device(0).unwrap();
                 device.pin_memory(&z[..]).unwrap();
             }
@@ -522,10 +523,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     let mut instance = Vec::new_in(HugePageAllocator);
                     instance.resize(size, C::Scalar::zero());
                     instance[0..x.len()].clone_from_slice(&x[..]);
-
-                    let device = CudaDevice::get_device(0).unwrap();
-                    device.pin_memory(&instance[..]).unwrap();
-
                     instance
                 })
                 .collect::<Vec<_>>(),
@@ -982,7 +979,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                 {
                                     None
                                 } else {
-                                    let mut buffer = Vec::new_in(HugePageAllocator);
+                                    let mut buffer = Vec::new_in(UnpinnedHugePageAllocator);
                                     buffer.resize(size, C::Scalar::zero());
                                     Some(buffer)
                                 };
@@ -992,7 +989,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                 {
                                     None
                                 } else {
-                                    let mut buffer = Vec::new_in(HugePageAllocator);
+                                    let mut buffer = Vec::new_in(UnpinnedHugePageAllocator);
                                     buffer.resize(size, C::Scalar::zero());
                                     Some(buffer)
                                 };
@@ -1165,10 +1162,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
 
                     for (d_buf, h_buf) in [
-                        (&input_buf, input),
-                        (&table_buf, table),
-                        (&permuted_input_buf, permuted_input),
-                        (&permuted_table_buf, permuted_table),
+                        (&input_buf, &mut input[..]),
+                        (&table_buf, &mut table[..]),
+                        (&permuted_input_buf, &mut permuted_input[..]),
+                        (&permuted_table_buf, &mut permuted_table[..]),
                     ] {
                         device.copy_from_host_to_device_async(d_buf, &h_buf[..], stream)?;
                     }
