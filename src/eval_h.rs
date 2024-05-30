@@ -281,6 +281,10 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
             None,
         )?;
 
+        if ctx.size >= 1 << 23 {
+            ctx.extended_allocator.clear();
+        }
+
         let timer = start_timer!(|| format!("vanishing msm {}", domain.quotient_poly_degree));
         for i in 0..domain.quotient_poly_degree as usize {
             let s_buf = unsafe {
