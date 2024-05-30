@@ -13,9 +13,12 @@ thread_local! {
     static ACITVE_CUDA_DEVICE: RefCell<i32> = RefCell::new(-1);
 }
 
+const HUGE_BUFFER_SIZE: usize = 1 << 30;
+
 lazy_static! {
     pub static ref CUDA_BUFFER_CACHE: Mutex<HashMap::<(i32, usize), Vec<usize>>> =
         Mutex::new(HashMap::new());
+    pub static ref HUGE_CUDA_BUFFER_CACHE: Mutex<Vec<usize>> = Mutex::new(vec![]);
 }
 
 #[derive(Debug, Clone)]
@@ -90,15 +93,19 @@ extern "C" {
 
 impl Drop for CudaDeviceBufRaw {
     fn drop(&mut self) {
-        if true {
-            let mut cache = CUDA_BUFFER_CACHE.lock().unwrap();
-            let arr = cache
-                .entry((self.device.device, self.size))
-                .or_insert(vec![]);
-            assert!(!arr.contains(&(self.ptr() as usize)));
-            arr.push(self.ptr() as usize);
-        }
-        if false {
+        if self.size < HUGE_BUFFER_SIZE {
+            if self.size >= HUGE_BUFFER_SIZE {
+                let mut cache = HUGE_CUDA_BUFFER_CACHE.lock().unwrap();
+                cache.push(self.ptr() as usize);
+            } else {
+                let mut cache = CUDA_BUFFER_CACHE.lock().unwrap();
+                let arr = cache
+                    .entry((self.device.device, self.size))
+                    .or_insert(vec![]);
+                assert!(!arr.contains(&(self.ptr() as usize)));
+                arr.push(self.ptr() as usize);
+            }
+        } else {
             self.device().acitve_ctx().unwrap();
             unsafe {
                 //let timer = start_timer!(|| "cuda free");
@@ -185,6 +192,21 @@ impl CudaDevice {
                         ptr: arr.pop().unwrap() as *mut c_void,
                         device: self.clone(),
                         size,
+                    };
+                    if zero {
+                        cuda_runtime_sys::cudaMemset(ret.ptr(), 0, size);
+                    }
+                    return Ok(ret);
+                }
+            }
+
+            {
+                let mut cache = HUGE_CUDA_BUFFER_CACHE.lock().unwrap();
+                if cache.len() > 0 {
+                    let ret = CudaDeviceBufRaw {
+                        ptr: cache.pop().unwrap() as *mut c_void,
+                        device: self.clone(),
+                        size: HUGE_BUFFER_SIZE,
                     };
                     if zero {
                         cuda_runtime_sys::cudaMemset(ret.ptr(), 0, size);
