@@ -554,17 +554,17 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             .unwrap();
         end_timer!(timer);
 
-        let timer = start_timer!(|| "prepare buffers");
-        let lookups = prepare_lookup_buffer(pk)?;
-        let permutations = prepare_permutation_buffers(pk)?;
-        let shuffles = prepare_shuffle_buffers(pk)?;
-        end_timer!(timer);
-
         // thread for part of lookups
         let sub_pk = pk.clone();
         let sub_advices = advices.clone();
         let sub_instances = instances.clone();
         let lookup_handler = s.spawn(move || {
+            let timer = start_timer!(|| "prepare buffers");
+            let lookups = prepare_lookup_buffer(pk).unwrap();
+            let permutations = prepare_permutation_buffers(pk).unwrap();
+            let shuffles = prepare_shuffle_buffers(pk).unwrap();
+            end_timer!(timer);
+
             let pk = sub_pk;
             let advices = sub_advices;
             let instances = sub_instances;
@@ -643,7 +643,13 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .collect::<Vec<_>>();
             end_timer!(timer);
 
-            (single_unit_lookups, single_comp_lookups, tuple_lookups)
+            (
+                single_unit_lookups,
+                single_comp_lookups,
+                tuple_lookups,
+                permutations,
+                shuffles,
+            )
         });
 
         let s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
@@ -675,8 +681,13 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let theta: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
         let timer = start_timer!(|| "wait single lookups");
-        let (mut single_unit_lookups, mut single_comp_lookups, mut tuple_lookups) =
-            lookup_handler.join().unwrap();
+        let (
+            mut single_unit_lookups,
+            mut single_comp_lookups,
+            mut tuple_lookups,
+            mut permutations,
+            mut shuffles,
+        ) = lookup_handler.join().unwrap();
         end_timer!(timer);
 
         // After theta
@@ -843,6 +854,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         let mut delta_omega =
                             C::Scalar::DELTA.pow_vartime([i as u64 * chunk_len as u64]);
 
+                        let chunk_size = size >> 2;
                         // Iterate over each column of the permutation
                         for (&column, permuted_column_values) in
                             columns.iter().zip(permutations.iter())
@@ -852,7 +864,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                 Any::Fixed => fixed_ref,
                                 Any::Instance => instance_ref,
                             };
-                            let chunk_size = size >> 2;
                             modified_values
                                 .par_chunks_mut(chunk_size)
                                 .zip(permuted_column_values.par_chunks(chunk_size))
@@ -865,7 +876,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         }
 
                         // Invert to obtain the denominator for the permutation product polynomial
-                        modified_values.iter_mut().batch_invert();
+                        modified_values.par_chunks_mut(chunk_size).for_each(|x| {
+                            x.iter_mut().batch_invert();
+                        });
 
                         // Iterate over each column again, this time finishing the computation
                         // of the entire fraction by computing the numerators
@@ -876,7 +889,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                 Any::Instance => instance_ref,
                             };
 
-                            let chunk_size = size >> 2;
                             modified_values
                                 .par_chunks_mut(chunk_size)
                                 .zip(values[column.index()].par_chunks(chunk_size))
@@ -944,7 +956,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let shuffle_products_handler = {
             let shuffle_groups = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
             let timer = start_timer!(|| format!(
-                "product shuffles total={},group={}",
+                "product shuffles total={}, group={}",
                 (&pk).vk.cs.shuffles.0.len(),
                 shuffle_groups.len()
             ));
@@ -1094,7 +1106,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                         }
                                     })
                             });
-                        modified_values.iter_mut().batch_invert();
+                        modified_values.par_chunks_mut(chunk_size).for_each(|x| {
+                            x.iter_mut().batch_invert();
+                        });
                         group
                             .iter()
                             .zip(beta_pows.iter())
