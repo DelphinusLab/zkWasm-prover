@@ -6,6 +6,7 @@ extern crate lazy_static;
 
 use std::collections::BTreeMap;
 use std::iter;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -14,6 +15,7 @@ use std::thread;
 use ark_std::end_timer;
 use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
+use cuda::bn254::intt_raw_async;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
@@ -37,6 +39,9 @@ use crate::cuda::bn254::batch_intt_raw;
 use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::msm_single_buffer;
 use crate::cuda::bn254::ntt_prepare;
+use crate::cuda::bn254_c::eval_lookup_z;
+use crate::device::cuda::to_result;
+use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
 use crate::device::cuda::CudaDeviceBufRaw;
 use crate::device::Device as _;
@@ -160,8 +165,8 @@ fn lookup_classify<'a, 'b, C: CurveAffine, T>(
 }
 
 fn handle_lookup_pair<F: FieldExt>(
-    input: &mut Vec<F, UnpinnedHugePageAllocator>,
-    table: &mut Vec<F, UnpinnedHugePageAllocator>,
+    input: &mut Vec<F, HugePageAllocator>,
+    table: &mut Vec<F, HugePageAllocator>,
     mut permuted_input: Vec<F, HugePageAllocator>,
     mut permuted_table: Vec<F, HugePageAllocator>,
     unusable_rows_start: usize,
@@ -391,8 +396,8 @@ pub fn prepare_lookup_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
 ) -> Result<
     Vec<(
-        Vec<C::Scalar, UnpinnedHugePageAllocator>,
-        Vec<C::Scalar, UnpinnedHugePageAllocator>,
+        Vec<C::Scalar, HugePageAllocator>,
+        Vec<C::Scalar, HugePageAllocator>,
         Vec<C::Scalar, HugePageAllocator>,
         Vec<C::Scalar, HugePageAllocator>,
         Vec<C::Scalar, HugePageAllocator>,
@@ -407,9 +412,9 @@ pub fn prepare_lookup_buffer<C: CurveAffine>(
         .lookups
         .par_iter()
         .map(|_| {
-            let mut input = Vec::new_in(UnpinnedHugePageAllocator);
+            let mut input = Vec::new_in(HugePageAllocator);
             input.resize(size, C::Scalar::zero());
-            let mut table = Vec::new_in(UnpinnedHugePageAllocator);
+            let mut table = Vec::new_in(HugePageAllocator);
             table.resize(size, C::Scalar::zero());
             let mut permuted_input = Vec::new_in(HugePageAllocator);
             permuted_input.resize(size, C::Scalar::zero());
@@ -685,8 +690,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             mut single_unit_lookups,
             mut single_comp_lookups,
             mut tuple_lookups,
-            mut permutations,
-            mut shuffles,
+            permutations,
+            shuffles,
         ) = lookup_handler.join().unwrap();
         end_timer!(timer);
 
@@ -1149,39 +1154,44 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             shuffle_products_handler
         };
 
+        let timer = start_timer!(|| "prepare ntt");
+        let (intt_omegas_buf, intt_pq_buf) =
+            ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
+        let intt_divisor_buf = device
+            .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
+        end_timer!(timer);
+
         let timer = start_timer!(|| "generate lookup z");
         {
-            let mut last_stream = None;
-            let mut last_z_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-            let mut last_input_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-            let mut last_table_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-            let mut last_permuted_input_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-            let mut last_permuted_table_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-
-            let mut z_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-            let mut input_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-            let mut table_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-            let mut permuted_input_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-            let mut permuted_table_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            const MAX_CONCURRENCY: usize = 3;
+            let mut streams = [None; MAX_CONCURRENCY];
+            let mut buffers = [0; MAX_CONCURRENCY].map(|_| {
+                Rc::new([0; 5].map(|_| (device.alloc_device_buffer::<C::Scalar>(size).unwrap())))
+            });
 
             let beta_gamma_buf = device.alloc_device_buffer_from_slice(&[beta, gamma])?;
-            for (_, (permuted_input, permuted_table, input, table, z)) in lookups.iter_mut() {
+            for (i, (permuted_input, permuted_table, input, table, z)) in lookups.iter_mut() {
                 unsafe {
-                    use crate::cuda::bn254_c::eval_lookup_z;
-                    use crate::device::cuda::to_result;
-                    use crate::device::cuda::CudaBuffer;
+                    let idx = *i % MAX_CONCURRENCY;
+                    let [z_buf, input_buf, table_buf, permuted_input_buf, permuted_table_buf] =
+                        Rc::get_mut(&mut buffers[idx]).unwrap();
+
+                    if let Some(last_stream) = streams[idx] {
+                        cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                        cuda_runtime_sys::cudaStreamDestroy(last_stream);
+                    }
 
                     let mut stream = std::mem::zeroed();
                     let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
                     crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
 
                     for (d_buf, h_buf) in [
-                        (&input_buf, &mut input[..]),
-                        (&table_buf, &mut table[..]),
-                        (&permuted_input_buf, &mut permuted_input[..]),
-                        (&permuted_table_buf, &mut permuted_table[..]),
+                        (&*input_buf, &mut input[..]),
+                        (&*table_buf, &mut table[..]),
+                        (&*permuted_input_buf, &mut permuted_input[..]),
+                        (&*permuted_table_buf, &mut permuted_table[..]),
                     ] {
-                        device.copy_from_host_to_device_async(d_buf, &h_buf[..], stream)?;
+                        device.copy_from_host_to_device_async(d_buf, h_buf, stream)?;
                     }
 
                     let err = eval_lookup_z(
@@ -1197,44 +1207,48 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                     to_result((), err, "failed to run eval_lookup_z")?;
 
+                    for (s_buf, t_buf) in [
+                        (&mut *permuted_input_buf, &mut *input_buf),
+                        (&mut *permuted_table_buf, &mut *table_buf),
+                    ] {
+                        intt_raw_async(
+                            &device,
+                            s_buf,
+                            t_buf,
+                            &intt_pq_buf,
+                            &intt_omegas_buf,
+                            &intt_divisor_buf,
+                            k,
+                            Some(stream),
+                        )?;
+                    }
+
+                    for (col, s_buf) in [
+                        (&mut permuted_input[..], permuted_input_buf),
+                        (&mut permuted_table[..], permuted_table_buf),
+                    ] {
+                        device.copy_from_device_to_host_async(col, &s_buf, stream)?;
+                    }
+
                     device
                         .copy_from_device_to_host_async(&mut z[..], &z_buf, stream)
                         .unwrap();
 
-                    if let Some(last_stream) = last_stream {
-                        cuda_runtime_sys::cudaStreamSynchronize(last_stream);
-                        cuda_runtime_sys::cudaStreamDestroy(last_stream);
-                    }
-
-                    last_stream = Some(stream);
-                    std::mem::swap(&mut z_buf, &mut last_z_buf);
-                    std::mem::swap(&mut input_buf, &mut last_input_buf);
-                    std::mem::swap(&mut table_buf, &mut last_table_buf);
-                    std::mem::swap(&mut permuted_input_buf, &mut last_permuted_input_buf);
-                    std::mem::swap(&mut permuted_table_buf, &mut last_permuted_table_buf);
+                    streams[idx] = Some(stream);
                 }
             }
 
             unsafe {
-                if let Some(last_stream) = last_stream {
-                    cuda_runtime_sys::cudaStreamSynchronize(last_stream);
-                    cuda_runtime_sys::cudaStreamDestroy(last_stream);
+                for last_stream in streams {
+                    if let Some(last_stream) = last_stream {
+                        cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                        cuda_runtime_sys::cudaStreamDestroy(last_stream);
+                    }
                 }
             }
         }
-        let mut lookups = lookups
-            .into_iter()
-            .map(|(_, (permuted_input, permuted_table, input, table, z))| {
-                (permuted_input, permuted_table, input, table, z)
-            })
-            .collect::<Vec<_>>();
-        end_timer!(timer);
 
-        let timer = start_timer!(|| "prepare ntt");
-        let (intt_omegas_buf, intt_pq_buf) =
-            ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
-        let intt_divisor_buf = device
-            .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
+        let mut lookups = lookups.into_iter().map(|(_, b)| b).collect::<Vec<_>>();
         end_timer!(timer);
 
         let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
@@ -1249,7 +1263,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let timer = start_timer!(|| "lookups intt");
         let buffers = lookups
             .iter_mut()
-            .map(|(a, b, _, _, c)| vec![&mut a[..], &mut b[..], &mut c[..]])
+            .map(|(a, b, _, _, c)|
+                //vec![&mut a[..], &mut b[..], &mut c[..]]
+                vec![&mut c[..]])
             .flatten()
             .collect::<Vec<_>>();
         batch_intt_raw(
@@ -1473,7 +1489,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 }
 
                 unsafe {
-                    use crate::device::cuda::CudaBuffer;
                     let err = crate::cuda::bn254_c::poly_eval(
                         poly_buf.ptr(),
                         eval_buf.ptr(),
