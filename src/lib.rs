@@ -557,6 +557,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let g_lagrange_buf = device
             .alloc_device_buffer_from_slice(&params.g_lagrange[..])
             .unwrap();
+        let g_buf = device
+            .alloc_device_buffer_from_slice(&params.g[..])
+            .unwrap();
         end_timer!(timer);
 
         // thread for part of lookups
@@ -861,8 +864,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                         let chunk_size = size >> 2;
                         // Iterate over each column of the permutation
-                        for (&column, permuted_column_values) in
-                            columns.iter().zip(permutations.iter())
+                        for (j, (&column, permuted_column_values)) in
+                            columns.iter().zip(permutations.iter()).enumerate()
                         {
                             let values = match column.column_type() {
                                 Any::Advice => advice_ref,
@@ -875,7 +878,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                 .zip(values[column.index()].par_chunks(chunk_size))
                                 .for_each(|((res, p), v)| {
                                     for i in 0..chunk_size {
-                                        res[i] *= &(beta * p[i] + &gamma + v[i]);
+                                        if j == 0 {
+                                            res[i] = beta * p[i] + &gamma + v[i];
+                                        } else {
+                                            res[i] *= &(beta * p[i] + &gamma + v[i]);
+                                        }
                                     }
                                 });
                         }
@@ -900,9 +907,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                 .enumerate()
                                 .for_each(|(idx, (res, v))| {
                                     let mut delta_omega = delta_omega
-                                        * omega.pow_vartime([(idx * chunk_size) as u64]);
+                                        * omega.pow_vartime([(idx * chunk_size) as u64])
+                                        * &beta;
                                     for i in 0..chunk_size {
-                                        res[i] *= &(delta_omega * &beta + &gamma + v[i]);
+                                        res[i] *= &(delta_omega + &gamma + v[i]);
                                         delta_omega *= &omega;
                                     }
                                 });
@@ -1098,19 +1106,22 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             .collect();
 
                         let chunk_size = size >> 2;
-                        group
-                            .iter()
-                            .zip(beta_pows.iter())
-                            .for_each(|(e, beta_pow_i)| {
+                        group.iter().zip(beta_pows.iter()).enumerate().for_each(
+                            |(j, (e, beta_pow_i))| {
                                 modified_values
                                     .par_chunks_mut(chunk_size)
                                     .zip(e.1.par_chunks(chunk_size))
                                     .for_each(|(values, shuffles)| {
                                         for i in 0..chunk_size {
-                                            values[i] *= &(shuffles[i] + beta_pow_i);
+                                            if j == 0 {
+                                                values[i] = shuffles[i] + beta_pow_i;
+                                            } else {
+                                                values[i] *= &(shuffles[i] + beta_pow_i);
+                                            }
                                         }
                                     })
-                            });
+                            },
+                        );
                         modified_values.par_chunks_mut(chunk_size).for_each(|x| {
                             x.iter_mut().batch_invert();
                         });
@@ -1132,11 +1143,33 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     .collect::<Vec<_>>();
 
                 p_z.par_iter_mut().for_each(|z| {
-                    let mut tmp = C::Scalar::one();
-                    for i in 0..size {
-                        std::mem::swap(&mut tmp, &mut z[i]);
-                        tmp = tmp * z[i];
+                    let chunks = 4;
+                    let chunk_size = (size + chunks - 1) / chunks;
+
+                    let mut tails = z
+                        .par_chunks_mut(chunk_size)
+                        .map(|z| {
+                            let mut tmp = C::Scalar::one();
+                            for i in 0..z.len() {
+                                std::mem::swap(&mut tmp, &mut z[i]);
+                                tmp = tmp * z[i];
+                            }
+                            tmp
+                        })
+                        .collect::<Vec<_>>();
+
+                    for i in 1..tails.len() {
+                        tails[i] = tails[i] * tails[i - 1];
                     }
+
+                    z.par_chunks_mut(chunk_size)
+                        .skip(1)
+                        .zip(tails.into_par_iter())
+                        .for_each(|(z, tail)| {
+                            for x in z.iter_mut() {
+                                *x = *x * tail;
+                            }
+                        });
 
                     if ADD_RANDOM {
                         for v in z[unusable_rows_start + 1..].iter_mut() {
@@ -1207,14 +1240,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                     to_result((), err, "failed to run eval_lookup_z")?;
 
-                    for (s_buf, t_buf) in [
-                        (&mut *permuted_input_buf, &mut *input_buf),
-                        (&mut *permuted_table_buf, &mut *table_buf),
+                    for s_buf in [
+                        &mut *permuted_input_buf,
+                        &mut *permuted_table_buf,
+                        &mut *z_buf,
                     ] {
                         intt_raw_async(
                             &device,
                             s_buf,
-                            t_buf,
+                            &mut *input_buf,
                             &intt_pq_buf,
                             &intt_omegas_buf,
                             &intt_divisor_buf,
@@ -1226,13 +1260,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     for (col, s_buf) in [
                         (&mut permuted_input[..], permuted_input_buf),
                         (&mut permuted_table[..], permuted_table_buf),
+                        (&mut z[..], z_buf),
                     ] {
                         device.copy_from_device_to_host_async(col, &s_buf, stream)?;
                     }
-
-                    device
-                        .copy_from_device_to_host_async(&mut z[..], &z_buf, stream)
-                        .unwrap();
 
                     streams[idx] = Some(stream);
                 }
@@ -1253,28 +1284,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
         let lookup_z_commitments = crate::cuda::bn254::batch_msm::<C>(
-            &g_lagrange_buf,
+            &g_buf,
             [&s_buf, &t_buf],
             lookups.iter().map(|x| &x.4[..]).collect::<Vec<_>>(),
             size,
-        )?;
-        end_timer!(timer);
-
-        let timer = start_timer!(|| "lookups intt");
-        let buffers = lookups
-            .iter_mut()
-            .map(|(a, b, _, _, c)|
-                //vec![&mut a[..], &mut b[..], &mut c[..]]
-                vec![&mut c[..]])
-            .flatten()
-            .collect::<Vec<_>>();
-        batch_intt_raw(
-            &device,
-            buffers,
-            &intt_pq_buf,
-            &intt_omegas_buf,
-            &intt_divisor_buf,
-            k,
         )?;
         end_timer!(timer);
 
@@ -1394,9 +1407,17 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .iter()
                 .map(|x| &x[..])
                 .collect::<Vec<_>>()[..],
-            &lookups
-                .iter()
-                .map(|(v0, v1, v2, v3, v4)| (&v0[..], &v1[..], &v2[..], &v3[..], &v4[..]))
+            &mut lookups
+                .iter_mut()
+                .map(|(v0, v1, v2, v3, v4)| {
+                    (
+                        &mut v0[..],
+                        &mut v1[..],
+                        &mut v2[..],
+                        &mut v3[..],
+                        &mut v4[..],
+                    )
+                })
                 .collect::<Vec<_>>()[..],
             &shuffle_products.iter().map(|x| &x[..]).collect::<Vec<_>>()[..],
             y,
@@ -1458,7 +1479,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             inputs.push((&z, x_next));
         }
 
-        let timer = start_timer!(|| format!("compute eval {}", inputs.len()));
         let mut collection = BTreeMap::new();
         let mut deg_buffer = BTreeMap::new();
         for (idx, (p, x)) in inputs.iter().enumerate() {
@@ -1469,6 +1489,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         }
         let mut evals = vec![C::Scalar::zero(); inputs.len()];
 
+        let timer = start_timer!(|| format!("compute eval {}", collection.len()));
         let mut eval_map = BTreeMap::new();
 
         let poly_buf = &s_buf;
