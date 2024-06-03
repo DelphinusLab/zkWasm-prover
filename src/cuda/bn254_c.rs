@@ -107,6 +107,7 @@ extern "C" {
         gamma: *mut c_void,
         rot: i32,
         n: i32,
+        stream: *mut CUstream_st,
     ) -> cudaError;
 
     pub fn shuffle_eval_h(

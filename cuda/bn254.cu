@@ -1116,11 +1116,12 @@ extern "C"
         const Bn254FrField *beta,
         const Bn254FrField *gamma,
         int rot,
-        int n)
+        int n,
+        cudaStream_t stream)
     {
         int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
-        _lookup_eval_h<<<blocks, threads>>>(
+        _lookup_eval_h<<<blocks, threads, 0, stream>>>(
             res,
             input, table, permuted_input, permuted_table, z,
             l0, l_last, l_active_row,
