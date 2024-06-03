@@ -28,6 +28,7 @@ use crate::cuda::bn254::field_op_v2;
 use crate::cuda::bn254::field_op_v3;
 use crate::cuda::bn254::field_sub;
 use crate::cuda::bn254::intt_raw;
+use crate::cuda::bn254::intt_raw_async;
 use crate::cuda::bn254::msm_single_buffer;
 use crate::cuda::bn254::ntt_prepare;
 use crate::cuda::bn254::ntt_raw;
@@ -127,12 +128,12 @@ pub fn _export_evaluate_h_gates<C: CurveAffine>(
     advice: &[&[C::Scalar]],
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
-    lookup_products: &[(
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
+    lookup_products: &mut [(
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
     )],
     shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
@@ -185,12 +186,12 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     advice: &[&[C::Scalar]],
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
-    lookup_products: &[(
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
+    lookup_products: &mut [(
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
     )],
     shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
@@ -356,12 +357,12 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     advice: &[&[C::Scalar]],
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
-    lookup_products: &[(
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
+    lookup_products: &mut [(
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
     )],
     shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
@@ -542,7 +543,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
         .cs
         .lookups
         .iter()
-        .zip(lookup_products.iter())
+        .zip(lookup_products.into_iter())
         .enumerate()
     {
         let input_deg = get_expr_degree(&lookup.input_expressions);
@@ -607,11 +608,18 @@ fn evaluate_h_gates_core<C: CurveAffine>(
             buf
         };
 
-        let (permuted_input_buf, tmp0, stream0) =
+        let (z_buf, tmp2, stream0) = do_intt_and_extended_ntt_v2_async(
+            device,
+            &intt_pq_buf,
+            &intt_omegas_buf,
+            &intt_divisor_buf,
+            &mut ctx,
+            *z,
+        )?;
+        let (permuted_input_buf, tmp0, stream1) =
             do_extended_ntt_v2_async(device, &mut ctx, permuted_input)?;
-        let (permuted_table_buf, tmp1, stream1) =
+        let (permuted_table_buf, tmp1, stream2) =
             do_extended_ntt_v2_async(device, &mut ctx, permuted_table)?;
-        let (z_buf, tmp2, stream2) = do_extended_ntt_v2_async(device, &mut ctx, z)?;
 
         unsafe {
             cuda_runtime_sys::cudaStreamSynchronize(stream0);
@@ -892,6 +900,56 @@ fn do_extended_ntt_v2<F: FieldExt>(
     Ok(buf)
 }
 
+fn do_intt_and_extended_ntt_v2_async<F: FieldExt>(
+    device: &CudaDevice,
+    pq_buf: &CudaDeviceBufRaw,
+    omegas_buf: &CudaDeviceBufRaw,
+    divisor: &CudaDeviceBufRaw,
+    ctx: &mut EvalHContext<F>,
+    data: &mut [F],
+) -> DeviceResult<(CudaDeviceBufRaw, CudaDeviceBufRaw, *mut CUstream_st)> {
+    let buf = ctx.extended_allocator.pop();
+    let mut s_buf = if buf.is_none() {
+        device.alloc_device_buffer::<F>(ctx.extended_size)?
+    } else {
+        buf.unwrap()
+    };
+
+    let buf = ctx.extended_allocator.pop();
+    let mut t_buf = if buf.is_none() {
+        device.alloc_device_buffer::<F>(ctx.extended_size)?
+    } else {
+        buf.unwrap()
+    };
+
+    let (tmp, stream) = unsafe {
+        let mut stream = std::mem::zeroed();
+        let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+        assert_eq!(err, cuda_runtime_sys::cudaError::cudaSuccess);
+        device.copy_from_host_to_device_async::<F>(&s_buf, data, stream)?;
+        /*
+        intt_raw_async(
+            device,
+            &mut s_buf,
+            &mut t_buf,
+            pq_buf,
+            omegas_buf,
+            divisor,
+            ctx.k,
+            Some(stream),
+        )?; */
+        //device.copy_from_device_to_device_async::<F>(&c_buf, &s_buf, ctx.size, stream)?;
+        do_extended_prepare(device, ctx, &mut s_buf, Some(stream))?;
+        //device.copy_from_device_to_host_async(data, &c_buf, stream)?;
+        let t_buf =
+            _do_extended_ntt_pure_async(device, ctx, &mut s_buf, Some(t_buf), Some(stream))?;
+        
+        (t_buf, stream)
+    };
+
+    Ok((s_buf, tmp, stream))
+}
+
 fn do_extended_ntt_v2_async<F: FieldExt>(
     device: &CudaDevice,
     ctx: &mut EvalHContext<F>,
@@ -945,13 +1003,14 @@ fn do_extended_ntt<F: FieldExt>(
     Ok(())
 }
 
-fn do_extended_ntt_pure_async<F: FieldExt>(
+fn _do_extended_ntt_pure_async<F: FieldExt>(
     device: &CudaDevice,
     ctx: &mut EvalHContext<F>,
     data: &mut CudaDeviceBufRaw,
+    tmp: Option<CudaDeviceBufRaw>,
     stream: Option<cudaStream_t>,
 ) -> DeviceResult<CudaDeviceBufRaw> {
-    let tmp = ctx.extended_allocator.pop();
+    let tmp = tmp.or_else(|| ctx.extended_allocator.pop());
     let mut tmp = if tmp.is_none() {
         device.alloc_device_buffer::<F>(ctx.extended_size)?
     } else {
@@ -967,6 +1026,15 @@ fn do_extended_ntt_pure_async<F: FieldExt>(
         stream,
     )?;
     Ok(tmp)
+}
+
+fn do_extended_ntt_pure_async<F: FieldExt>(
+    device: &CudaDevice,
+    ctx: &mut EvalHContext<F>,
+    data: &mut CudaDeviceBufRaw,
+    stream: Option<cudaStream_t>,
+) -> DeviceResult<CudaDeviceBufRaw> {
+    _do_extended_ntt_pure_async(device, ctx, data, None, stream)
 }
 
 fn do_extended_ntt_pure<F: FieldExt>(

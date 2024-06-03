@@ -230,6 +230,26 @@ impl CudaDevice {
             )
         }
     }
+
+    pub fn copy_from_device_to_device_async<T>(
+        &self,
+        dst: &CudaDeviceBufRaw,
+        src: &CudaDeviceBufRaw,
+        size: usize,
+        stream: cudaStream_t,
+    ) -> DeviceResult<()> {
+        self.acitve_ctx()?;
+        unsafe {
+            let res = cuda_runtime_sys::cudaMemcpyAsync(
+                dst.ptr(),
+                src.ptr(),
+                size * mem::size_of::<T>(),
+                cuda_runtime_sys::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream,
+            );
+            to_result((), res, "fail to copy memory from device to host")
+        }
+    }
 }
 
 impl Device<CudaDeviceBufRaw> for CudaDevice {
