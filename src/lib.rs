@@ -5,7 +5,9 @@
 extern crate lazy_static;
 
 use std::collections::BTreeMap;
+use std::collections::LinkedList;
 use std::iter;
+use std::mem::ManuallyDrop;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Condvar;
@@ -1480,50 +1482,117 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         }
 
         let mut collection = BTreeMap::new();
-        let mut deg_buffer = BTreeMap::new();
+        let mut x_sets = vec![];
         for (idx, (p, x)) in inputs.iter().enumerate() {
             collection
                 .entry(p.as_ptr() as usize)
                 .and_modify(|arr: &mut (_, Vec<_>)| arr.1.push((idx, x)))
                 .or_insert((p, vec![(idx, x)]));
+            x_sets.push(x);
         }
+        x_sets.sort_unstable();
+        x_sets.dedup();
+        let mut x_extend_sets = vec![];
+        for x in x_sets.iter() {
+            x_extend_sets.push(**x);
+            for i in 1..k {
+                x_extend_sets.push(x_extend_sets.last().unwrap().square());
+            }
+        }
+
+        let x_buf = device.alloc_device_buffer_from_slice(&x_extend_sets)?;
+        let mut x_map = BTreeMap::new();
+        for (i, x) in x_sets.into_iter().enumerate() {
+            x_map.insert(
+                x,
+                ManuallyDrop::new(CudaDeviceBufRaw {
+                    ptr: unsafe {
+                        x_buf
+                            .ptr()
+                            .offset((i * k * core::mem::size_of::<C::Scalar>()) as isize)
+                    },
+                    device: device.clone(),
+                    size: core::mem::size_of::<C::Scalar>(),
+                }),
+            );
+        }
+
         let mut evals = vec![C::Scalar::zero(); inputs.len()];
 
         let timer = start_timer!(|| format!("compute eval {}", collection.len()));
         let mut eval_map = BTreeMap::new();
 
-        let poly_buf = &s_buf;
-        let eval_buf = &t_buf;
-        let tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-        for (_, (p, arr)) in collection {
-            //let timer = start_timer!(|| "eval copy");
-            device.copy_from_host_to_device(poly_buf, p)?;
-            //end_timer!(timer);
-            //let timer = start_timer!(|| "eval core");
-            for (idx, x) in arr {
-                if !deg_buffer.contains_key(&x) {
-                    let mut buf = vec![*x];
-                    for _ in 1..k {
-                        buf.push(*buf.last().unwrap() * buf.last().unwrap());
-                    }
-                    deg_buffer.insert(x, device.alloc_device_buffer_from_slice(&buf)?);
-                }
+        let mut streams = vec![];
+        let mut bufs = vec![];
+        let max = 6;
+        for _ in 0..max {
+            bufs.push((
+                device.alloc_device_buffer::<C::Scalar>(size)?,
+                device.alloc_device_buffer::<C::Scalar>(size)?,
+                device.alloc_device_buffer::<C::Scalar>(size)?,
+            ));
+            unsafe {
+                let mut stream = std::mem::zeroed();
+                let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+                assert_eq!(err, cuda_runtime_sys::cudaError::cudaSuccess);
+                streams.push(stream);
+            }
+        }
 
-                unsafe {
+        let mut collection = collection.into_iter().collect::<Vec<_>>();
+        collection.sort_by(|a, b| a.1 .1.len().cmp(&b.1 .1.len()));
+
+        let mut l = 0;
+        let mut r = collection.len();
+        let mut inc = false;
+        while l < r {
+            let i = if inc { l } else { r - 1 };
+            if inc {
+                l += 1;
+            } else {
+                r -= 1;
+            }
+            inc = !inc;
+            let (p, arr) = &collection[i].1;
+            let p = *p;
+            unsafe {
+                let stream = streams[i % max];
+                let (poly_buf, eval_buf, tmp_buf) = &bufs[i % max];
+
+                device.copy_from_host_to_device_async(poly_buf, p, stream)?;
+                for (idx, x) in arr {
                     let err = crate::cuda::bn254_c::poly_eval(
                         poly_buf.ptr(),
                         eval_buf.ptr(),
                         tmp_buf.ptr(),
-                        deg_buffer.get(&x).unwrap().ptr(),
+                        x_map.get(x).unwrap().ptr(),
                         size as i32,
+                        stream,
                     );
                     crate::device::cuda::to_result((), err, "fail to run poly_eval")?;
+                    device.copy_from_device_to_host_async(
+                        &mut evals[*idx..*idx + 1],
+                        eval_buf,
+                        stream,
+                    )?;
+                    eval_map.insert(((*p).as_ptr() as usize, **x), *idx);
                 }
-                device.copy_from_device_to_host(&mut evals[idx..idx + 1], eval_buf)?;
-                eval_map.insert((p.as_ptr() as usize, *x), evals[idx]);
             }
-            //end_timer!(timer);
         }
+
+        for stream in streams {
+            unsafe {
+                cuda_runtime_sys::cudaStreamSynchronize(stream);
+                cuda_runtime_sys::cudaStreamDestroy(stream);
+            }
+        }
+
+        drop(bufs);
+
+        let eval_map = eval_map
+            .into_iter()
+            .map(|(k, v)| (k, evals[v]))
+            .collect::<BTreeMap<(usize, C::ScalarExt), C::ScalarExt>>();
 
         for (_i, eval) in evals.into_iter().skip(1).enumerate() {
             transcript.write_scalar(eval).unwrap();
