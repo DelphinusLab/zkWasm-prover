@@ -1207,7 +1207,8 @@ extern "C"
         Bn254FrField *res,
         Bn254FrField *tmp,
         const Bn254FrField *x,
-        int n)
+        int n,
+        CUstream_st *stream)
     {
         Bn254FrField *in = p;
         Bn254FrField *out = res;
@@ -1216,7 +1217,7 @@ extern "C"
         {
             int threads = n / 2 >= 64 ? 64 : 1;
             int blocks = n / threads / 2;
-            _poly_eval<<<blocks, threads>>>(in, out, x, deg);
+            _poly_eval<<<blocks, threads, 0, stream>>>(in, out, x, deg);
             n >>= 1;
 
             if (n > 1)
@@ -1238,7 +1239,7 @@ extern "C"
 
         if (out != res)
         {
-            cudaMemcpy(res, out, sizeof(Bn254FrField), cudaMemcpyDeviceToDevice);
+            cudaMemcpyAsync(res, out, sizeof(Bn254FrField), cudaMemcpyDeviceToDevice, stream);
         }
 
         return cudaGetLastError();

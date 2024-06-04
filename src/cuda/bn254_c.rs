@@ -133,6 +133,7 @@ extern "C" {
         tmp: *mut c_void,
         x: *mut c_void,
         n: i32,
+        stream: *mut CUstream_st,
     ) -> cudaError;
 
     pub fn shplonk_h_x_merge(
