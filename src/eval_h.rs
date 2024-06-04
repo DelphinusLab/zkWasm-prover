@@ -29,7 +29,6 @@ use crate::cuda::bn254::field_op_v3;
 use crate::cuda::bn254::field_sub;
 use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::intt_raw_async;
-use crate::cuda::bn254::msm_single_buffer;
 use crate::cuda::bn254::ntt_prepare;
 use crate::cuda::bn254::ntt_raw;
 use crate::cuda::bn254::permutation_eval_h_l;
@@ -92,7 +91,7 @@ pub(crate) fn analyze_expr_tree<F: FieldExt>(
         })
         .collect::<Vec<_, _>>();
 
-    let limit = if k < 23 { 20 } else { 10 };
+    let limit = if k < 23 { 26 } else { 10 };
     let mut v = HashSet::new();
 
     let mut expr_group = vec![];
@@ -287,6 +286,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
         }
 
         let timer = start_timer!(|| format!("vanishing msm {}", domain.quotient_poly_degree));
+        let mut buffers = vec![];
         for i in 0..domain.quotient_poly_degree as usize {
             let s_buf = unsafe {
                 ManuallyDrop::new(CudaDeviceBufRaw {
@@ -297,7 +297,15 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
                     size: size * core::mem::size_of::<C::Scalar>(),
                 })
             };
-            let commitment = msm_single_buffer(&g_buf, &s_buf, size)?;
+            buffers.push(s_buf);
+        }
+
+        let commitments = crate::cuda::bn254::batch_msm_v2(
+            &g_buf,
+            buffers.iter().map(|x| x as &CudaDeviceBufRaw).collect(),
+            size,
+        )?;
+        for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }
         end_timer!(timer);

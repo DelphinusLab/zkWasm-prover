@@ -183,10 +183,11 @@ pub mod shplonk {
     use halo2_proofs::transcript::TranscriptWrite;
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
+    use std::mem::ManuallyDrop;
 
     use crate::cuda::bn254::batch_msm;
+    use crate::cuda::bn254::batch_msm_v2;
     use crate::cuda::bn254::field_op_v3;
-    use crate::cuda::bn254::msm_single_buffer;
     use crate::cuda::bn254::FieldOp;
     use crate::device::cuda::CudaBuffer;
     use crate::device::cuda::CudaDevice;
@@ -285,6 +286,7 @@ pub mod shplonk {
         size: usize,
         s_buf: [&CudaDeviceBufRaw; 2],
         eval_map: BTreeMap<(usize, C::Scalar), C::Scalar>,
+        poly_cache: BTreeMap<usize, &ManuallyDrop<CudaDeviceBufRaw>>,
         transcript: &mut T,
     ) -> DeviceResult<()>
     where
@@ -303,7 +305,11 @@ pub mod shplonk {
                 let v_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
 
                 if queries.len() == 1 {
-                    device.copy_from_host_to_device(&v_buf, &queries[0].0[..])?;
+                    if let Some(buf) = poly_cache.get(&(queries[0].0.as_ptr() as usize)) {
+                        device.copy_from_device_to_device::<C::Scalar>(&v_buf, 0, buf, 0, size)?;
+                    } else {
+                        device.copy_from_host_to_device(&v_buf, &queries[0].0[..])?;
+                    }
                     let evals_acc = lagrange_interpolate(&points[..], &queries[0].1[..]);
                     Ok((points, v_buf, evals_acc))
                 } else {
@@ -325,7 +331,17 @@ pub mod shplonk {
                                 err,
                                 "fail to run cudaStreamCreate",
                             )?;
-                            device.copy_from_host_to_device_async(&tmp_buf, &poly[..], stream)?;
+                            let poly_buf =
+                                if let Some(buf) = poly_cache.get(&(poly.as_ptr() as usize)) {
+                                    *buf
+                                } else {
+                                    device.copy_from_host_to_device_async(
+                                        &tmp_buf,
+                                        &poly[..],
+                                        stream,
+                                    )?;
+                                    &tmp_buf
+                                };
                             if let Some(last_stream) = last_stream {
                                 cuda_runtime_sys::cudaStreamSynchronize(last_stream);
                                 cuda_runtime_sys::cudaStreamDestroy(last_stream);
@@ -335,7 +351,7 @@ pub mod shplonk {
                                 &v_buf,
                                 Some(&v_buf),
                                 Some(&y_buf),
-                                Some(&tmp_buf),
+                                Some(&poly_buf),
                                 None,
                                 size,
                                 FieldOp::Add,
@@ -447,8 +463,8 @@ pub mod shplonk {
             k,
         )?;
 
-        let commitment = msm_single_buffer::<C>(&g_buf, &hx_buf, size)?;
-        transcript.write_point(commitment).unwrap();
+        let commitment = batch_msm_v2::<C>(&g_buf, vec![&hx_buf], size)?;
+        transcript.write_point(commitment[0]).unwrap();
 
         let u: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 

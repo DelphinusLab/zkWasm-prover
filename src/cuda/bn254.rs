@@ -223,63 +223,6 @@ pub(crate) fn field_op<F: FieldExt>(
     Ok(())
 }
 
-pub fn msm_single_buffer<C: CurveAffine>(
-    p_buf: &CudaDeviceBufRaw,
-    s_buf: &CudaDeviceBufRaw,
-    len: usize,
-) -> DeviceResult<C> {
-    for _ in 0..100 {
-        let res = msm_single_buffer_core(p_buf, s_buf, len);
-
-        if res.is_ok() {
-            return res;
-        }
-    }
-
-    unreachable!()
-}
-
-fn msm_single_buffer_core<C: CurveAffine>(
-    p_buf: &CudaDeviceBufRaw,
-    s_buf: &CudaDeviceBufRaw,
-    len: usize,
-) -> DeviceResult<C> {
-    unsafe {
-        // Ensure s_buf and p_buf are ready
-        cudaDeviceSynchronize();
-    }
-
-    let mut msm_results = HostOrDeviceSlice::cuda_malloc(1).unwrap();
-
-    let points = {
-        unsafe {
-            ManuallyDrop::new(HostOrDeviceSlice::Device(
-                std::slice::from_raw_parts_mut(p_buf.ptr() as _, len),
-                0,
-            ))
-        }
-    };
-
-    let scalars = {
-        unsafe {
-            ManuallyDrop::new(HostOrDeviceSlice::Device(
-                std::slice::from_raw_parts_mut(s_buf.ptr() as _, len),
-                0,
-            ))
-        }
-    };
-    //Use async would cause failure on multi-open;
-    //scalars.copy_from_host_async(value, &stream).unwrap();
-    let mut cfg = msm::MSMConfig::default();
-    cfg.are_scalars_montgomery_form = true;
-    cfg.are_points_montgomery_form = true;
-    msm::msm(&scalars, &points, &cfg, &mut msm_results).unwrap();
-
-    let res = copy_and_to_affine(&msm_results)?;
-
-    Ok(res)
-}
-
 pub fn batch_msm<C: CurveAffine>(
     p_buf: &CudaDeviceBufRaw,
     s_buf: [&CudaDeviceBufRaw; 2],
@@ -433,6 +376,80 @@ fn batch_msm_and_intt_core<'a, C: CurveAffine>(
         res_vec.push(res);
         *start += 1;
     }
+
+    Ok(res_vec)
+}
+
+pub fn batch_msm_v2<C: CurveAffine>(
+    p_buf: &CudaDeviceBufRaw,
+    values: Vec<&CudaDeviceBufRaw>,
+    len: usize,
+) -> Result<Vec<C>, Error> {
+    for _ in 0..100 {
+        let res = batch_msm_core_v2(p_buf, values.clone(), len);
+
+        if res.is_ok() {
+            return res;
+        }
+    }
+
+    unreachable!()
+}
+
+fn batch_msm_core_v2<C: CurveAffine>(
+    p_buf: &CudaDeviceBufRaw,
+    values: Vec<&CudaDeviceBufRaw>,
+    len: usize,
+) -> Result<Vec<C>, Error> {
+    unsafe {
+        cudaDeviceSynchronize();
+    }
+
+    const STREAMS_NR: usize = 1;
+    let streams = [0; STREAMS_NR].map(|_| CudaStream::create().unwrap());
+    let mut msm_results_buf = values
+        .iter()
+        .map(|_| HostOrDeviceSlice::cuda_malloc(1).unwrap())
+        .collect::<Vec<_>>();
+
+    let points = {
+        unsafe {
+            ManuallyDrop::new(HostOrDeviceSlice::Device(
+                std::slice::from_raw_parts_mut(
+                    p_buf.ptr() as *mut icicle_bn254::curve::G1Affine,
+                    len,
+                ),
+                0,
+            ))
+        }
+    };
+
+    for (idx, value) in values.into_iter().enumerate() {
+        let scalars = {
+            unsafe {
+                ManuallyDrop::new(HostOrDeviceSlice::Device(
+                    std::slice::from_raw_parts_mut(value.ptr() as _, len),
+                    0,
+                ))
+            }
+        };
+        let stream = &streams[idx % STREAMS_NR];
+        let mut cfg = msm::MSMConfig::default();
+        cfg.ctx.stream = &stream;
+        cfg.is_async = true;
+        cfg.are_scalars_montgomery_form = true;
+        cfg.are_points_montgomery_form = true;
+        msm::msm(&scalars, &points, &cfg, &mut msm_results_buf[idx]).unwrap();
+    }
+
+    for stream in streams {
+        stream.synchronize().unwrap();
+    }
+
+    let res_vec = msm_results_buf
+        .into_iter()
+        .map(|x| copy_and_to_affine(&x).unwrap())
+        .collect();
 
     Ok(res_vec)
 }
@@ -641,10 +658,8 @@ pub fn batch_intt_raw<F: FieldExt>(
 
     let size = 1 << len_log;
     let mut streams = [None; MAX_CONCURRENCY];
-    let mut t_buf =
-        [0; MAX_CONCURRENCY].map(|_| device.alloc_device_buffer::<F>(size).unwrap());
-    let mut s_buf =
-        [0; MAX_CONCURRENCY].map(|_| device.alloc_device_buffer::<F>(size).unwrap());
+    let mut t_buf = [0; MAX_CONCURRENCY].map(|_| device.alloc_device_buffer::<F>(size).unwrap());
+    let mut s_buf = [0; MAX_CONCURRENCY].map(|_| device.alloc_device_buffer::<F>(size).unwrap());
 
     for (i, col) in value.into_iter().enumerate() {
         let idx = i % MAX_CONCURRENCY;
