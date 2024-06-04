@@ -507,6 +507,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
     transcript: &mut T,
     use_gwc: bool,
 ) -> Result<(), Error> {
+    if pk.ev.gpu_gates_expr.len() != 1 {
+        println!("Multi-GPU detected, please set CUDA_VISIBLE_DEVICES to use one GPU");
+        assert!(false);
+    }
+
     println!("k is {}", pk.get_vk().domain.k());
 
     thread::scope(|s| {
