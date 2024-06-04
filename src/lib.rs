@@ -5,7 +5,6 @@
 extern crate lazy_static;
 
 use std::collections::BTreeMap;
-use std::collections::LinkedList;
 use std::iter;
 use std::mem::ManuallyDrop;
 use std::rc::Rc;
@@ -17,6 +16,7 @@ use std::thread;
 use ark_std::end_timer;
 use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
+use cuda::bn254::batch_msm_v2;
 use cuda::bn254::intt_raw_async;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
@@ -39,7 +39,6 @@ use rayon::slice::ParallelSlice as _;
 
 use crate::cuda::bn254::batch_intt_raw;
 use crate::cuda::bn254::intt_raw;
-use crate::cuda::bn254::msm_single_buffer;
 use crate::cuda::bn254::ntt_prepare;
 use crate::cuda::bn254_c::eval_lookup_z;
 use crate::device::cuda::to_result;
@@ -1517,6 +1516,26 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             );
         }
 
+        let mut poly_buf_cache = BTreeMap::new();
+        let extended_buffers_count = if k < 23 { 30 } else { 15 };
+        let mut extended_buffers = vec![];
+        let mut cache_buffers = vec![];
+        let extended_k = pk.vk.domain.extended_k() as usize;
+        for _ in 0..extended_buffers_count {
+            let buf = device.alloc_device_buffer::<C::Scalar>(1 << extended_k)?;
+            for i in 0..1 << (extended_k - k) {
+                cache_buffers.push(ManuallyDrop::new(CudaDeviceBufRaw {
+                    ptr: unsafe {
+                        buf.ptr()
+                            .offset(((i << k) * core::mem::size_of::<C::Scalar>()) as isize)
+                    },
+                    device: device.clone(),
+                    size: core::mem::size_of::<C::Scalar>(),
+                }));
+            }
+            extended_buffers.push(buf);
+        }
+
         let mut evals = vec![C::Scalar::zero(); inputs.len()];
 
         let timer = start_timer!(|| format!("compute eval {}", collection.len()));
@@ -1545,6 +1564,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let mut l = 0;
         let mut r = collection.len();
         let mut inc = false;
+        let mut used_cache_idx = 0;
         while l < r {
             let i = if inc { l } else { r - 1 };
             if inc {
@@ -1558,7 +1578,14 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             unsafe {
                 let stream = streams[i % max];
                 let (poly_buf, eval_buf, tmp_buf) = &bufs[i % max];
-
+                let poly_buf = if used_cache_idx < cache_buffers.len() {
+                    let buf = &cache_buffers[used_cache_idx];
+                    poly_buf_cache.insert((*p).as_ptr() as usize, buf);
+                    used_cache_idx += 1;
+                    buf
+                } else {
+                    poly_buf
+                };
                 device.copy_from_host_to_device_async(poly_buf, p, stream)?;
                 for (idx, x) in arr {
                     let err = crate::cuda::bn254_c::poly_eval(
@@ -1705,6 +1732,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 size,
                 [&s_buf, &t_buf],
                 eval_map,
+                poly_buf_cache,
                 transcript,
             )?;
         }
@@ -1743,8 +1771,8 @@ fn vanish_commit<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E
 
     // Commit
     device.copy_from_host_to_device(&s_buf, &random_poly[..])?;
-    let commitment = msm_single_buffer(&g_buf, &s_buf, size)?;
-    transcript.write_point(commitment).unwrap();
+    let commitment = batch_msm_v2(&g_buf, vec![&s_buf], size)?;
+    transcript.write_point(commitment[0]).unwrap();
 
     Ok(random_poly)
 }
