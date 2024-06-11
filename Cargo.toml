@@ -25,6 +25,3 @@ cc = "1.0.83"
 default = ["halo2_proofs/cuda"]
 profile = ["ark-std/print-trace", "halo2_proofs/profile"]
 hugetlb = []
-
-[patch."https://github.com/DelphinusLab/halo2-gpu-specific"]
-halo2_proofs = { git = "https://github.com/mooreland/halo2-gpu-specific", branch = "add_shuffle"}
