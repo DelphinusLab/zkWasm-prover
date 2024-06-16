@@ -1499,7 +1499,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let mut x_extend_sets = vec![];
         for x in x_sets.iter() {
             x_extend_sets.push(**x);
-            for i in 1..k {
+            for _ in 1..k {
                 x_extend_sets.push(x_extend_sets.last().unwrap().square());
             }
         }

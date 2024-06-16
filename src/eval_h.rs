@@ -984,56 +984,6 @@ fn do_extended_ntt_v2<F: FieldExt>(
     Ok(buf)
 }
 
-fn do_intt_and_extended_ntt_v2_async<F: FieldExt>(
-    device: &CudaDevice,
-    pq_buf: &CudaDeviceBufRaw,
-    omegas_buf: &CudaDeviceBufRaw,
-    divisor: &CudaDeviceBufRaw,
-    ctx: &mut EvalHContext<F>,
-    data: &mut [F],
-) -> DeviceResult<(CudaDeviceBufRaw, CudaDeviceBufRaw, *mut CUstream_st)> {
-    let buf = ctx.extended_allocator.pop();
-    let mut s_buf = if buf.is_none() {
-        device.alloc_device_buffer::<F>(ctx.extended_size)?
-    } else {
-        buf.unwrap()
-    };
-
-    let buf = ctx.extended_allocator.pop();
-    let mut t_buf = if buf.is_none() {
-        device.alloc_device_buffer::<F>(ctx.extended_size)?
-    } else {
-        buf.unwrap()
-    };
-
-    let (tmp, stream) = unsafe {
-        let mut stream = std::mem::zeroed();
-        let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-        assert_eq!(err, cuda_runtime_sys::cudaError::cudaSuccess);
-        device.copy_from_host_to_device_async::<F>(&s_buf, data, stream)?;
-        /*
-        intt_raw_async(
-            device,
-            &mut s_buf,
-            &mut t_buf,
-            pq_buf,
-            omegas_buf,
-            divisor,
-            ctx.k,
-            Some(stream),
-        )?; */
-        //device.copy_from_device_to_device_async::<F>(&c_buf, &s_buf, ctx.size, stream)?;
-        do_extended_prepare(device, ctx, &mut s_buf, Some(stream))?;
-        //device.copy_from_device_to_host_async(data, &c_buf, stream)?;
-        let t_buf =
-            _do_extended_ntt_pure_async(device, ctx, &mut s_buf, Some(t_buf), Some(stream))?;
-
-        (t_buf, stream)
-    };
-
-    Ok((s_buf, tmp, stream))
-}
-
 fn do_extended_ntt_v2_async<F: FieldExt>(
     device: &CudaDevice,
     ctx: &mut EvalHContext<F>,
