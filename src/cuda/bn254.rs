@@ -4,7 +4,7 @@ use crate::device::Error;
 use crate::device::{Device, DeviceResult};
 
 use core::mem::ManuallyDrop;
-use cuda_runtime_sys::{cudaDeviceSynchronize, cudaStream_t};
+use cuda_runtime_sys::{cudaDeviceSynchronize, cudaStream_t, CUstream_st};
 use halo2_proofs::arithmetic::{CurveAffine, FieldExt};
 use icicle_bn254::curve::BaseField;
 use icicle_bn254::curve::CurveCfg;
@@ -223,63 +223,6 @@ pub(crate) fn field_op<F: FieldExt>(
     Ok(())
 }
 
-pub fn msm_single_buffer<C: CurveAffine>(
-    p_buf: &CudaDeviceBufRaw,
-    s_buf: &CudaDeviceBufRaw,
-    len: usize,
-) -> DeviceResult<C> {
-    for _ in 0..100 {
-        let res = msm_single_buffer_core(p_buf, s_buf, len);
-
-        if res.is_ok() {
-            return res;
-        }
-    }
-
-    unreachable!()
-}
-
-fn msm_single_buffer_core<C: CurveAffine>(
-    p_buf: &CudaDeviceBufRaw,
-    s_buf: &CudaDeviceBufRaw,
-    len: usize,
-) -> DeviceResult<C> {
-    unsafe {
-        // Ensure s_buf and p_buf are ready
-        cudaDeviceSynchronize();
-    }
-
-    let mut msm_results = HostOrDeviceSlice::cuda_malloc(1).unwrap();
-
-    let points = {
-        unsafe {
-            ManuallyDrop::new(HostOrDeviceSlice::Device(
-                std::slice::from_raw_parts_mut(p_buf.ptr() as _, len),
-                0,
-            ))
-        }
-    };
-
-    let scalars = {
-        unsafe {
-            ManuallyDrop::new(HostOrDeviceSlice::Device(
-                std::slice::from_raw_parts_mut(s_buf.ptr() as _, len),
-                0,
-            ))
-        }
-    };
-    //Use async would cause failure on multi-open;
-    //scalars.copy_from_host_async(value, &stream).unwrap();
-    let mut cfg = msm::MSMConfig::default();
-    cfg.are_scalars_montgomery_form = true;
-    cfg.are_points_montgomery_form = true;
-    msm::msm(&scalars, &points, &cfg, &mut msm_results).unwrap();
-
-    let res = copy_and_to_affine(&msm_results)?;
-
-    Ok(res)
-}
-
 pub fn batch_msm<C: CurveAffine>(
     p_buf: &CudaDeviceBufRaw,
     s_buf: [&CudaDeviceBufRaw; 2],
@@ -295,6 +238,220 @@ pub fn batch_msm<C: CurveAffine>(
     }
 
     unreachable!()
+}
+
+pub fn batch_msm_and_intt<C: CurveAffine>(
+    device: &CudaDevice,
+    p_buf: &CudaDeviceBufRaw,
+    s_buf: &mut [CudaDeviceBufRaw; 2],
+    t_buf: &mut [CudaDeviceBufRaw; 2],
+    pq_buf: &CudaDeviceBufRaw,
+    omegas_buf: &CudaDeviceBufRaw,
+    divisor: &CudaDeviceBufRaw,
+    len_log: usize,
+    mut values: Vec<&mut [C::Scalar]>,
+) -> Result<Vec<C>, Error> {
+    let mut start = 0;
+
+    for _ in 0..100 {
+        let res = batch_msm_and_intt_core(
+            device,
+            p_buf,
+            s_buf,
+            t_buf,
+            pq_buf,
+            omegas_buf,
+            divisor,
+            len_log,
+            &mut values,
+            &mut start,
+        );
+
+        if res.is_ok() {
+            return res;
+        }
+    }
+
+    unreachable!()
+}
+
+// bad msm issue
+fn batch_msm_and_intt_core<'a, C: CurveAffine>(
+    device: &CudaDevice,
+    p_buf: &CudaDeviceBufRaw,
+    s_buf: &mut [CudaDeviceBufRaw; 2],
+    t_buf: &mut [CudaDeviceBufRaw; 2],
+    pq_buf: &CudaDeviceBufRaw,
+    omegas_buf: &CudaDeviceBufRaw,
+    divisor: &CudaDeviceBufRaw,
+    len_log: usize,
+    values: &mut Vec<&'a mut [C::Scalar]>,
+    start: &mut usize,
+) -> Result<Vec<C>, Error> {
+    let len = 1 << len_log;
+
+    unsafe {
+        // Ensure s_buf and p_buf are ready
+        cudaDeviceSynchronize();
+    }
+
+    let mut res_vec = vec![];
+    let mut last_stream: Option<CudaStream> = None;
+    let mut msm_results = [
+        HostOrDeviceSlice::cuda_malloc(1).unwrap(),
+        HostOrDeviceSlice::cuda_malloc(1).unwrap(),
+    ];
+
+    let points = {
+        unsafe {
+            ManuallyDrop::new(HostOrDeviceSlice::Device(
+                std::slice::from_raw_parts_mut(p_buf.ptr() as _, len),
+                0,
+            ))
+        }
+    };
+
+    let msm_count = values.len();
+
+    for idx in *start..msm_count {
+        let value = &mut values[idx];
+        let scalars = {
+            unsafe {
+                ManuallyDrop::new(HostOrDeviceSlice::Device(
+                    std::slice::from_raw_parts_mut(s_buf[idx & 1].ptr() as _, len),
+                    0,
+                ))
+            }
+        };
+        let stream = CudaStream::create().unwrap();
+        let _stream = unsafe { *(&last_stream as *const _ as *const *mut CUstream_st) };
+        //let _value = unsafe { core::mem::transmute::<_, _>(&**value) };
+        //Use async would cause failure on multi-open;
+        //scalars.copy_from_host_async(value, &stream).unwrap();
+        //scalars.copy_from_host(_value).unwrap();
+        let mut cfg = msm::MSMConfig::default();
+        cfg.ctx.stream = &stream;
+        cfg.is_async = true;
+        cfg.are_scalars_montgomery_form = true;
+        cfg.are_points_montgomery_form = true;
+
+        device.copy_from_host_to_device_async(&s_buf[idx & 1], value, _stream)?;
+        msm::msm(&scalars, &points, &cfg, &mut msm_results[idx & 1]).unwrap();
+        intt_raw_async(
+            device,
+            &mut s_buf[idx & 1],
+            &mut t_buf[idx & 1],
+            pq_buf,
+            omegas_buf,
+            divisor,
+            len_log,
+            unsafe { Some(*(&stream as *const _ as *const *mut CUstream_st)) },
+        )?;
+
+        if let Some(last_stream) = last_stream {
+            let last_idx = 1 - (idx & 1);
+            last_stream.synchronize().unwrap();
+            let res = copy_and_to_affine(&msm_results[last_idx])?;
+            device.copy_from_device_to_host_async(
+                values[idx - 1],
+                &s_buf[last_idx & 1],
+                _stream,
+            )?;
+            last_stream.synchronize().unwrap();
+
+            res_vec.push(res);
+            *start += 1;
+        }
+        last_stream = Some(stream);
+    }
+
+    if let Some(last_stream) = last_stream {
+        let _stream = unsafe { *(&last_stream as *const _ as *const *mut CUstream_st) };
+        let last_idx = 1 - (msm_count & 1);
+        last_stream.synchronize().unwrap();
+        let res = copy_and_to_affine(&msm_results[last_idx])?;
+        device.copy_from_device_to_host_async(values[msm_count - 1], &s_buf[last_idx], _stream)?;
+        last_stream.synchronize().unwrap();
+
+        res_vec.push(res);
+        *start += 1;
+    }
+
+    Ok(res_vec)
+}
+
+pub fn batch_msm_v2<C: CurveAffine>(
+    p_buf: &CudaDeviceBufRaw,
+    values: Vec<&CudaDeviceBufRaw>,
+    len: usize,
+) -> Result<Vec<C>, Error> {
+    for _ in 0..100 {
+        let res = batch_msm_core_v2(p_buf, values.clone(), len);
+
+        if res.is_ok() {
+            return res;
+        }
+    }
+
+    unreachable!()
+}
+
+fn batch_msm_core_v2<C: CurveAffine>(
+    p_buf: &CudaDeviceBufRaw,
+    values: Vec<&CudaDeviceBufRaw>,
+    len: usize,
+) -> Result<Vec<C>, Error> {
+    unsafe {
+        cudaDeviceSynchronize();
+    }
+
+    const STREAMS_NR: usize = 1;
+    let streams = [0; STREAMS_NR].map(|_| CudaStream::create().unwrap());
+    let mut msm_results_buf = values
+        .iter()
+        .map(|_| HostOrDeviceSlice::cuda_malloc(1).unwrap())
+        .collect::<Vec<_>>();
+
+    let points = {
+        unsafe {
+            ManuallyDrop::new(HostOrDeviceSlice::Device(
+                std::slice::from_raw_parts_mut(
+                    p_buf.ptr() as *mut icicle_bn254::curve::G1Affine,
+                    len,
+                ),
+                0,
+            ))
+        }
+    };
+
+    for (idx, value) in values.into_iter().enumerate() {
+        let scalars = {
+            unsafe {
+                ManuallyDrop::new(HostOrDeviceSlice::Device(
+                    std::slice::from_raw_parts_mut(value.ptr() as _, len),
+                    0,
+                ))
+            }
+        };
+        let stream = &streams[idx % STREAMS_NR];
+        let mut cfg = msm::MSMConfig::default();
+        cfg.ctx.stream = &stream;
+        cfg.is_async = true;
+        cfg.are_scalars_montgomery_form = true;
+        cfg.are_points_montgomery_form = true;
+        msm::msm(&scalars, &points, &cfg, &mut msm_results_buf[idx]).unwrap();
+    }
+
+    for stream in streams {
+        stream.synchronize().unwrap();
+    }
+
+    let res_vec = msm_results_buf
+        .into_iter()
+        .map(|x| copy_and_to_affine(&x).unwrap())
+        .collect();
+
+    Ok(res_vec)
 }
 
 fn batch_msm_core<C: CurveAffine>(
@@ -324,7 +481,7 @@ fn batch_msm_core<C: CurveAffine>(
         }
     };
 
-    let msm_counts = values.len();
+    let msm_count = values.len();
 
     for (idx, value) in values.iter().enumerate() {
         let mut scalars = {
@@ -358,7 +515,7 @@ fn batch_msm_core<C: CurveAffine>(
     }
 
     if let Some(last_stream) = last_stream {
-        let last_idx = 1 - (msm_counts & 1);
+        let last_idx = 1 - (msm_count & 1);
         last_stream.synchronize().unwrap();
         let res = copy_and_to_affine(&msm_results[last_idx])?;
         res_vec.push(res);
@@ -487,6 +644,63 @@ pub fn intt_raw(
     intt_raw_async(
         device, s_buf, tmp_buf, pq_buf, omegas_buf, divisor, len_log, None,
     )
+}
+
+pub fn batch_intt_raw<F: FieldExt>(
+    device: &CudaDevice,
+    value: Vec<&mut [F]>,
+    pq_buf: &CudaDeviceBufRaw,
+    omegas_buf: &CudaDeviceBufRaw,
+    divisor: &CudaDeviceBufRaw,
+    len_log: usize,
+) -> Result<(), Error> {
+    const MAX_CONCURRENCY: usize = 3;
+
+    let size = 1 << len_log;
+    let mut streams = [None; MAX_CONCURRENCY];
+    let mut t_buf = [0; MAX_CONCURRENCY].map(|_| device.alloc_device_buffer::<F>(size).unwrap());
+    let mut s_buf = [0; MAX_CONCURRENCY].map(|_| device.alloc_device_buffer::<F>(size).unwrap());
+
+    for (i, col) in value.into_iter().enumerate() {
+        let idx = i % MAX_CONCURRENCY;
+        let s_buf = &mut s_buf[idx];
+        let t_buf = &mut t_buf[idx];
+
+        unsafe {
+            if let Some(last_stream) = streams[idx] {
+                cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                cuda_runtime_sys::cudaStreamDestroy(last_stream);
+            }
+
+            let mut stream = std::mem::zeroed();
+            let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+            crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
+            device.copy_from_host_to_device_async(&s_buf, &col[..], stream)?;
+            intt_raw_async(
+                &device,
+                s_buf,
+                t_buf,
+                &pq_buf,
+                &omegas_buf,
+                &divisor,
+                len_log,
+                Some(stream),
+            )?;
+            device.copy_from_device_to_host_async(&mut col[..], &s_buf, stream)?;
+            streams[idx] = Some(stream);
+        }
+    }
+
+    for idx in 0..MAX_CONCURRENCY {
+        if let Some(last_stream) = streams[idx] {
+            unsafe {
+                cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                cuda_runtime_sys::cudaStreamDestroy(last_stream);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn intt_raw_async(

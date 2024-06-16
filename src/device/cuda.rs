@@ -1,7 +1,8 @@
 use core::cell::RefCell;
 use core::mem;
-use std::ffi::c_void;
+use std::collections::HashMap;
 use std::mem::size_of;
+use std::{ffi::c_void, sync::Mutex};
 
 use cuda_runtime_sys::{cudaError, cudaStream_t};
 
@@ -12,6 +13,14 @@ thread_local! {
     static ACITVE_CUDA_DEVICE: RefCell<i32> = RefCell::new(-1);
 }
 
+const HUGE_BUFFER_SIZE: usize = 1 << 30;
+
+lazy_static! {
+    pub static ref CUDA_BUFFER_CACHE: Mutex<HashMap::<(i32, usize), Vec<usize>>> =
+        Mutex::new(HashMap::new());
+    pub static ref HUGE_CUDA_BUFFER_CACHE: Mutex<Vec<usize>> = Mutex::new(vec![]);
+}
+
 #[derive(Debug, Clone)]
 pub struct CudaDevice {
     device: i32,
@@ -19,11 +28,13 @@ pub struct CudaDevice {
 
 impl Drop for CudaDevice {
     fn drop(&mut self) {
+        /*
         ACITVE_CUDA_DEVICE.with(|x| {
             if *x.borrow() != self.device {
                 *x.borrow_mut() = -1;
             }
         });
+        */
     }
 }
 
@@ -73,24 +84,35 @@ impl CudaBuffer for CudaDeviceBufRaw {
 pub struct CudaDeviceBufRaw {
     pub(crate) ptr: *mut c_void,
     pub(crate) device: CudaDevice,
+    pub(crate) size: usize,
 }
 
-
 extern "C" {
-    pub fn cudaFreeAsync(
-        ptr: *mut c_void,
-        stream: cudaStream_t,
-    ) -> cudaError;
+    pub fn cudaFreeAsync(ptr: *mut c_void, stream: cudaStream_t) -> cudaError;
 }
 
 impl Drop for CudaDeviceBufRaw {
     fn drop(&mut self) {
-        self.device().acitve_ctx().unwrap();
-        unsafe {
-            //let timer = start_timer!(|| "cuda free");
-            let res = cudaFreeAsync(self.ptr(), 0usize as _);
-            to_result((), res, "fail to free device memory").unwrap();
-            //end_timer!(timer);
+        if self.size < HUGE_BUFFER_SIZE {
+            if self.size >= HUGE_BUFFER_SIZE {
+                let mut cache = HUGE_CUDA_BUFFER_CACHE.lock().unwrap();
+                cache.push(self.ptr() as usize);
+            } else {
+                let mut cache = CUDA_BUFFER_CACHE.lock().unwrap();
+                let arr = cache
+                    .entry((self.device.device, self.size))
+                    .or_insert(vec![]);
+                assert!(!arr.contains(&(self.ptr() as usize)));
+                arr.push(self.ptr() as usize);
+            }
+        } else {
+            self.device().acitve_ctx().unwrap();
+            unsafe {
+                //let timer = start_timer!(|| "cuda free");
+                let res = cudaFreeAsync(self.ptr(), 0usize as _);
+                to_result((), res, "fail to free device memory").unwrap();
+                //end_timer!(timer);
+            }
         }
     }
 }
@@ -155,6 +177,79 @@ impl CudaDevice {
             to_result((), res, "fail to copy memory from device to host")
         }
     }
+
+    fn _alloc_device_buffer<T>(&self, size: usize, zero: bool) -> DeviceResult<CudaDeviceBufRaw> {
+        //println!("alloc device memory {}", size * mem::size_of::<T>());
+        //self.print_memory_info()?;
+        unsafe {
+            let size = size * mem::size_of::<T>();
+            {
+                let mut cache = CUDA_BUFFER_CACHE.lock().unwrap();
+                let arr = cache.entry((self.device, size)).or_insert(vec![]);
+
+                if arr.len() > 0 {
+                    let ret = CudaDeviceBufRaw {
+                        ptr: arr.pop().unwrap() as *mut c_void,
+                        device: self.clone(),
+                        size,
+                    };
+                    if zero {
+                        cuda_runtime_sys::cudaMemset(ret.ptr(), 0, size);
+                    }
+                    return Ok(ret);
+                }
+            }
+
+            {
+                let mut cache = HUGE_CUDA_BUFFER_CACHE.lock().unwrap();
+                if cache.len() > 0 {
+                    let ret = CudaDeviceBufRaw {
+                        ptr: cache.pop().unwrap() as *mut c_void,
+                        device: self.clone(),
+                        size: HUGE_BUFFER_SIZE,
+                    };
+                    if zero {
+                        cuda_runtime_sys::cudaMemset(ret.ptr(), 0, size);
+                    }
+                    return Ok(ret);
+                }
+            }
+
+            self.acitve_ctx()?;
+            let mut ptr = 0 as *mut c_void;
+            let res = cuda_runtime_sys::cudaMalloc(&mut ptr, size);
+            //self.print_memory_info()?;
+            to_result(
+                CudaDeviceBufRaw {
+                    ptr,
+                    device: self.clone(),
+                    size,
+                },
+                res,
+                "fail to alloc device memory",
+            )
+        }
+    }
+
+    pub fn copy_from_device_to_device_async<T>(
+        &self,
+        dst: &CudaDeviceBufRaw,
+        src: &CudaDeviceBufRaw,
+        size: usize,
+        stream: cudaStream_t,
+    ) -> DeviceResult<()> {
+        self.acitve_ctx()?;
+        unsafe {
+            let res = cuda_runtime_sys::cudaMemcpyAsync(
+                dst.ptr(),
+                src.ptr(),
+                size * mem::size_of::<T>(),
+                cuda_runtime_sys::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream,
+            );
+            to_result((), res, "fail to copy memory from device to host")
+        }
+    }
 }
 
 impl Device<CudaDeviceBufRaw> for CudaDevice {
@@ -190,23 +285,13 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
     }
 
     fn alloc_device_buffer<T>(&self, size: usize) -> DeviceResult<CudaDeviceBufRaw> {
-        //println!("alloc device memory {}", size * mem::size_of::<T>());
-        //self.print_memory_info()?;
-        self.acitve_ctx()?;
-        let mut ptr = 0 as *mut c_void;
-        unsafe {
-            let size = size * mem::size_of::<T>();
-            let res = cuda_runtime_sys::cudaMalloc(&mut ptr, size);
-            //self.print_memory_info()?;
-            to_result(
-                CudaDeviceBufRaw {
-                    ptr,
-                    device: self.clone(),
-                },
-                res,
-                "fail to alloc device memory",
-            )
-        }
+        self._alloc_device_buffer::<T>(size, true)
+    }
+
+    fn alloc_device_buffer_from_slice<T>(&self, data: &[T]) -> DeviceResult<CudaDeviceBufRaw> {
+        let buf = self._alloc_device_buffer::<T>(data.len(), false)?;
+        self.copy_from_host_to_device(&buf, data)?;
+        Ok(buf)
     }
 
     fn copy_from_host_to_device<T>(&self, dst: &CudaDeviceBufRaw, src: &[T]) -> DeviceResult<()> {
@@ -271,11 +356,14 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
     fn pin_memory<T>(&self, dst: &[T]) -> DeviceResult<()> {
         self.acitve_ctx()?;
         unsafe {
-            let res = cuda_runtime_sys::cudaHostRegister(
+            let res: cudaError = cuda_runtime_sys::cudaHostRegister(
                 dst.as_ptr() as *mut _,
                 dst.len() * size_of::<T>(),
                 cuda_runtime_sys::cudaHostAllocMapped,
             );
+            if res == cudaError::cudaErrorHostMemoryAlreadyRegistered {
+                return Ok(());
+            }
             to_result((), res, "fail to synchronize")
         }
     }

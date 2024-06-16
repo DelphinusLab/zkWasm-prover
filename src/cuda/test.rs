@@ -1,35 +1,137 @@
 use super::bn254_c;
 use crate::cuda::bn254::{intt_raw, ntt_raw};
-use crate::device::cuda::{CudaBuffer as _, CudaDevice};
+use crate::device::cuda::{to_result, CudaBuffer as _, CudaDevice};
 use crate::device::Device;
 use ark_std::{end_timer, start_timer};
-use cuda_runtime_sys::cudaError;
-use halo2_proofs::arithmetic::{best_fft_cpu, BaseExt, Field as _, FieldExt, Group};
-use halo2_proofs::pairing::bn256::{Fr, G1Affine, G1};
-use halo2_proofs::pairing::group::cofactor::CofactorCurveAffine;
+use halo2_proofs::arithmetic::{best_fft_cpu, BaseExt, CurveAffine, Field as _, FieldExt, Group};
+use halo2_proofs::pairing::bn256::{Fq, Fr, G1Affine, G1};
 use halo2_proofs::pairing::group::ff::PrimeField as _;
 use halo2_proofs::pairing::group::Curve;
-use icicle_cuda_runtime::stream::CudaStream;
+use rand::Rng;
+
+fn batch_msm(p: &[G1Affine], s: &[&[Fr]], expect: Option<Vec<G1Affine>>) {
+    const N: usize = 4;
+    let device = CudaDevice::get_device(0).unwrap();
+    let timer = start_timer!(|| "prepare batch msm");
+    let mut tmp_buf = vec![];
+    let mut s_buf = vec![];
+    for _ in 0..N {
+        tmp_buf.push(device.alloc_device_buffer::<Fq>((1 << 22) * 4).unwrap());
+        s_buf.push(device.alloc_device_buffer::<Fr>(p.len()).unwrap());
+    }
+    end_timer!(timer);
+    let p_buf = device.alloc_device_buffer_from_slice(&p[..]).unwrap();
+
+    let mut streams = [None; N];
+    let mut msm_results = vec![];
+
+    let timer = start_timer!(|| "batch msm");
+    for (i, s) in s.into_iter().enumerate() {
+        unsafe {
+            if streams[i % N].is_some() {
+                cuda_runtime_sys::cudaStreamSynchronize(streams[i % N].unwrap());
+                cuda_runtime_sys::cudaStreamDestroy(streams[i % N].unwrap());
+                let mut res = [G1::group_zero()];
+                device
+                    .copy_from_device_to_host(&mut res[..], &tmp_buf[i % N])
+                    .unwrap();
+                let res = res[0].to_affine();
+                let is_valid: bool = res.is_on_curve().into();
+                assert!(is_valid);
+                if expect.is_some() {
+                    assert_eq!(res, expect.as_ref().unwrap()[i]);
+                }
+                msm_results.push(res);
+                streams[i % N] = None;
+            }
+
+            let mut stream = std::mem::zeroed();
+            cuda_runtime_sys::cudaStreamCreate(&mut stream);
+            device
+                .copy_from_host_to_device_async(&s_buf[i % N], &s[..], stream)
+                .unwrap();
+            let res = bn254_c::msm(
+                tmp_buf[i % N].ptr(),
+                p_buf.ptr(),
+                s_buf[i % N].ptr(),
+                p.len() as i32,
+                stream,
+            );
+            to_result((), res, "batch msm").unwrap();
+            streams[i % N] = Some(stream);
+        }
+    }
+
+    for i in 0..N {
+        if streams[i % N].is_some() {
+            unsafe {
+                cuda_runtime_sys::cudaStreamSynchronize(streams[i % N].unwrap());
+                cuda_runtime_sys::cudaStreamDestroy(streams[i % N].unwrap());
+            }
+            if true {
+                let mut res = [Fq::zero(); 4];
+                device
+                    .copy_from_device_to_host(&mut res[..], &tmp_buf[i % N])
+                    .unwrap();
+
+                let x = res[0];
+                let y = res[1];
+                let zz = res[2];
+                let zzz_inv = res[3].invert().unwrap();
+                let z_inv = zz * zzz_inv;
+                let x = x * z_inv.square();
+                let y = y * zzz_inv;
+
+                let res = G1Affine::from_xy(x, y).unwrap();
+                if expect.is_some() {
+                    assert_eq!(res, expect.as_ref().unwrap()[i]);
+                }
+                msm_results.push(res);
+            } else {
+                let mut res = [G1::group_zero()];
+                device
+                    .copy_from_device_to_host(&mut res[..], &tmp_buf[i % N])
+                    .unwrap();
+                let res = res[0].to_affine();
+                let is_valid: bool = res.is_on_curve().into();
+                assert!(is_valid);
+                if expect.is_some() {
+                    assert_eq!(res, expect.as_ref().unwrap()[i]);
+                }
+                msm_results.push(res);
+            }
+            streams[i % N] = None;
+        }
+    }
+    end_timer!(timer);
+}
 
 #[test]
 fn test_bn254_msm() {
-    let device = CudaDevice::get_device(0).unwrap();
-    let len = 1 << 20;
+    let len = 1 << 22;
 
     for _ in 0..10 {
         let mut p = vec![];
         let mut s = vec![];
 
-        let timer = start_timer!(|| "prepare buffer");
-        let random_nr = 1;
+        //let timer = start_timer!(|| "prepare buffer");
+        let random_nr = 1024;
         let mut rands_s = vec![];
         let mut rands_p = vec![];
         let mut rands_ps = vec![];
-        for _ in 0..random_nr {
-            let s = Fr::rand();
-            rands_s.push(s);
-            let ps = Fr::rand();
 
+        for i in 0..random_nr {
+            let s = if true {
+                Fr::rand()
+            } else {
+                let mut rng = rand::thread_rng();
+                let s: u64 = rng.gen();
+                Fr::from(s)
+            };
+
+            rands_s.push(s);
+
+            let ps = Fr::rand();
             rands_p.push((G1Affine::generator() * ps).to_affine());
             rands_ps.push(ps);
         }
@@ -42,118 +144,17 @@ fn test_bn254_msm() {
             s.push(y);
             acc += (rands_s[i % random_nr] + Fr::from(i as u64)) * rands_ps[i % random_nr];
         }
-        end_timer!(timer);
+        //end_timer!(timer);
 
-        let timer = start_timer!(|| "cpu costs");
+        //let timer = start_timer!(|| "cpu costs");
         let msm_res_expect = G1Affine::generator() * acc;
-        end_timer!(timer);
+        //end_timer!(timer);
 
-        let windows = 32;
-        let windows_bits = 8;
-        let msm_groups = 4;
-        let threads = 128;
-        let mut tmp = vec![];
-        for _ in 0..windows * msm_groups {
-            tmp.push(G1::group_zero());
-        }
-
-        unsafe {
-            let timer = start_timer!(|| "copy buffer");
-            let tmp_buf = device.alloc_device_buffer_from_slice(&tmp[..]).unwrap();
-            let p_buf = device.alloc_device_buffer_from_slice(&p[..]).unwrap();
-            let s_buf = device.alloc_device_buffer_from_slice(&s[..]).unwrap();
-            end_timer!(timer);
-
-            let timer = start_timer!(|| "gpu costs********");
-            let res = bn254_c::msm(
-                msm_groups as i32,
-                threads,
-                tmp_buf.ptr(),
-                p_buf.ptr(),
-                s_buf.ptr(),
-                len as i32,
-            );
-            device.synchronize().unwrap();
-            assert_eq!(res, cudaError::cudaSuccess);
-            end_timer!(timer);
-
-            let timer = start_timer!(|| "copy buffer back");
-            device
-                .copy_from_device_to_host(&mut tmp[..], &tmp_buf)
-                .unwrap();
-            end_timer!(timer);
-
-            for i in 0..windows {
-                for j in 1..msm_groups {
-                    tmp[i] = tmp[i] + tmp[i + j * windows];
-                }
-            }
-
-            let timer = start_timer!(|| "gpu msm merge");
-            let mut msm_res = tmp[windows - 1];
-            for i in 0..windows - 1 {
-                for _ in 0..windows_bits {
-                    msm_res = msm_res + msm_res;
-                }
-                msm_res = msm_res + tmp[windows - 2 - i];
-            }
-            end_timer!(timer);
-            assert_eq!(msm_res.to_affine(), msm_res_expect.to_affine());
-
-            {
-                use icicle_bn254::curve::CurveCfg;
-                use icicle_bn254::curve::G1Projective;
-                use icicle_bn254::curve::ScalarField;
-                use icicle_core::curve::Affine;
-                use icicle_core::curve::Curve;
-                use icicle_core::msm;
-                use icicle_core::traits::FieldImpl;
-                use icicle_cuda_runtime::memory::HostOrDeviceSlice;
-
-                let mut msm_host_result = vec![G1Projective::zero(); 1];
-                let mut msm_host_affine_result = vec![icicle_bn254::curve::G1Affine::zero(); 1];
-
-                let points = HostOrDeviceSlice::Host(
-                    std::mem::transmute::<_, &[Affine<_>]>(&p[..len]).to_vec(),
-                );
-                let scalars = HostOrDeviceSlice::Host(
-                    std::mem::transmute::<_, &[ScalarField]>(&s[..len]).to_vec(),
-                );
-                let mut msm_results: HostOrDeviceSlice<'_, G1Projective> =
-                    HostOrDeviceSlice::cuda_malloc(1).unwrap();
-                let mut cfg = msm::MSMConfig::default();
-                let stream = CudaStream::create().unwrap();
-                cfg.ctx.stream = &stream;
-                cfg.is_async = true;
-                cfg.are_scalars_montgomery_form = true;
-                cfg.are_points_montgomery_form = true;
-                msm::msm(&scalars, &points, &cfg, &mut msm_results).unwrap();
-                stream.synchronize().unwrap();
-                msm_results.copy_to_host(&mut msm_host_result[..]).unwrap();
-                let _res = [CurveCfg::to_affine(
-                    &mut msm_host_result[0],
-                    &mut msm_host_affine_result[0],
-                )];
-                let mut res = G1Affine::identity();
-                res.x = halo2_proofs::pairing::bn256::Fq::from_repr(
-                    msm_host_affine_result[0]
-                        .x
-                        .to_bytes_le()
-                        .try_into()
-                        .unwrap(),
-                )
-                .unwrap();
-                res.y = halo2_proofs::pairing::bn256::Fq::from_repr(
-                    msm_host_affine_result[0]
-                        .y
-                        .to_bytes_le()
-                        .try_into()
-                        .unwrap(),
-                )
-                .unwrap();
-                assert_eq!(res, msm_res_expect.to_affine());
-            }
-        }
+        batch_msm(
+            &p[..],
+            &[&s[..]; 1][..],
+            Some(vec![msm_res_expect.to_affine(); 1]),
+        );
     }
 }
 

@@ -28,7 +28,7 @@ use crate::cuda::bn254::field_op_v2;
 use crate::cuda::bn254::field_op_v3;
 use crate::cuda::bn254::field_sub;
 use crate::cuda::bn254::intt_raw;
-use crate::cuda::bn254::msm_single_buffer;
+use crate::cuda::bn254::intt_raw_async;
 use crate::cuda::bn254::ntt_prepare;
 use crate::cuda::bn254::ntt_raw;
 use crate::cuda::bn254::permutation_eval_h_l;
@@ -39,6 +39,7 @@ use crate::cuda::bn254::FieldOp;
 use crate::cuda::bn254_c;
 use crate::cuda::bn254_c::field_op_batch_mul_sum;
 use crate::cuda::bn254_c::lookup_eval_h;
+use crate::cuda::bn254_c::shuffle_eval_h;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
@@ -90,7 +91,7 @@ pub(crate) fn analyze_expr_tree<F: FieldExt>(
         })
         .collect::<Vec<_, _>>();
 
-    let limit = if k < 23 { 20 } else { 10 };
+    let limit = if k < 23 { 26 } else { 10 };
     let mut v = HashSet::new();
 
     let mut expr_group = vec![];
@@ -126,13 +127,14 @@ pub fn _export_evaluate_h_gates<C: CurveAffine>(
     advice: &[&[C::Scalar]],
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
-    lookup_products: &[(
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
+    lookup_products: &mut [(
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
     )],
+    shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
     beta: C::Scalar,
     gamma: C::Scalar,
@@ -158,6 +160,7 @@ pub fn _export_evaluate_h_gates<C: CurveAffine>(
         instance,
         permutation_products,
         lookup_products,
+        shuffle_products,
         y,
         beta,
         gamma,
@@ -182,13 +185,14 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     advice: &[&[C::Scalar]],
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
-    lookup_products: &[(
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
+    lookup_products: &mut [(
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
     )],
+    shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
     beta: C::Scalar,
     gamma: C::Scalar,
@@ -211,6 +215,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
         instance,
         permutation_products,
         lookup_products,
+        shuffle_products,
         y,
         beta,
         gamma,
@@ -276,7 +281,12 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
             None,
         )?;
 
+        if ctx.size >= 1 << 23 {
+            ctx.extended_allocator.clear();
+        }
+
         let timer = start_timer!(|| format!("vanishing msm {}", domain.quotient_poly_degree));
+        let mut buffers = vec![];
         for i in 0..domain.quotient_poly_degree as usize {
             let s_buf = unsafe {
                 ManuallyDrop::new(CudaDeviceBufRaw {
@@ -284,9 +294,18 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
                         .ptr()
                         .offset((i * size * core::mem::size_of::<C::Scalar>()) as isize),
                     device: device.clone(),
+                    size: size * core::mem::size_of::<C::Scalar>(),
                 })
             };
-            let commitment = msm_single_buffer(&g_buf, &s_buf, size)?;
+            buffers.push(s_buf);
+        }
+
+        let commitments = crate::cuda::bn254::batch_msm_v2(
+            &g_buf,
+            buffers.iter().map(|x| x as &CudaDeviceBufRaw).collect(),
+            size,
+        )?;
+        for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }
         end_timer!(timer);
@@ -307,6 +326,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
                         * core::mem::size_of::<C::Scalar>()) as isize,
                 ),
                 device: device.clone(),
+                size: size * core::mem::size_of::<C::Scalar>(),
             })
         };
         let xn_buf = device.alloc_device_buffer_from_slice(&[xn][..])?;
@@ -317,6 +337,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
                         .ptr()
                         .offset((i * size * core::mem::size_of::<C::Scalar>()) as isize),
                     device: device.clone(),
+                    size: size * core::mem::size_of::<C::Scalar>(),
                 })
             };
             field_op_v3(
@@ -344,13 +365,14 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     advice: &[&[C::Scalar]],
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
-    lookup_products: &[(
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
-        &[C::Scalar],
+    lookup_products: &mut [(
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
+        &mut [C::Scalar],
     )],
+    shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
     beta: C::Scalar,
     gamma: C::Scalar,
@@ -524,12 +546,15 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h lookup");
+    let gamma_buf = device.alloc_device_buffer_from_slice(&[gamma][..])?;
+    let beta_buf = device.alloc_device_buffer_from_slice(&[beta][..])?;
+    let mut last_stream = (None, vec![]);
     for (_i, (lookup, (permuted_input, permuted_table, input, table, z))) in pk
         .vk
         .cs
         .lookups
         .iter()
-        .zip(lookup_products.iter())
+        .zip(lookup_products.into_iter())
         .enumerate()
     {
         let input_deg = get_expr_degree(&lookup.input_expressions);
@@ -543,62 +568,109 @@ fn evaluate_h_gates_core<C: CurveAffine>(
             theta,
         );
 
-        let input_buf = if input_deg > 1 {
-            evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx)?
+        let (input_buf, stream_input) = if input_deg > 1 {
+            (
+                evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx)?,
+                None,
+            )
         } else {
-            let mut buf = ctx.alloc(device)?;
-            device.copy_from_host_to_device(&buf, &input)?;
+            unsafe {
+                let mut stream = std::mem::zeroed();
+                let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+                let mut buf = ctx.alloc(device)?;
+                device.copy_from_host_to_device_async(&buf, &input, stream)?;
 
-            let mut tmp_buf = ctx.alloc(device)?;
-            intt_raw(
-                &device,
-                &mut buf,
-                &mut tmp_buf,
-                &intt_pq_buf,
-                &intt_omegas_buf,
-                &intt_divisor_buf,
-                k,
-            )?;
-            ctx.extended_allocator.push(tmp_buf);
+                let mut tmp_buf = ctx.alloc(device)?;
+                field_op_v3(
+                    device,
+                    &buf,
+                    Some(&buf),
+                    None,
+                    None,
+                    Some(&beta_buf),
+                    size,
+                    FieldOp::Add,
+                    Some(stream),
+                )?;
+                intt_raw_async(
+                    &device,
+                    &mut buf,
+                    &mut tmp_buf,
+                    &intt_pq_buf,
+                    &intt_omegas_buf,
+                    &intt_divisor_buf,
+                    k,
+                    Some(stream),
+                )?;
+                do_extended_prepare(device, &mut ctx, &mut buf, Some(stream))?;
+                ntt_raw(
+                    device,
+                    &mut buf,
+                    &mut tmp_buf,
+                    &ctx.extended_ntt_pq_buf,
+                    &ctx.extended_ntt_omegas_buf,
+                    ctx.extended_k,
+                    Some(stream),
+                )?;
 
-            let coeff = pick_from_buf::<C::Scalar>(device, &buf, 0, 0, ctx.size)?;
-            let short = vec![coeff + beta];
-            device.copy_from_host_to_device(&buf, &short[..])?;
-            do_extended_ntt(device, &mut ctx, &mut buf)?;
-
-            buf
-        };
-        let table_buf = if table_deg > 1 {
-            evaluate_prove_expr(device, &vec![e2], fixed, advice, instance, &mut ctx)?
-        } else {
-            let mut buf = ctx.alloc(device)?;
-            device.copy_from_host_to_device(&buf, &table)?;
-
-            let mut tmp_buf = ctx.alloc(device)?;
-            intt_raw(
-                &device,
-                &mut buf,
-                &mut tmp_buf,
-                &intt_pq_buf,
-                &intt_omegas_buf,
-                &intt_divisor_buf,
-                k,
-            )?;
-            ctx.extended_allocator.push(tmp_buf);
-
-            let coeff = pick_from_buf::<C::Scalar>(device, &buf, 0, 0, ctx.size)?;
-            let short = vec![coeff + gamma];
-            device.copy_from_host_to_device(&buf, &short[..])?;
-            do_extended_ntt(device, &mut ctx, &mut buf)?;
-
-            buf
+                (buf, Some((stream, tmp_buf)))
+            }
         };
 
-        let (permuted_input_buf, tmp0, stream0) =
+        let (table_buf, stream_table) = if table_deg > 1 {
+            (
+                evaluate_prove_expr(device, &vec![e2], fixed, advice, instance, &mut ctx)?,
+                None,
+            )
+        } else {
+            unsafe {
+                let mut stream = std::mem::zeroed();
+                let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+                let mut buf = ctx.alloc(device)?;
+                device.copy_from_host_to_device_async(&buf, &table, stream)?;
+
+                let mut tmp_buf = ctx.alloc(device)?;
+                field_op_v3(
+                    device,
+                    &buf,
+                    Some(&buf),
+                    None,
+                    None,
+                    Some(&gamma_buf),
+                    size,
+                    FieldOp::Add,
+                    Some(stream),
+                )?;
+                intt_raw_async(
+                    &device,
+                    &mut buf,
+                    &mut tmp_buf,
+                    &intt_pq_buf,
+                    &intt_omegas_buf,
+                    &intt_divisor_buf,
+                    k,
+                    Some(stream),
+                )?;
+                do_extended_prepare(device, &mut ctx, &mut buf, Some(stream))?;
+                ntt_raw(
+                    device,
+                    &mut buf,
+                    &mut tmp_buf,
+                    &ctx.extended_ntt_pq_buf,
+                    &ctx.extended_ntt_omegas_buf,
+                    ctx.extended_k,
+                    Some(stream),
+                )?;
+
+                (buf, Some((stream, tmp_buf)))
+            }
+        };
+
+        let (z_buf, tmp2, stream0) = do_extended_ntt_v2_async(device, &mut ctx, *z)?;
+        let (permuted_input_buf, tmp0, stream1) =
             do_extended_ntt_v2_async(device, &mut ctx, permuted_input)?;
-        let (permuted_table_buf, tmp1, stream1) =
+        let (permuted_table_buf, tmp1, stream2) =
             do_extended_ntt_v2_async(device, &mut ctx, permuted_table)?;
-        let (z_buf, tmp2, stream2) = do_extended_ntt_v2_async(device, &mut ctx, z)?;
 
         unsafe {
             cuda_runtime_sys::cudaStreamSynchronize(stream0);
@@ -610,9 +682,23 @@ fn evaluate_h_gates_core<C: CurveAffine>(
             cuda_runtime_sys::cudaStreamSynchronize(stream2);
             cuda_runtime_sys::cudaStreamDestroy(stream2);
             ctx.extended_allocator.push(tmp2);
+
+            if let Some((stream, buf)) = stream_input {
+                cuda_runtime_sys::cudaStreamSynchronize(stream);
+                cuda_runtime_sys::cudaStreamDestroy(stream);
+                ctx.extended_allocator.push(buf);
+            }
+
+            if let Some((stream, buf)) = stream_table {
+                cuda_runtime_sys::cudaStreamSynchronize(stream);
+                cuda_runtime_sys::cudaStreamDestroy(stream);
+                ctx.extended_allocator.push(buf);
+            }
         }
 
         unsafe {
+            let mut stream = std::mem::zeroed();
+            let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
             let err = lookup_eval_h(
                 h_buf.ptr(),
                 input_buf.ptr(),
@@ -628,6 +714,80 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                 gamma_buf.ptr(),
                 1 << (extended_k - k),
                 ctx.extended_size as i32,
+                stream,
+            );
+
+            to_result((), err, "fail to run field_op_batch_mul_sum")?;
+
+            if let Some(stream) = last_stream.0 {
+                cuda_runtime_sys::cudaStreamSynchronize(stream);
+                cuda_runtime_sys::cudaStreamDestroy(stream);
+                ctx.extended_allocator.append(&mut last_stream.1)
+            }
+
+            last_stream = (
+                Some(stream),
+                vec![
+                    input_buf,
+                    table_buf,
+                    permuted_input_buf,
+                    permuted_table_buf,
+                    z_buf,
+                ],
+            );
+        }
+    }
+
+    if let Some(stream) = last_stream.0 {
+        unsafe {
+            cuda_runtime_sys::cudaStreamSynchronize(stream);
+            cuda_runtime_sys::cudaStreamDestroy(stream);
+            ctx.extended_allocator.append(&mut last_stream.1)
+        }
+    }
+    end_timer!(timer);
+
+    let timer = start_timer!(|| "evaluate_h shuffle");
+    let shuffle_group = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
+    for (_i, (shuffle, z)) in shuffle_group
+        .iter()
+        .zip(shuffle_products.iter())
+        .enumerate()
+    {
+        let (input_expressions, table_expressions) = shuffle
+            .0
+            .iter()
+            .map(|x| (x.input_expressions.clone(), x.shuffle_expressions.clone()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .unzip();
+
+        let [e1, e2] =
+            flatten_shuffle_expression(&input_expressions, &table_expressions, beta, theta);
+
+        let input_buf = evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx)?;
+        let table_buf = evaluate_prove_expr(device, &vec![e2], fixed, advice, instance, &mut ctx)?;
+
+        let (z_buf, tmp0, stream0) = do_extended_ntt_v2_async(device, &mut ctx, z)?;
+
+        unsafe {
+            cuda_runtime_sys::cudaStreamSynchronize(stream0);
+            cuda_runtime_sys::cudaStreamDestroy(stream0);
+            ctx.extended_allocator.push(tmp0);
+        }
+
+        unsafe {
+            let err = shuffle_eval_h(
+                h_buf.ptr(),
+                input_buf.ptr(),
+                table_buf.ptr(),
+                z_buf.ptr(),
+                l0_buf.ptr(),
+                l_last_buf.ptr(),
+                l_active_buf.ptr(),
+                y_buf.ptr(),
+                1 << (extended_k - k),
+                ctx.extended_size as i32,
             );
 
             to_result((), err, "fail to run field_op_batch_mul_sum")?;
@@ -636,8 +796,6 @@ fn evaluate_h_gates_core<C: CurveAffine>(
 
         ctx.extended_allocator.push(input_buf);
         ctx.extended_allocator.push(table_buf);
-        ctx.extended_allocator.push(permuted_input_buf);
-        ctx.extended_allocator.push(permuted_table_buf);
         ctx.extended_allocator.push(z_buf);
     }
     end_timer!(timer);
@@ -737,6 +895,78 @@ fn flatten_lookup_expression<F: FieldExt>(
     [expr_input, expr_table]
 }
 
+fn flatten_shuffle_expression<F: FieldExt>(
+    inputs: &Vec<Vec<Expression<F>>>,
+    tables: &Vec<Vec<Expression<F>>>,
+    beta: F,
+    theta: F,
+) -> [Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>; 2] {
+    let construct_expr_input = |inputs: &Vec<Vec<Expression<F>>>| {
+        let expr_inputs = inputs
+            .iter()
+            .map(|input| {
+                let mut expr_input = ProveExpression::<F>::from_expr(&input[0]);
+                for input in input.iter().skip(1) {
+                    expr_input = ProveExpression::Scale(
+                        Box::new(expr_input),
+                        BTreeMap::from_iter([(0, theta)].into_iter()),
+                    );
+                    expr_input = ProveExpression::Op(
+                        Box::new(expr_input),
+                        Box::new(ProveExpression::<F>::from_expr(input)),
+                        Bop::Sum,
+                    );
+                }
+                expr_input
+            })
+            .collect::<Vec<_>>();
+
+        let mut expr_input = ProveExpression::Op(
+            Box::new(expr_inputs[0].clone()),
+            Box::new(ProveExpression::Y(BTreeMap::from_iter(
+                [(0, beta)].into_iter(),
+            ))),
+            Bop::Sum,
+        );
+        for (i, input) in expr_inputs.iter().enumerate().skip(1) {
+            let beta_pow_i = beta.pow_vartime([1 + i as u64]);
+            let next_input = ProveExpression::Op(
+                Box::new(input.clone()),
+                Box::new(ProveExpression::Y(BTreeMap::from_iter(
+                    [(0, beta_pow_i)].into_iter(),
+                ))),
+                Bop::Sum,
+            );
+            expr_input = ProveExpression::Op(
+                Box::new(expr_input.clone()),
+                Box::new(next_input.clone()),
+                Bop::Product,
+            );
+        }
+
+        let expr_input = expr_input
+            .flatten()
+            .into_iter()
+            .map(|(us, v)| {
+                let mut map = BTreeMap::new();
+                for mut u in us {
+                    if let Some(c) = map.get_mut(&mut u) {
+                        *c = *c + 1;
+                    } else {
+                        map.insert(u.clone(), 1);
+                    }
+                }
+                (map, v.clone())
+            })
+            .collect::<Vec<_, _>>();
+        expr_input
+    };
+    let expr_input = construct_expr_input(inputs);
+    let expr_table = construct_expr_input(tables);
+
+    [expr_input, expr_table]
+}
+
 fn do_extended_ntt_v2<F: FieldExt>(
     device: &CudaDevice,
     ctx: &mut EvalHContext<F>,
@@ -807,13 +1037,14 @@ fn do_extended_ntt<F: FieldExt>(
     Ok(())
 }
 
-fn do_extended_ntt_pure_async<F: FieldExt>(
+fn _do_extended_ntt_pure_async<F: FieldExt>(
     device: &CudaDevice,
     ctx: &mut EvalHContext<F>,
     data: &mut CudaDeviceBufRaw,
+    tmp: Option<CudaDeviceBufRaw>,
     stream: Option<cudaStream_t>,
 ) -> DeviceResult<CudaDeviceBufRaw> {
-    let tmp = ctx.extended_allocator.pop();
+    let tmp = tmp.or_else(|| ctx.extended_allocator.pop());
     let mut tmp = if tmp.is_none() {
         device.alloc_device_buffer::<F>(ctx.extended_size)?
     } else {
@@ -829,6 +1060,15 @@ fn do_extended_ntt_pure_async<F: FieldExt>(
         stream,
     )?;
     Ok(tmp)
+}
+
+fn do_extended_ntt_pure_async<F: FieldExt>(
+    device: &CudaDevice,
+    ctx: &mut EvalHContext<F>,
+    data: &mut CudaDeviceBufRaw,
+    stream: Option<cudaStream_t>,
+) -> DeviceResult<CudaDeviceBufRaw> {
+    _do_extended_ntt_pure_async(device, ctx, data, None, stream)
 }
 
 fn do_extended_ntt_pure<F: FieldExt>(

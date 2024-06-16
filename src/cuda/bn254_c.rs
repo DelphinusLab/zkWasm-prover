@@ -4,12 +4,11 @@ use std::ffi::c_void;
 #[link(name = "zkwasm_prover_kernel", kind = "static")]
 extern "C" {
     pub fn msm(
-        blocks: i32,
-        threads: i32,
         res: *mut c_void,
         p: *mut c_void,
         s: *mut c_void,
         array_len: i32,
+        stream: *mut CUstream_st,
     ) -> cudaError;
 
     pub fn ntt(
@@ -108,6 +107,20 @@ extern "C" {
         gamma: *mut c_void,
         rot: i32,
         n: i32,
+        stream: *mut CUstream_st,
+    ) -> cudaError;
+
+    pub fn shuffle_eval_h(
+        res: *mut c_void,
+        input: *mut c_void,
+        table: *mut c_void,
+        z: *mut c_void,
+        l0: *mut c_void,
+        l_last: *mut c_void,
+        l_active_row: *mut c_void,
+        y: *mut c_void,
+        rot: i32,
+        n: i32,
     ) -> cudaError;
 
     pub fn expand_omega_buffer(buf: *mut c_void, n: i32) -> cudaError;
@@ -120,6 +133,7 @@ extern "C" {
         tmp: *mut c_void,
         x: *mut c_void,
         n: i32,
+        stream: *mut CUstream_st,
     ) -> cudaError;
 
     pub fn shplonk_h_x_merge(

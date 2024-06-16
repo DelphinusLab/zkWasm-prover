@@ -1,13 +1,23 @@
 #include "cuda_runtime.h"
+
 #include <stdio.h>
 #include <assert.h>
+#include <cuda/semaphore>
 
-#include "bn254.cuh"
+#include "zprize_ff_wrapper.cuh"
+
+#if false
+#include "ec.cuh"
+typedef CurveAffine<Bn254FpField> Bn254G1Affine;
+typedef Curve<Bn254FpField> Bn254G1;
+#else
+#include "zprize_ec_wrapper.cuh"
+#endif
 
 __global__ void _eval_lookup_z_step1(
     Bn254FrField *z,
-    Bn254FrField *permuted_input,
-    Bn254FrField *permuted_table,
+    const Bn254FrField *permuted_input,
+    const Bn254FrField *permuted_table,
     Bn254FrField *beta_gamma)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -22,7 +32,8 @@ __global__ void _eval_lookup_z_batch_invert(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     Bn254FrField t(1);
     Bn254FrField u(1);
-    for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++) {
+    for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++)
+    {
         u = t * z[j];
         tmp[j] = t;
         t = u;
@@ -30,7 +41,8 @@ __global__ void _eval_lookup_z_batch_invert(
 
     t = t.inv();
 
-    for (int j = i * size_per_worker + size_per_worker - 1; j >= i * size_per_worker; j--) {
+    for (int j = i * size_per_worker + size_per_worker - 1; j >= i * size_per_worker; j--)
+    {
         u = z[j];
         z[j] = t * tmp[j];
         t = t * u;
@@ -39,13 +51,21 @@ __global__ void _eval_lookup_z_batch_invert(
 }
 
 __global__ void _eval_lookup_z_step2(
-    Bn254FrField *z,
     Bn254FrField *input,
     Bn254FrField *table,
     Bn254FrField *beta_gamma)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    z[i] = z[i] * (input[i] + beta_gamma[0]) * (table[i] + beta_gamma[1]);
+    input[i] = (input[i] + beta_gamma[0]) * (table[i] + beta_gamma[1]);
+}
+
+__global__ void _eval_lookup_z_step3(
+    Bn254FrField *z,
+    Bn254FrField *input,
+    Bn254FrField *beta_gamma)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    z[i] = z[i] * input[i];
 }
 
 __global__ void _eval_lookup_z_product_batch(
@@ -54,14 +74,18 @@ __global__ void _eval_lookup_z_product_batch(
     int size_per_worker)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i != 0) {
+    if (i != 0)
+    {
         i--;
         Bn254FrField t(1);
-        for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++) {
+        for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++)
+        {
             t *= z[j];
         }
         res[i + 1] = t;
-    } else {
+    }
+    else
+    {
         res[i] = Bn254FrField(1);
     }
 }
@@ -70,8 +94,8 @@ __global__ void _eval_lookup_z_product_single_spread(
     Bn254FrField *res,
     int size_per_worker)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    for (int i = 1; i < size_per_worker; i++) {
+    for (int i = 1; i < size_per_worker; i++)
+    {
         res[i] *= res[i - 1];
     }
 }
@@ -83,7 +107,8 @@ __global__ void _eval_lookup_z_product_batch_spread(
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     z[i * size_per_worker] *= res[i];
-    for (int j = i * size_per_worker + 1; j < i * size_per_worker + size_per_worker; j++) {
+    for (int j = i * size_per_worker + 1; j < i * size_per_worker + size_per_worker; j++)
+    {
         z[j] *= z[j - 1];
     }
 }
@@ -97,7 +122,8 @@ __global__ void _eval_lookup_z_product_batch_spread_skip(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     Bn254FrField t = res[i];
     Bn254FrField u;
-    for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++) {
+    for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++)
+    {
         u = z[j] * t;
         z[j] = t;
         t = u;
@@ -114,10 +140,10 @@ __global__ void _poly_eval(
     out[i] = p[i * 2] + p[i * 2 + 1] * x[deg];
 }
 
-__global__ void _msm_mont_unmont(
-    Bn254G1Affine *p,
-    Bn254FrField *s,
-    bool mont,
+__global__ void _msm_unmont(
+    Bn254FrField *scalars,
+    Bn254FrField *unmont_scalars,
+    int *nonzero_bytes_table,
     int n)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -129,68 +155,165 @@ __global__ void _msm_mont_unmont(
 
     for (int i = start; i < end; i++)
     {
-        if (mont)
+        unmont_scalars[i] = scalars[i];
+        unmont_scalars[i].unmont_assign();
+        int nonzero_bytes = unmont_scalars[i].nonzero_bytes();
+        if (nonzero_bytes > 0 && nonzero_bytes_table[nonzero_bytes] == 0)
         {
-            s[i].mont_assign();
-        }
-        else
-        {
-            s[i].unmont_assign();
+            nonzero_bytes_table[nonzero_bytes] = 1;
         }
     }
 }
 
+__global__ void _msm_merge_groups(
+    Bn254G1 *tmp_res,
+    int groups)
+{
+    int window_idx = blockIdx.x;
+    int inner_idx = threadIdx.x;
+    int inner_worker = blockDim.x;
+    int shift_idx = blockIdx.y * inner_worker + inner_idx;
+
+    int start = window_idx * groups * 256;
+
+    for (int i = 1; i < groups; i++)
+    {
+        tmp_res[start + shift_idx] = tmp_res[start + shift_idx] + tmp_res[start + i * 256 + shift_idx];
+    }
+}
+
+__global__ void _msm_merge_groups_v2(
+    Bn254G1 *tmp_res,
+    int groups)
+{
+    int window_idx = blockIdx.x;
+    int shift_idx = blockIdx.y;
+
+    int inner_worker = blockDim.x;
+    int inner_idx = threadIdx.x;
+
+    int start = window_idx * groups * 256 + inner_idx * 256 + shift_idx;
+
+    for (int i = inner_worker; i + inner_idx < groups; i += inner_worker)
+    {
+        tmp_res[start] = tmp_res[start] + tmp_res[start + i * 256];
+    }
+
+    __syncthreads();
+    if (inner_idx == 0)
+    {
+        for (int i = 1; i < inner_worker; i++)
+        {
+            tmp_res[start] = tmp_res[start] + tmp_res[start + i * 256];
+        }
+    }
+}
+
+__global__ void _msm_merge_inner(
+    Bn254G1 *tmp_res,
+    int groups)
+{
+    int window_idx = threadIdx.x;
+    int windows = blockDim.x;
+
+    int start = window_idx * groups * 256;
+
+    Bn254G1 *round = &tmp_res[start + 254];
+    Bn254G1 acc = *round;
+    for (int i = 253; i >= 0; i--)
+    {
+        *round = *round + tmp_res[start + i];
+        acc = acc + *round;
+    }
+    tmp_res[start] = acc;
+
+    __syncthreads();
+    if (window_idx == 0)
+    {
+        Bn254G1 res = tmp_res[(windows - 1) * groups * 256];
+        for (int j = windows - 2; j >= 0; j--)
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                res = res.ec_double();
+            }
+
+            res = res + tmp_res[j * groups * 256];
+        }
+        tmp_res[0] = res;
+    }
+}
+
 __global__ void _msm_core(
-    Bn254G1 *res,
     const Bn254G1Affine *p,
     Bn254FrField *s,
+    Bn254G1 *tmp_res,
     int n)
 {
-    int group_idx = blockIdx.x;
-    int worker = blockDim.x * gridDim.y;
-    int size_per_worker = (n + worker - 1) / worker;
+    int inner_worker = blockDim.x;
+    int groups = gridDim.y * inner_worker;
+    int size_per_worker = (n + groups - 1) / groups;
+    int window_idx = blockIdx.x;
     int inner_idx = threadIdx.x;
-    int window_idx = inner_idx + blockIdx.y * blockDim.x;
-    int start = window_idx * size_per_worker;
+    int group_idx = blockIdx.y * inner_worker + inner_idx;
+    int start = group_idx * size_per_worker;
     int end = start + size_per_worker;
     end = end > n ? n : end;
 
-    __shared__ Bn254G1 thread_res[128];
+    Bn254G1 *buckets = &tmp_res[window_idx * groups * 256 + group_idx * 256];
 
-    Bn254G1 buckets[256];
-
+#if true
     for (int i = start; i < end; i++)
     {
-        int v = s[i].get_8bits(group_idx);
+        int v = s[i].get_8bits(window_idx);
         if (v--)
         {
             buckets[v] = buckets[v] + p[i];
         }
     }
 
-    if (end > start)
-    {
-        Bn254G1 round;
-        Bn254G1 acc;
-        for (int i = 254; i >= 0; i--)
-        {
-            round = round + buckets[i];
-            acc = acc + round;
-        }
+#else
+    const int BATCH = 4;
 
-        thread_res[inner_idx] = acc;
+    __shared__ Bn254G1 tmp[16];
+    unsigned short idx[256][BATCH];
+    unsigned char count[256] = {0};
+
+    for (int i = start; i < end; i++)
+    {
+        *((volatile int *)&s[i]);
+        int v = s[i].get_8bits(window_idx);
+        if (v--)
+        {
+
+            idx[v][count[v]++] = i - start;
+
+            if (count[v] == BATCH)
+            {
+                tmp[inner_idx] = buckets[v];
+                for (int j = 0; j < BATCH; j++)
+                {
+                    tmp[inner_idx] = tmp[inner_idx] + p[start + idx[v][j]];
+                }
+                buckets[v] = tmp[inner_idx];
+                count[v] = 0;
+            }
+        }
     }
 
-    __syncthreads();
-    if (inner_idx == 0)
+    for (int i = 0; i < 255; i++)
     {
-        Bn254G1 acc;
-        for (int i = 0; i < blockDim.x; i++)
+        if (count[i] > 0)
         {
-            acc = acc + thread_res[i];
+            tmp[inner_idx] = buckets[i];
+            for (int j = 0; j < count[i]; j++)
+            {
+                tmp[inner_idx] = tmp[inner_idx] + p[start + idx[i][j]];
+            }
+            buckets[i] = tmp[inner_idx];
         }
-        res[group_idx + blockIdx.y * gridDim.x] = acc;
     }
+#endif
 }
 
 __device__ uint bit_reverse(uint n, uint bits)
@@ -401,9 +524,8 @@ __global__ void _field_op(
             fr = r[(i + r_rot) % n] * r_c[0];
         else
             fr = r[(i + r_rot) % n];
-    else
-        if (r_c)
-            fr = r_c[0];
+    else if (r_c)
+        fr = r_c[0];
 
     // add
     if (op == 0)
@@ -656,6 +778,49 @@ __global__ void _lookup_eval_h(
     res[i] = t;
 }
 
+__global__ void _shuffle_eval_h(
+    Bn254FrField *res,
+    const Bn254FrField *input,
+    const Bn254FrField *table,
+    const Bn254FrField *z,
+    const Bn254FrField *l0,
+    const Bn254FrField *l_last,
+    const Bn254FrField *l_active_row,
+    const Bn254FrField *y,
+    int rot,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = gid;
+    int r_next = (i + rot) & (n - 1);
+
+    Bn254FrField t, u, p;
+    t = res[i];
+
+    // l_0(X) * (1 - z(X)) = 0
+    t = t * *y;
+    u = Bn254FrField(1) - z[i];
+    u = l0[i] * u;
+    t += u;
+
+    // l_last(X) * (z(X)^2 - z(X)) = 0
+    t = t * *y;
+    u = z[i] * z[i];
+    u -= z[i];
+    u = l_last[i] * u;
+    t += u;
+
+    // (1 - (l_last(X) + l_blind(X))) *
+    // (z(\omega X) (s(X) + \beta^i)- z(X) (a(X) + \beta^i))=0
+    t = t * *y;
+    u = table[i] * z[r_next];
+    u -= input[i] * z[i];
+    u = u * l_active_row[i];
+    t += u;
+
+    res[i] = t;
+}
+
 __global__ void _expand_omega_buffer(
     Bn254FrField *buf,
     int n)
@@ -704,7 +869,8 @@ __global__ void _shplonk_h_x_merge(
     int i = gid;
 
     Bn254FrField t = values[i];
-    for (int j = 0; j < diff_points_n; j++) {
+    for (int j = 0; j < diff_points_n; j++)
+    {
         t = t * (omegas[i] - diff_points[j]);
     }
     res[i] = res[i] * v[0] + t;
@@ -721,7 +887,8 @@ __global__ void _shplonk_h_x_div_points(
     int i = gid;
 
     Bn254FrField t = omegas[i] - points[0];
-    for (int j = 1; j < points_n; j++) {
+    for (int j = 1; j < points_n; j++)
+    {
         t = t * (omegas[i] - points[j]);
     }
     assert(!(t.inv() == Bn254FrField(0)));
@@ -882,19 +1049,56 @@ extern "C"
     }
 
     cudaError_t msm(
-        int msm_blocks,
-        int max_msm_threads,
         Bn254G1 *res,
-        Bn254G1Affine *p,
-        Bn254FrField *s,
-        int n)
+        Bn254G1Affine *points,
+        Bn254FrField *scalars,
+        int n,
+        cudaStream_t stream)
     {
-        int threads = n >= max_msm_threads ? max_msm_threads : 1;
+        cudaDeviceProp properties;
+        cudaGetDeviceProperties(&properties, 0);
+        int smCount = properties.multiProcessorCount;
+        printf("smCount is %d\n", smCount);
+
+        int threads = n >= 32 ? 32 : 1;
         int blocks = (n + threads - 1) / threads;
-        _msm_mont_unmont<<<blocks, threads>>>(p, s, false, n);
-        _msm_core<<<dim3(32, msm_blocks), threads>>>(res, p, s, n);
-        _msm_mont_unmont<<<blocks, threads>>>(p, s, true, n);
-        cudaDeviceSynchronize();
+
+        int cpu_none_zero_bytes[64];
+        int *none_zero_bytes = NULL;
+        cudaError_t err = cudaMallocAsync(&none_zero_bytes, 64 * sizeof(int), stream);
+        if (err)
+        {
+            return err;
+        }
+
+        Bn254FrField *unmont_scalars = NULL;
+        err = cudaMallocAsync(&unmont_scalars, n * sizeof(Bn254FrField), stream);
+        if (err)
+        {
+            cudaFreeAsync(none_zero_bytes, stream);
+            return err;
+        }
+
+        _msm_unmont<<<blocks, threads, 0, stream>>>(scalars, unmont_scalars, none_zero_bytes, n);
+        err = cudaMemcpyAsync(cpu_none_zero_bytes, none_zero_bytes, sizeof(cpu_none_zero_bytes), cudaMemcpyDefault, stream);
+
+        cudaStreamSynchronize(stream);
+        int windows = 32;
+        for (; windows > 0; windows--)
+        {
+            if (cpu_none_zero_bytes[windows])
+            {
+                break;
+            }
+        }
+
+        cudaMemsetAsync(res, 0, sizeof(Bn254G1) << 22, stream);
+        int groups = 512 / windows;
+        _msm_core<<<dim3(windows, groups), 16, 0, stream>>>(points, unmont_scalars, res, n);
+        _msm_merge_groups_v2<<<dim3(windows, 256), 16, 0, stream>>>(res, groups * 16);
+        _msm_merge_inner<<<1, windows, 0, stream>>>(res, groups * 16);
+        cudaFreeAsync(unmont_scalars, stream);
+        cudaFreeAsync(none_zero_bytes, stream);
         return cudaGetLastError();
     }
 
@@ -912,16 +1116,39 @@ extern "C"
         const Bn254FrField *beta,
         const Bn254FrField *gamma,
         int rot,
-        int n)
+        int n,
+        cudaStream_t stream)
     {
         int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
-        _lookup_eval_h<<<blocks, threads>>>(
+        _lookup_eval_h<<<blocks, threads, 0, stream>>>(
             res,
             input, table, permuted_input, permuted_table, z,
             l0, l_last, l_active_row,
             y, beta, gamma,
             rot, n);
+        return cudaGetLastError();
+    }
+
+    cudaError_t shuffle_eval_h(
+        Bn254FrField *res,
+        const Bn254FrField *input,
+        const Bn254FrField *table,
+        const Bn254FrField *z,
+        const Bn254FrField *l0,
+        const Bn254FrField *l_last,
+        const Bn254FrField *l_active_row,
+        const Bn254FrField *y,
+        int rot,
+        int n)
+    {
+        int threads = n >= 64 ? 64 : 1;
+        int blocks = n / threads;
+        _shuffle_eval_h<<<blocks, threads>>>(
+            res,
+            input, table, z,
+            l0, l_last, l_active_row,
+            y, rot, n);
         return cudaGetLastError();
     }
 
@@ -980,7 +1207,8 @@ extern "C"
         Bn254FrField *res,
         Bn254FrField *tmp,
         const Bn254FrField *x,
-        int n)
+        int n,
+        CUstream_st *stream)
     {
         Bn254FrField *in = p;
         Bn254FrField *out = res;
@@ -989,7 +1217,7 @@ extern "C"
         {
             int threads = n / 2 >= 64 ? 64 : 1;
             int blocks = n / threads / 2;
-            _poly_eval<<<blocks, threads>>>(in, out, x, deg);
+            _poly_eval<<<blocks, threads, 0, stream>>>(in, out, x, deg);
             n >>= 1;
 
             if (n > 1)
@@ -1011,7 +1239,7 @@ extern "C"
 
         if (out != res)
         {
-            cudaMemcpy(res, out, sizeof(Bn254FrField), cudaMemcpyDeviceToDevice);
+            cudaMemcpyAsync(res, out, sizeof(Bn254FrField), cudaMemcpyDeviceToDevice, stream);
         }
 
         return cudaGetLastError();
@@ -1021,8 +1249,8 @@ extern "C"
         Bn254FrField *z,
         Bn254FrField *input,
         Bn254FrField *table,
-        Bn254FrField *permuted_input,
-        Bn254FrField *permuted_table,
+        const Bn254FrField *permuted_input,
+        const Bn254FrField *permuted_table,
         Bn254FrField *beta_gamma,
         int n,
         CUstream_st *stream)
@@ -1031,27 +1259,28 @@ extern "C"
         int blocks = n / threads;
         _eval_lookup_z_step1<<<blocks, threads, 0, stream>>>(
             z, permuted_input, permuted_table, beta_gamma);
+        _eval_lookup_z_step2<<<blocks, threads, 0, stream>>>(
+            input, table, beta_gamma);
 
         int worker = 64 * 128;
         int size_per_worker = n / worker;
         _eval_lookup_z_batch_invert<<<128, 64, 0, stream>>>(
-            z, permuted_input, size_per_worker);
-
-        _eval_lookup_z_step2<<<blocks, threads, 0, stream>>>(
-            z, input, table, beta_gamma);
+            z, table, size_per_worker);
+        _eval_lookup_z_step3<<<blocks, threads, 0, stream>>>(
+            z, input, beta_gamma);
 
         worker = 64 * 64;
         size_per_worker = n / worker;
         _eval_lookup_z_product_batch<<<64, 64, 0, stream>>>(
-            z, permuted_input, size_per_worker);
+            z, input, size_per_worker);
         _eval_lookup_z_product_batch<<<8, 8, 0, stream>>>(
-            permuted_input, permuted_table, 64);
+            input, table, 64);
         _eval_lookup_z_product_single_spread<<<1, 1, 0, stream>>>(
-            permuted_table, 64);
+            table, 64);
         _eval_lookup_z_product_batch_spread<<<8, 8, 0, stream>>>(
-            permuted_input, permuted_table, 64);
+            input, table, 64);
         _eval_lookup_z_product_batch_spread_skip<<<64, 64, 0, stream>>>(
-            z, permuted_input, size_per_worker);
+            z, input, size_per_worker);
 
         return cudaGetLastError();
     }
