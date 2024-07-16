@@ -161,7 +161,7 @@ pub(crate) mod gwc {
 
         let timer = start_timer!(|| "msm");
 
-        let commitments = batch_msm::<C>(&g_buf, s_buf, ws.iter().map(|x| &x[..]).collect(), size)?;
+        let commitments = batch_msm(&g_buf, s_buf, ws.iter().map(|x| &x[..]).collect(), size)?;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }
@@ -565,7 +565,7 @@ pub mod shplonk {
             lx[0] = tmp;
         }
 
-        let commitments = batch_msm::<C>(&g_buf, s_buf, vec![&lx[..]], size)?;
+        let commitments = batch_msm(&g_buf, s_buf, vec![&lx[..]], size)?;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }

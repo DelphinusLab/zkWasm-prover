@@ -666,15 +666,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             )
         });
 
-        let s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-        let t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let mut s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
 
         // Advice MSM
         let timer = start_timer!(|| format!(
             "instances and advices msm {}",
             instances.len() + advices.len()
         ));
-        let commitments = crate::cuda::bn254::batch_msm::<C>(
+        let commitments = crate::cuda::bn254::batch_msm(
             &g_lagrange_buf,
             [&s_buf, &t_buf],
             instances
@@ -775,7 +775,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 lookup_scalars.push(&permuted_input[..]);
                 lookup_scalars.push(&permuted_table[..])
             }
-            let commitments = crate::cuda::bn254::batch_msm::<C>(
+            let commitments = crate::cuda::bn254::batch_msm(
                 &g_lagrange_buf,
                 [&s_buf, &t_buf],
                 lookup_scalars,
@@ -806,7 +806,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 lookup_scalars.push(&permuted_input[..]);
                 lookup_scalars.push(&permuted_table[..])
             }
-            let commitments = crate::cuda::bn254::batch_msm::<C>(
+            let commitments = crate::cuda::bn254::batch_msm(
                 &g_lagrange_buf,
                 [&s_buf, &t_buf],
                 lookup_scalars,
@@ -1289,7 +1289,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
-        let lookup_z_commitments = crate::cuda::bn254::batch_msm::<C>(
+        let lookup_z_commitments = crate::cuda::bn254::batch_msm(
             &g_buf,
             [&s_buf, &t_buf],
             lookups.iter().map(|x| &x.4[..]).collect::<Vec<_>>(),
@@ -1302,26 +1302,22 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "permutation z msm and intt");
-        let permutation_commitments = crate::cuda::bn254::batch_msm::<C>(
-            &g_lagrange_buf,
-            [&s_buf, &t_buf],
-            permutation_products
-                .iter()
-                .map(|x| &x[..])
-                .collect::<Vec<_>>(),
-            size,
-        )?;
 
-        batch_intt_raw(
+        let mut batch_ntt_t0_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let mut batch_ntt_t1_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let permutation_commitments = crate::cuda::bn254::batch_msm_and_intt::<C>(
             &device,
-            permutation_products
-                .iter_mut()
-                .map(|x| &mut x[..])
-                .collect::<Vec<_>>(),
+            &g_lagrange_buf,
+            [&mut s_buf, &mut t_buf],
+            [&mut batch_ntt_t0_buf, &mut batch_ntt_t1_buf],
             &intt_pq_buf,
             &intt_omegas_buf,
             &intt_divisor_buf,
             k,
+            permutation_products
+                .par_iter_mut()
+                .map(|x| &mut x[..])
+                .collect::<Vec<_>>(),
         )?;
         end_timer!(timer);
 
@@ -1330,24 +1326,22 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "shuffle z msm and intt");
-        let shuffle_commitments = crate::cuda::bn254::batch_msm::<C>(
-            &g_lagrange_buf,
-            [&s_buf, &t_buf],
-            shuffle_products.iter().map(|x| &x[..]).collect::<Vec<_>>(),
-            size,
-        )?;
-
-        batch_intt_raw(
+        let shuffle_commitments = crate::cuda::bn254::batch_msm_and_intt::<C>(
             &device,
-            shuffle_products
-                .iter_mut()
-                .map(|x| &mut x[..])
-                .collect::<Vec<_>>(),
+            &g_lagrange_buf,
+            [&mut s_buf, &mut t_buf],
+            [&mut batch_ntt_t0_buf, &mut batch_ntt_t1_buf],
             &intt_pq_buf,
             &intt_omegas_buf,
             &intt_divisor_buf,
             k,
+            shuffle_products
+                .iter_mut()
+                .map(|x| &mut x[..])
+                .collect::<Vec<_>>(),
         )?;
+        drop(batch_ntt_t0_buf);
+        drop(batch_ntt_t1_buf);
         end_timer!(timer);
 
         for commitment in permutation_commitments {
