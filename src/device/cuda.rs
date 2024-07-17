@@ -1,24 +1,27 @@
 use core::cell::RefCell;
 use core::mem;
+use cuda_runtime_sys::{cudaError, cudaStream_t};
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::{ffi::c_void, sync::Mutex};
 
-use cuda_runtime_sys::{cudaError, cudaStream_t};
-
 use super::{Device, DeviceBuf, Error};
+use crate::device::cuda::buffer_allocator::CudaBufferAllocator;
 use crate::device::DeviceResult;
+
+mod buffer_allocator;
 
 thread_local! {
     static ACITVE_CUDA_DEVICE: RefCell<i32> = RefCell::new(-1);
 }
 
-const HUGE_BUFFER_SIZE: usize = 1 << 30;
+const HUGE_BUFFER_SIZE: usize = 1 << 27;
 
 lazy_static! {
-    pub static ref CUDA_BUFFER_CACHE: Mutex<HashMap::<(i32, usize), Vec<usize>>> =
+    pub(crate) static ref CUDA_BUFFER_CACHE: Mutex<HashMap::<(i32, usize), Vec<usize>>> =
         Mutex::new(HashMap::new());
-    pub static ref HUGE_CUDA_BUFFER_CACHE: Mutex<Vec<usize>> = Mutex::new(vec![]);
+    pub(crate) static ref CUDA_BUFFER_ALLOCATOR: Mutex<CudaBufferAllocator> =
+        Mutex::new(CudaBufferAllocator::new());
 }
 
 #[derive(Debug, Clone)]
@@ -27,15 +30,7 @@ pub struct CudaDevice {
 }
 
 impl Drop for CudaDevice {
-    fn drop(&mut self) {
-        /*
-        ACITVE_CUDA_DEVICE.with(|x| {
-            if *x.borrow() != self.device {
-                *x.borrow_mut() = -1;
-            }
-        });
-        */
-    }
+    fn drop(&mut self) {}
 }
 
 impl CudaDevice {
@@ -94,25 +89,15 @@ extern "C" {
 impl Drop for CudaDeviceBufRaw {
     fn drop(&mut self) {
         if self.size < HUGE_BUFFER_SIZE {
-            if self.size >= HUGE_BUFFER_SIZE {
-                let mut cache = HUGE_CUDA_BUFFER_CACHE.lock().unwrap();
-                cache.push(self.ptr() as usize);
-            } else {
-                let mut cache = CUDA_BUFFER_CACHE.lock().unwrap();
-                let arr = cache
-                    .entry((self.device.device, self.size))
-                    .or_insert(vec![]);
-                assert!(!arr.contains(&(self.ptr() as usize)));
-                arr.push(self.ptr() as usize);
-            }
+            let mut cache = CUDA_BUFFER_CACHE.lock().unwrap();
+            let arr = cache
+                .entry((self.device.device, self.size))
+                .or_insert(vec![]);
+            assert!(!arr.contains(&(self.ptr() as usize)));
+            arr.push(self.ptr() as usize);
         } else {
-            self.device().acitve_ctx().unwrap();
-            unsafe {
-                //let timer = start_timer!(|| "cuda free");
-                let res = cudaFreeAsync(self.ptr(), 0usize as _);
-                to_result((), res, "fail to free device memory").unwrap();
-                //end_timer!(timer);
-            }
+            let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
+            allocator.free(self.ptr(), self.size);
         }
     }
 }
@@ -183,7 +168,7 @@ impl CudaDevice {
         //self.print_memory_info()?;
         unsafe {
             let size = size * mem::size_of::<T>();
-            {
+            if size < HUGE_BUFFER_SIZE {
                 let mut cache = CUDA_BUFFER_CACHE.lock().unwrap();
                 let arr = cache.entry((self.device, size)).or_insert(vec![]);
 
@@ -198,36 +183,29 @@ impl CudaDevice {
                     }
                     return Ok(ret);
                 }
-            }
 
-            {
-                let mut cache = HUGE_CUDA_BUFFER_CACHE.lock().unwrap();
-                if cache.len() > 0 {
-                    let ret = CudaDeviceBufRaw {
-                        ptr: cache.pop().unwrap() as *mut c_void,
+                self.acitve_ctx()?;
+                let mut ptr = 0 as *mut c_void;
+                let res = cuda_runtime_sys::cudaMalloc(&mut ptr, size);
+                //self.print_memory_info()?;
+                to_result(
+                    CudaDeviceBufRaw {
+                        ptr,
                         device: self.clone(),
-                        size: HUGE_BUFFER_SIZE,
-                    };
-                    if zero {
-                        cuda_runtime_sys::cudaMemset(ret.ptr(), 0, size);
-                    }
-                    return Ok(ret);
-                }
-            }
-
-            self.acitve_ctx()?;
-            let mut ptr = 0 as *mut c_void;
-            let res = cuda_runtime_sys::cudaMalloc(&mut ptr, size);
-            //self.print_memory_info()?;
-            to_result(
-                CudaDeviceBufRaw {
+                        size,
+                    },
+                    res,
+                    "fail to alloc device memory",
+                )
+            } else {
+                let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
+                let ptr = allocator.alloc(size);
+                Ok(CudaDeviceBufRaw {
                     ptr,
                     device: self.clone(),
                     size,
-                },
-                res,
-                "fail to alloc device memory",
-            )
+                })
+            }
         }
     }
 
@@ -249,6 +227,16 @@ impl CudaDevice {
             );
             to_result((), res, "fail to copy memory from device to host")
         }
+    }
+
+    pub fn alloc_device_buffer_from_slice_async<T>(
+        &self,
+        data: &[T],
+        stream: cudaStream_t,
+    ) -> DeviceResult<CudaDeviceBufRaw> {
+        let buf = self._alloc_device_buffer::<T>(data.len(), false)?;
+        self.copy_from_host_to_device_async(&buf, data, stream)?;
+        Ok(buf)
     }
 }
 
@@ -373,6 +361,42 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
         unsafe {
             let res = cuda_runtime_sys::cudaHostUnregister(dst.as_ptr() as *mut _);
             to_result((), res, "fail to synchronize")
+        }
+    }
+}
+
+pub struct CudaStreamWrapper(cudaStream_t);
+
+impl CudaStreamWrapper {
+    pub fn new() -> Self {
+        unsafe {
+            let mut stream = std::mem::zeroed();
+            let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+            Self(stream)
+        }
+    }
+
+    pub fn sync(&self) {
+        unsafe {
+            let err = cuda_runtime_sys::cudaStreamSynchronize(self.into());
+            to_result((), err, "fail to run cudaStreamSynchronize").unwrap();
+        }
+    }
+}
+
+impl From<&CudaStreamWrapper> for cudaStream_t {
+    fn from(value: &CudaStreamWrapper) -> Self {
+        value.0
+    }
+}
+
+impl Drop for CudaStreamWrapper {
+    fn drop(&mut self) {
+        unsafe {
+            let err = cuda_runtime_sys::cudaStreamSynchronize(self.0);
+            to_result((), err, "fail to run cudaStreamSynchronize").unwrap();
+            let err = cuda_runtime_sys::cudaStreamDestroy(self.0);
+            to_result((), err, "fail to run cudaStreamDestroy").unwrap();
         }
     }
 }

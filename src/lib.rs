@@ -45,6 +45,7 @@ use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
 use crate::device::cuda::CudaDeviceBufRaw;
+use crate::device::cuda::CUDA_BUFFER_ALLOCATOR;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
 use crate::expr::evaluate_exprs;
@@ -451,11 +452,18 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         assert!(false);
     }
 
-    println!("k is {}", pk.get_vk().domain.k());
+    let k = pk.get_vk().domain.k() as usize;
+    let size = 1 << k;
+
+    println!("k is {}", k);
+
+    {
+        let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
+        let count = if k < 23 { 148 } else { 52 };
+        allocator.reset((1 << k) * core::mem::size_of::<C::Scalar>(), count);
+    }
 
     thread::scope(|s| {
-        let k = pk.get_vk().domain.k() as usize;
-        let size = 1 << pk.get_vk().domain.k();
         let meta = &pk.vk.cs;
         let unusable_rows_start = size - (meta.blinding_factors() + 1);
         let omega = pk.get_vk().domain.get_omega();
