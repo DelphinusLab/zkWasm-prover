@@ -625,7 +625,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
 
         let (
-            tuple_lookups_involved_advices,
+            _,
             lookups_involved_advices,
             permutation_involved_advices,
             shuffle_involved_advices,
@@ -639,7 +639,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         ));
 
         let instances_len = instances.len();
-        let (commitments, advice_device_buffers) =
+        let (commitments, mut advice_device_buffers) =
             crate::cuda::bn254::batch_msm_and_conditional_intt(
                 &device,
                 &g_lagrange_buf,
@@ -655,7 +655,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         .collect()
                 },
                 &uninvolved_advices,
-                &tuple_lookups_involved_advices,
                 instances_len,
             )?;
         for commitment in commitments.iter().take(instances.len()) {
@@ -698,7 +697,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
             let tuple_lookup_device_buffers = evaluate_exprs_in_gpu(
                 &device,
-                advice_device_buffers,
+                &advice_device_buffers,
                 &tuple_lookup_exprs[..],
                 fixed_ref,
                 advice_ref,
@@ -1301,7 +1300,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         && !permutation_involved_advices.contains(&idx)
                         && !shuffle_involved_advices.contains(&idx)
                     {
-                        Some(&mut x[..])
+                        Some((&mut x[..], advice_device_buffers.remove(&idx).unwrap()))
                     } else {
                         None
                     }
@@ -1350,7 +1349,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     if permutation_involved_advices.contains(&idx)
                         && !shuffle_involved_advices.contains(&idx)
                     {
-                        Some(&mut x[..])
+                        Some((&mut x[..], advice_device_buffers.remove(&idx).unwrap()))
                     } else {
                         None
                     }
@@ -1418,14 +1417,17 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let buffers = unsafe {
                 Arc::get_mut_unchecked(&mut instances)
                     .iter_mut()
-                    .map(|x| &mut x[..])
+                    .map(|x| {
+                        let buf = device.alloc_device_buffer_from_slice(&x[..]).unwrap();
+                        (&mut x[..], buf)
+                    })
                     .chain(
                         Arc::get_mut_unchecked(&mut advices)
                             .iter_mut()
                             .enumerate()
                             .filter_map(|(idx, x)| {
                                 if shuffle_involved_advices.contains(&idx) {
-                                    Some(&mut x[..])
+                                    Some((&mut x[..], advice_device_buffers.remove(&idx).unwrap()))
                                 } else {
                                     None
                                 }

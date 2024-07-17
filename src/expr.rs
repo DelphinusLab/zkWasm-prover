@@ -203,7 +203,7 @@ fn pick_prove_unit_slice<'a, F: FieldExt>(
 
 pub(crate) fn evaluate_exprs_in_gpu<F: FieldExt>(
     device: &CudaDevice,
-    advice_buffer: HashMap<usize, CudaDeviceBufRaw>,
+    advice_buffer: &HashMap<usize, CudaDeviceBufRaw>,
     exprs: &[&[Expression<F>]],
     fixed: &[&[F]],
     advice: &[&[F]],

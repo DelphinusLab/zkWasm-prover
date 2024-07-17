@@ -346,7 +346,6 @@ pub(crate) fn batch_msm_and_conditional_intt<C: CurveAffine>(
     len_log: usize,
     values: Vec<&mut [C::Scalar]>,
     intt_map: &HashSet<usize>,
-    cache_map: &HashSet<usize>,
     skip_intt: usize,
 ) -> Result<(Vec<C>, HashMap<usize, CudaDeviceBufRaw>), Error> {
     unsafe {
@@ -424,7 +423,7 @@ pub(crate) fn batch_msm_and_conditional_intt<C: CurveAffine>(
                     &s_buf[idx % MSM_STREAMS_NR],
                     stream,
                 )?;
-            } else if cache_map.contains(&(idx - skip_intt)) {
+            } else {
                 let mut new_buffer = device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?;
                 core::mem::swap(&mut s_buf[idx % MSM_STREAMS_NR], &mut new_buffer);
                 ret_device_buffers.insert(idx - skip_intt, new_buffer);
@@ -652,7 +651,7 @@ pub fn intt_raw(
 
 pub fn batch_intt_raw<F: FieldExt>(
     device: &CudaDevice,
-    value: Vec<&mut [F]>,
+    value: Vec<(&mut [F], CudaDeviceBufRaw)>,
     pq_buf: &CudaDeviceBufRaw,
     omegas_buf: &CudaDeviceBufRaw,
     divisor: &CudaDeviceBufRaw,
@@ -664,19 +663,14 @@ pub fn batch_intt_raw<F: FieldExt>(
     let streams = [0; MAX_CONCURRENCY].map(|_| CudaStreamWrapper::new());
     let mut t_buf =
         [0; MAX_CONCURRENCY].map(|_| device.alloc_device_buffer_non_zeroed::<F>(size).unwrap());
-    let mut s_buf =
-        [0; MAX_CONCURRENCY].map(|_| device.alloc_device_buffer_non_zeroed::<F>(size).unwrap());
 
-    for (i, col) in value.into_iter().enumerate() {
+    for (i, (col, mut s_buf)) in value.into_iter().enumerate() {
         let idx = i % MAX_CONCURRENCY;
-        let s_buf = &mut s_buf[idx];
         let t_buf = &mut t_buf[idx];
 
-        streams[idx].sync();
-        device.copy_from_host_to_device_async(&s_buf, &col[..], (&streams[idx]).into())?;
         intt_raw_async(
             &device,
-            s_buf,
+            &mut s_buf,
             t_buf,
             &pq_buf,
             &omegas_buf,
