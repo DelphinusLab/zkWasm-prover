@@ -132,7 +132,7 @@ pub fn evaluate_exprs<F: FieldExt>(
         (((idx as i32) + (rot * rot_scale)).rem_euclid(isize)) as usize
     };
 
-    let chunks = 32;
+    let chunks = 12;
     let chunk_size = size / chunks;
 
     res.par_chunks_mut(chunk_size)

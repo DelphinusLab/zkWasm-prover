@@ -624,8 +624,13 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let mut s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
 
-        let (tuple_lookups_involved_units, _, _, _, uninvolved_advices) =
-            crate::analyze::analyze_involved_advices(pk);
+        let (
+            tuple_lookups_involved_advices,
+            lookups_involved_advices,
+            permutation_involved_advices,
+            shuffle_involved_advices,
+            uninvolved_advices,
+        ) = crate::analyze::analyze_involved_advices(pk);
 
         // Advice MSM
         let timer = start_timer!(|| format!(
@@ -650,7 +655,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         .collect()
                 },
                 &uninvolved_advices,
-                &tuple_lookups_involved_units,
+                &tuple_lookups_involved_advices,
                 instances_len,
             )?;
         for commitment in commitments.iter().take(instances.len()) {
@@ -972,8 +977,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     started = cvar.wait(started).unwrap();
                 }
 
-                println!("start to handle shuffle");
-
                 let pk = sub_pk;
                 let advices = sub_advices;
                 let instances = sub_instance;
@@ -1289,12 +1292,38 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         )?;
         end_timer!(timer);
 
+        let buffers = unsafe {
+            Arc::get_mut_unchecked(&mut advices)
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(idx, x)| {
+                    if lookups_involved_advices.contains(&idx)
+                        && !permutation_involved_advices.contains(&idx)
+                        && !shuffle_involved_advices.contains(&idx)
+                    {
+                        Some(&mut x[..])
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let timer = start_timer!(|| format!("partial and advices intt {}", buffers.len()));
+        batch_intt_raw(
+            &device,
+            buffers,
+            &intt_pq_buf,
+            &intt_omegas_buf,
+            &intt_divisor_buf,
+            k,
+        )?;
+        end_timer!(timer);
+
         let timer = start_timer!(|| "wait permutation_products");
         let mut permutation_products = permutation_products_handler.join().unwrap();
         end_timer!(timer);
 
         let timer = start_timer!(|| "permutation z msm and intt");
-
         let mut batch_ntt_t0_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         let mut batch_ntt_t1_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         let permutation_commitments = crate::cuda::bn254::batch_msm_and_intt::<C>(
@@ -1310,6 +1339,32 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .par_iter_mut()
                 .map(|x| &mut x[..])
                 .collect::<Vec<_>>(),
+        )?;
+        end_timer!(timer);
+
+        let buffers = unsafe {
+            Arc::get_mut_unchecked(&mut advices)
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(idx, x)| {
+                    if permutation_involved_advices.contains(&idx)
+                        && !shuffle_involved_advices.contains(&idx)
+                    {
+                        Some(&mut x[..])
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let timer = start_timer!(|| format!("partial and advices intt {}", buffers.len()));
+        batch_intt_raw(
+            &device,
+            buffers,
+            &intt_pq_buf,
+            &intt_omegas_buf,
+            &intt_divisor_buf,
+            k,
         )?;
         end_timer!(timer);
 
@@ -1360,8 +1415,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let timer = start_timer!(|| "h_poly");
         {
-            let timer = start_timer!(|| "instances and advices intt");
-
             let buffers = unsafe {
                 Arc::get_mut_unchecked(&mut instances)
                     .iter_mut()
@@ -1371,15 +1424,18 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             .iter_mut()
                             .enumerate()
                             .filter_map(|(idx, x)| {
-                                if uninvolved_advices.contains(&idx) {
-                                    None
-                                } else {
+                                if shuffle_involved_advices.contains(&idx) {
                                     Some(&mut x[..])
+                                } else {
+                                    None
                                 }
                             }),
                     )
                     .collect::<Vec<_>>()
             };
+
+            let timer =
+                start_timer!(|| format!("partial instances and advices intt {}", buffers.len()));
             batch_intt_raw(
                 &device,
                 buffers,
@@ -1388,7 +1444,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 &intt_divisor_buf,
                 k,
             )?;
-
             end_timer!(timer);
         }
 
