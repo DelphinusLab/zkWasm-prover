@@ -4,15 +4,6 @@
 #[macro_use]
 extern crate lazy_static;
 
-use std::collections::BTreeMap;
-use std::iter;
-use std::mem::ManuallyDrop;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::Condvar;
-use std::sync::Mutex;
-use std::thread;
-
 use ark_std::end_timer;
 use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
@@ -36,6 +27,14 @@ use rayon::iter::IntoParallelRefMutIterator as _;
 use rayon::iter::ParallelIterator as _;
 use rayon::prelude::ParallelSliceMut as _;
 use rayon::slice::ParallelSlice as _;
+use std::collections::BTreeMap;
+use std::iter;
+use std::mem::ManuallyDrop;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::thread;
 
 use crate::cuda::bn254::batch_intt_raw;
 use crate::cuda::bn254::intt_raw;
@@ -63,6 +62,7 @@ pub mod cuda;
 pub mod device;
 pub mod expr;
 
+mod analyze;
 mod eval_h;
 mod hugetlb;
 mod multiopen;
@@ -516,6 +516,13 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             .unwrap();
         end_timer!(timer);
 
+        let timer = start_timer!(|| "prepare ntt");
+        let (intt_omegas_buf, intt_pq_buf) =
+            ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
+        let intt_divisor_buf = device
+            .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
+        end_timer!(timer);
+
         // thread for part of lookups
         let sub_pk = pk.clone();
         let sub_advices = advices.clone();
@@ -617,20 +624,31 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let mut s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
 
+        let (_, _, _, uninvolved_advices) = crate::analyze::analyze_involved_advices(pk);
+
         // Advice MSM
         let timer = start_timer!(|| format!(
             "instances and advices msm {}",
             instances.len() + advices.len()
         ));
-        let commitments = crate::cuda::bn254::batch_msm(
+
+        let instances_len = instances.len();
+        let commitments = crate::cuda::bn254::batch_msm_and_conditional_intt(
+            &device,
             &g_lagrange_buf,
-            [&s_buf, &t_buf],
-            instances
-                .iter()
-                .chain(advices.iter())
-                .map(|x| &x[..])
-                .collect(),
-            size,
+            &intt_pq_buf,
+            &intt_omegas_buf,
+            &intt_divisor_buf,
+            k,
+            unsafe {
+                Arc::get_mut_unchecked(&mut instances)
+                    .iter_mut()
+                    .chain(Arc::get_mut_unchecked(&mut advices).iter_mut())
+                    .map(|x| &mut x[..])
+                    .collect()
+            },
+            &uninvolved_advices,
+            instances_len,
         )?;
         for commitment in commitments.iter().take(instances.len()) {
             transcript.common_point(*commitment).unwrap();
@@ -950,6 +968,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     started = cvar.wait(started).unwrap();
                 }
 
+                println!("start to handle shuffle");
+
                 let pk = sub_pk;
                 let advices = sub_advices;
                 let instances = sub_instance;
@@ -1005,13 +1025,13 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 };
 
                 let buffer_groups = shuffle_groups
-                    .par_iter()
-                    .zip(more_buffer_groups.par_iter_mut())
+                    .iter()
+                    .zip(more_buffer_groups.iter_mut())
                     .map(|(group, buffers)| {
                         group
                             .0
-                            .par_iter()
-                            .zip(buffers.par_iter_mut())
+                            .iter()
+                            .zip(buffers.iter_mut())
                             .map(|(elements, buffer)| {
                                 let mut tuple_expres = vec![];
                                 if !(elements.input_expressions.len() == 1
@@ -1152,13 +1172,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             end_timer!(timer);
             shuffle_products_handler
         };
-
-        let timer = start_timer!(|| "prepare ntt");
-        let (intt_omegas_buf, intt_pq_buf) =
-            ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
-        let intt_divisor_buf = device
-            .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
-        end_timer!(timer);
 
         let timer = start_timer!(|| "generate lookup z");
         {
@@ -1352,7 +1365,14 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     .chain(
                         Arc::get_mut_unchecked(&mut advices)
                             .iter_mut()
-                            .map(|x| &mut x[..]),
+                            .enumerate()
+                            .filter_map(|(idx, x)| {
+                                if uninvolved_advices.contains(&idx) {
+                                    None
+                                } else {
+                                    Some(&mut x[..])
+                                }
+                            }),
                     )
                     .collect::<Vec<_>>()
             };

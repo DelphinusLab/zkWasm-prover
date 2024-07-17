@@ -15,6 +15,7 @@ use icicle_cuda_runtime::memory::DeviceSlice;
 use icicle_cuda_runtime::memory::DeviceVec;
 use icicle_cuda_runtime::memory::HostSlice;
 use icicle_cuda_runtime::stream::CudaStream;
+use std::collections::HashSet;
 
 pub(crate) fn extended_prepare(
     device: &CudaDevice,
@@ -321,6 +322,100 @@ pub(crate) fn batch_msm<const MSM_STREAMS_NR: usize, C: CurveAffine>(
         cfg.are_scalars_montgomery_form = true;
         cfg.are_points_montgomery_form = true;
         msm::msm(scalars, points, &cfg, &mut msm_results_buf[idx][..]).unwrap();
+    }
+
+    for stream in streams {
+        stream.synchronize().unwrap();
+    }
+
+    let res_vec = msm_results_buf
+        .into_iter()
+        .map(|x| copy_and_to_affine(&x).unwrap())
+        .collect();
+
+    Ok(res_vec)
+}
+
+pub(crate) fn batch_msm_and_conditional_intt<C: CurveAffine>(
+    device: &CudaDevice,
+    p_buf: &CudaDeviceBufRaw,
+    pq_buf: &CudaDeviceBufRaw,
+    omegas_buf: &CudaDeviceBufRaw,
+    divisor: &CudaDeviceBufRaw,
+    len_log: usize,
+    values: Vec<&mut [C::Scalar]>,
+    intt_map: &HashSet<usize>,
+    skip_intt: usize,
+) -> Result<Vec<C>, Error> {
+    unsafe {
+        cudaDeviceSynchronize();
+    }
+
+    let len = 1 << len_log;
+
+    let mut s_buf = [
+        device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?,
+        device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?,
+    ];
+
+    let mut t_buf = [
+        device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?,
+        device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?,
+    ];
+
+    const MSM_STREAMS_NR: usize = 2;
+    let streams = [0; MSM_STREAMS_NR].map(|_| CudaStream::create().unwrap());
+    let mut msm_results_buf = values
+        .iter()
+        .map(|_| DeviceVec::<G1Projective>::cuda_malloc(1).unwrap())
+        .collect::<Vec<_>>();
+
+    let points = {
+        unsafe {
+            DeviceSlice::from_slice(std::slice::from_raw_parts_mut(
+                p_buf.ptr() as *mut icicle_bn254::curve::G1Affine,
+                len,
+            ))
+        }
+    };
+
+    for (idx, value) in values.into_iter().enumerate() {
+        let stream = &streams[idx % MSM_STREAMS_NR];
+        let scalars = {
+            unsafe {
+                DeviceSlice::from_mut_slice(std::slice::from_raw_parts_mut(
+                    s_buf[idx % MSM_STREAMS_NR].ptr() as _,
+                    len,
+                ))
+            }
+        };
+        let value_transmuted = unsafe { core::mem::transmute::<_, _>(&*value) };
+        scalars
+            .copy_from_host_async(&HostSlice::from_slice(value_transmuted), stream)
+            .unwrap();
+        let mut cfg = msm::MSMConfig::default();
+        cfg.ctx.stream = stream;
+        cfg.is_async = true;
+        cfg.are_scalars_montgomery_form = true;
+        cfg.are_points_montgomery_form = true;
+        msm::msm(scalars, points, &cfg, &mut msm_results_buf[idx][..]).unwrap();
+
+        if idx >= skip_intt && intt_map.contains(&(idx - skip_intt)) {
+            let stream = unsafe { *(stream as *const _ as *const *mut _) };
+
+            intt_raw_async(
+                device,
+                &mut s_buf[idx % MSM_STREAMS_NR],
+                &mut t_buf[idx % MSM_STREAMS_NR],
+                pq_buf,
+                omegas_buf,
+                divisor,
+                len_log,
+                Some(stream),
+            )?;
+
+            device.copy_from_device_to_host_async(value, &s_buf[idx % MSM_STREAMS_NR], stream)?;
+        }
     }
 
     for stream in streams {

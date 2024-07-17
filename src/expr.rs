@@ -66,7 +66,7 @@ fn compose_tuple_expressions<F: FieldExt>(
     composed_expr
 }
 
-fn flatten_tuple_expressions<F: FieldExt>(
+pub(crate) fn flatten_tuple_expressions<F: FieldExt>(
     exprs: &[Expression<F>],
     challenge: Option<F>,
     theta: F,

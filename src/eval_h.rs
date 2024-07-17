@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::collections::HashSet;
 use std::mem::ManuallyDrop;
 
 use ark_std::end_timer;
@@ -12,13 +11,13 @@ use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
 use halo2_proofs::plonk::circuit::Expression;
-use halo2_proofs::plonk::evaluation_gpu::ProveExpression;
 use halo2_proofs::plonk::evaluation_gpu::ProveExpressionUnit;
 use halo2_proofs::plonk::Any;
 use halo2_proofs::plonk::ProvingKey;
 use halo2_proofs::transcript::EncodedChallenge;
 use halo2_proofs::transcript::TranscriptWrite;
 
+use crate::analyze::analyze_expr_tree;
 use crate::cuda::bn254::buffer_copy_with_shift;
 use crate::cuda::bn254::extended_intt_after;
 use crate::cuda::bn254::extended_prepare;
@@ -70,56 +69,6 @@ impl<F: FieldExt> EvalHContext<F> {
             Ok(buf.unwrap())
         }
     }
-}
-
-pub(crate) fn analyze_expr_tree<F: FieldExt>(
-    expr: &ProveExpression<F>,
-    k: usize,
-) -> Vec<Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>> {
-    let tree = expr.clone().flatten();
-    let tree = tree
-        .into_iter()
-        .map(|(us, v)| {
-            let mut map = BTreeMap::new();
-            for mut u in us {
-                if let Some(c) = map.get_mut(&mut u) {
-                    *c = *c + 1;
-                } else {
-                    map.insert(u.clone(), 1);
-                }
-            }
-            (map, v.clone())
-        })
-        .collect::<Vec<_, _>>();
-
-    let limit = if k < 23 { 26 } else { 10 };
-    let mut v = HashSet::new();
-
-    let mut expr_group = vec![];
-    let mut expr_groups = vec![];
-    for (_, (units, coeff)) in tree.iter().enumerate() {
-        let mut v_new = v.clone();
-        let mut v_new_clean = HashSet::new();
-        let mut muls_new = 0;
-        for (unit, exp) in units {
-            v_new.insert(unit.get_group());
-            v_new_clean.insert(unit.get_group());
-            muls_new += exp;
-        }
-
-        if v_new.len() > limit {
-            v = v_new_clean;
-
-            expr_groups.push(expr_group);
-            expr_group = vec![(units.clone(), coeff.clone())];
-        } else {
-            v = v_new;
-            expr_group.push((units.clone(), coeff.clone()));
-        }
-    }
-
-    expr_groups.push(expr_group);
-    expr_groups
 }
 
 pub fn _export_evaluate_h_gates<C: CurveAffine>(
