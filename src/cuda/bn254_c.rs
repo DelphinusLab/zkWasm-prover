@@ -90,6 +90,7 @@ extern "C" {
         rot: *mut c_void,
         v_n: i32,
         n: i32,
+        stream: *mut CUstream_st,
     ) -> cudaError;
 
     pub fn lookup_eval_h(

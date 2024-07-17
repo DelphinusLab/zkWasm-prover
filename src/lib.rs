@@ -49,6 +49,7 @@ use crate::device::cuda::CUDA_BUFFER_ALLOCATOR;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
 use crate::expr::evaluate_exprs;
+use crate::expr::evaluate_exprs_in_gpu;
 use crate::hugetlb::HugePageAllocator;
 use crate::hugetlb::UnpinnedHugePageAllocator;
 use crate::multiopen::gwc;
@@ -651,40 +652,40 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         ) = lookup_handler.join().unwrap();
         end_timer!(timer);
 
-        // After theta
-        let sub_pk = pk.clone();
-        let sub_advices = advices.clone();
-        let sub_instance = instances.clone();
-        let tuple_lookup_handler = s.spawn(move || {
-            let pk = sub_pk;
-            let advices = sub_advices;
-            let instances = sub_instance;
-            let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
+        // tuple lookup prepare input/table buffer
+        {
+            let timer = start_timer!(|| "eval tuple lookup buffer");
+            let mut tuple_lookup_exprs = vec![];
+            let mut tuple_host_buffers = vec![];
+            for (i, (input, table, _, _, _)) in tuple_lookups.iter_mut() {
+                tuple_lookup_exprs.push(&pk.vk.cs.lookups[*i].input_expressions[..]);
+                tuple_lookup_exprs.push(&pk.vk.cs.lookups[*i].table_expressions[..]);
+
+                tuple_host_buffers.push(&mut input[..]);
+                tuple_host_buffers.push(&mut table[..]);
+            }
 
             let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
             let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
             let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
 
-            let mut buffers = vec![];
-            for (i, (input, table, _, _, _)) in tuple_lookups.iter_mut() {
-                buffers.push((&pk.vk.cs.lookups[*i].input_expressions[..], &mut input[..]));
-                buffers.push((&pk.vk.cs.lookups[*i].table_expressions[..], &mut table[..]));
-            }
+            let tuple_lookup_device_buffers = evaluate_exprs_in_gpu(
+                &device,
+                &tuple_lookup_exprs[..],
+                fixed_ref,
+                advice_ref,
+                instance_ref,
+                theta,
+                &mut tuple_host_buffers[..],
+                size,
+            )?;
+            drop(tuple_lookup_device_buffers);
+            end_timer!(timer);
+        }
 
-            buffers.into_iter().for_each(|(expr, buffer)| {
-                evaluate_exprs(
-                    expr,
-                    size,
-                    1,
-                    fixed_ref,
-                    advice_ref,
-                    instance_ref,
-                    theta,
-                    buffer,
-                )
-            });
-
-            let timer2 = start_timer!(|| "pair");
+        // After theta
+        let tuple_lookup_handler = s.spawn(move || {
+            let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
             let tuple_lookups = tuple_lookups
                 .into_par_iter()
                 .map(
@@ -700,7 +701,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     },
                 )
                 .collect::<Vec<_>>();
-            end_timer!(timer2);
             end_timer!(timer);
 
             tuple_lookups

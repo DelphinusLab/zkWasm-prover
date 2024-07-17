@@ -1022,6 +1022,7 @@ fn evaluate_prove_expr<F: FieldExt>(
                 rots_buf.ptr(),
                 group.len() as i32,
                 ctx.extended_size as i32,
+                0 as _,
             );
 
             to_result((), err, "fail to run field_op_batch_mul_sum")?;
@@ -1135,6 +1136,7 @@ fn evaluate_prove_expr_with_async_ntt<F: FieldExt>(
                 rots_buf.ptr(),
                 group.len() as i32,
                 ctx.extended_size as i32,
+                0 as _,
             );
 
             to_result((), err, "fail to run field_op_batch_mul_sum")?;

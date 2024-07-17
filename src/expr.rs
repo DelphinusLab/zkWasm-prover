@@ -1,3 +1,10 @@
+use crate::cuda::bn254_c::field_op_batch_mul_sum;
+use crate::device::cuda::CudaBuffer;
+use crate::device::cuda::CudaStreamWrapper;
+use crate::device::Device;
+use crate::device::DeviceResult;
+use crate::to_result;
+use crate::CudaDevice;
 use crate::CudaDeviceBufRaw;
 
 use halo2_proofs::arithmetic::FieldExt;
@@ -108,20 +115,6 @@ pub(crate) fn flatten_shuffle_expression<F: FieldExt>(
     [expr_input, expr_table]
 }
 
-pub fn evaluate_exprs_gpu<F: FieldExt>(
-    buffers: &mut BTreeMap<ProveExpressionUnit, CudaDeviceBufRaw>,
-    expressions: &[Expression<F>],
-    size: usize,
-    rot_scale: i32,
-    fixed: &[&[F]],
-    advice: &[&[F]],
-    instance: &[&[F]],
-    theta: F,
-    res: &mut [F],
-) {
-    let flat_expr = flatten_tuple_expressions(expressions, None, theta);
-}
-
 /// Simple evaluation of an expression
 pub fn evaluate_exprs<F: FieldExt>(
     expressions: &[Expression<F>],
@@ -183,4 +176,114 @@ pub fn evaluate_exprs<F: FieldExt>(
                 }
             }
         });
+}
+
+fn pick_prove_unit_slice<'a, F: FieldExt>(
+    unit: &ProveExpressionUnit,
+    fixed: &'a [&'a [F]],
+    advice: &'a [&'a [F]],
+    instance: &'a [&'a [F]],
+) -> (&'a [F], i32) {
+    match unit {
+        ProveExpressionUnit::Fixed {
+            column_index,
+            rotation,
+        } => (&fixed[*column_index], rotation.0),
+        ProveExpressionUnit::Advice {
+            column_index,
+            rotation,
+        } => (&advice[*column_index], rotation.0),
+        ProveExpressionUnit::Instance {
+            column_index,
+            rotation,
+        } => (&instance[*column_index], rotation.0),
+    }
+}
+
+pub(crate) fn evaluate_exprs_in_gpu<F: FieldExt>(
+    device: &CudaDevice,
+    exprs: &[&[Expression<F>]],
+    fixed: &[&[F]],
+    advice: &[&[F]],
+    instance: &[&[F]],
+    theta: F,
+    outputs: &mut [&mut [F]],
+    size: usize,
+) -> DeviceResult<Vec<CudaDeviceBufRaw>> {
+    let mut unit_buffers = BTreeMap::new();
+    let mut handlers = vec![];
+    for (i, expr) in exprs.into_iter().enumerate() {
+        let expr = flatten_tuple_expressions(expr, None, theta);
+
+        let stream_wrapper = CudaStreamWrapper::new();
+        let stream = (&stream_wrapper).into();
+        let mut coeffs = vec![];
+        for (_, y_map) in expr.iter() {
+            assert_eq!(y_map.len(), 1);
+            for (k, v) in y_map {
+                assert_eq!(*k, 0);
+                coeffs.push(*v);
+            }
+        }
+
+        let coeffs_buf = device.alloc_device_buffer_from_slice_async(&coeffs[..], stream)?;
+
+        let mut terms = vec![]; // Array of polynomial terms [coeff0, x0, y0, ..., nil, coeff1, x1, y1, ...]
+        let mut rots = vec![];
+        for (i, (units, _)) in expr.into_iter().enumerate() {
+            terms.push(unsafe {
+                coeffs_buf
+                    .ptr()
+                    .offset((i * core::mem::size_of::<F>()) as isize)
+            });
+
+            for (unit, exp) in units {
+                let (values, rot) = pick_prove_unit_slice(&unit, fixed, advice, instance);
+                let buf = unit_buffers.entry(unit).or_insert_with(|| {
+                    device
+                        .alloc_device_buffer_from_slice_async(values, stream)
+                        .unwrap()
+                });
+                for _ in 0..exp {
+                    terms.push(buf.ptr());
+                    rots.push(rot);
+                }
+            }
+
+            terms.push(0usize as _);
+        }
+
+        let terms_buf = device.alloc_device_buffer_from_slice_async(&terms[..], stream)?;
+        let rots_buf = device.alloc_device_buffer_from_slice_async(&rots[..], stream)?;
+        let res = device.alloc_device_buffer::<F>(size)?;
+
+        let err = unsafe {
+            field_op_batch_mul_sum(
+                res.ptr(),
+                terms_buf.ptr(),
+                rots_buf.ptr(),
+                terms.len() as i32,
+                size as i32,
+                stream,
+            )
+        };
+
+        to_result((), err, "fail to run field_op_batch_mul_sum")?;
+
+        device.copy_from_device_to_host_async(outputs[i], &res, stream)?;
+        handlers.push((res, terms_buf, rots_buf, stream_wrapper))
+    }
+
+    let mut res = vec![];
+
+    for (buf, _, _, _) in handlers {
+        res.push(buf);
+    }
+
+    println!(
+        "buffers {} {:?}",
+        unit_buffers.keys().len(),
+        unit_buffers.keys()
+    );
+    Ok(res)
 }
