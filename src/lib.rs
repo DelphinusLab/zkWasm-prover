@@ -47,6 +47,7 @@ use crate::device::cuda::CudaDevice;
 use crate::device::cuda::CudaDeviceBufRaw;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
+use crate::expr::evaluate_exprs;
 use crate::hugetlb::HugePageAllocator;
 use crate::hugetlb::UnpinnedHugePageAllocator;
 use crate::multiopen::gwc;
@@ -58,6 +59,7 @@ use crate::multiopen::ProverQuery;
 
 pub mod cuda;
 pub mod device;
+pub mod expr;
 
 mod eval_h;
 mod hugetlb;
@@ -286,69 +288,6 @@ pub fn evaluate_expr<F: FieldExt>(
             &|a, scalar| a * scalar,
         );
     }
-}
-
-/// Simple evaluation of an expression
-pub fn evaluate_exprs<F: FieldExt>(
-    expressions: &[Expression<F>],
-    size: usize,
-    rot_scale: i32,
-    fixed: &[&[F]],
-    advice: &[&[F]],
-    instance: &[&[F]],
-    theta: F,
-    res: &mut [F],
-) {
-    let isize = size as i32;
-    let get_rotation_idx = |idx: usize, rot: i32, rot_scale: i32, isize: i32| -> usize {
-        (((idx as i32) + (rot * rot_scale)).rem_euclid(isize)) as usize
-    };
-
-    let chunks = 8;
-    let chunk_size = size / chunks;
-
-    res.par_chunks_mut(chunk_size)
-        .enumerate()
-        .for_each(|(chunk_idx, res_chunck)| {
-            for (i, value) in res_chunck.into_iter().enumerate() {
-                let idx = chunk_idx * chunk_size + i;
-                for (i, expression) in expressions.iter().enumerate() {
-                    let v = expression.evaluate(
-                        &|scalar| scalar,
-                        &|_| panic!("virtual selectors are removed during optimization"),
-                        &|_, column_index, rotation| {
-                            fixed[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                        },
-                        &|_, column_index, rotation| {
-                            advice[column_index]
-                                [get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                        },
-                        &|_, column_index, rotation| {
-                            instance[column_index]
-                                [get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                        },
-                        &|a| -a,
-                        &|a, b| a + &b,
-                        &|a, b| {
-                            let a = a();
-                            if a == F::zero() {
-                                a
-                            } else {
-                                a * b()
-                            }
-                        },
-                        &|a, scalar| a * scalar,
-                    );
-
-                    if i > 0 && *value != F::zero() {
-                        *value = *value * theta;
-                        *value += v;
-                    } else {
-                        *value = v;
-                    }
-                }
-            }
-        });
 }
 
 pub fn create_proof_from_advices<
@@ -724,7 +663,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 buffers.push((&pk.vk.cs.lookups[*i].table_expressions[..], &mut table[..]));
             }
 
-            buffers.into_par_iter().for_each(|(expr, buffer)| {
+            buffers.into_iter().for_each(|(expr, buffer)| {
                 evaluate_exprs(
                     expr,
                     size,
@@ -737,6 +676,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 )
             });
 
+            let timer2 = start_timer!(|| "pair");
             let tuple_lookups = tuple_lookups
                 .into_par_iter()
                 .map(
@@ -752,6 +692,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     },
                 )
                 .collect::<Vec<_>>();
+            end_timer!(timer2);
             end_timer!(timer);
 
             tuple_lookups

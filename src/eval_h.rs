@@ -12,7 +12,6 @@ use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
 use halo2_proofs::plonk::circuit::Expression;
-use halo2_proofs::plonk::evaluation_gpu::Bop;
 use halo2_proofs::plonk::evaluation_gpu::ProveExpression;
 use halo2_proofs::plonk::evaluation_gpu::ProveExpressionUnit;
 use halo2_proofs::plonk::Any;
@@ -46,6 +45,8 @@ use crate::device::cuda::CudaDevice;
 use crate::device::cuda::CudaDeviceBufRaw;
 use crate::device::Device as _;
 use crate::device::DeviceResult;
+use crate::expr::flatten_lookup_expression;
+use crate::expr::flatten_shuffle_expression;
 use crate::hugetlb::HugePageAllocator;
 
 struct EvalHContext<F: FieldExt> {
@@ -809,162 +810,6 @@ fn get_expr_degree<F: FieldExt>(expr: &Vec<Expression<F>>) -> usize {
         deg = deg.max(expr.degree());
     }
     deg
-}
-
-fn flatten_lookup_expression<F: FieldExt>(
-    input: &Vec<Expression<F>>,
-    table: &Vec<Expression<F>>,
-    beta: F,
-    gamma: F,
-    theta: F,
-) -> [Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>; 2] {
-    let mut expr_input = ProveExpression::<F>::from_expr(&input[0]);
-    for input in input.iter().skip(1) {
-        expr_input = ProveExpression::Scale(
-            Box::new(expr_input),
-            BTreeMap::from_iter([(0, theta)].into_iter()),
-        );
-        expr_input = ProveExpression::Op(
-            Box::new(expr_input),
-            Box::new(ProveExpression::<F>::from_expr(input)),
-            Bop::Sum,
-        );
-    }
-
-    expr_input = ProveExpression::Op(
-        Box::new(expr_input),
-        Box::new(ProveExpression::Y(BTreeMap::from_iter(
-            [(0, beta)].into_iter(),
-        ))),
-        Bop::Sum,
-    );
-
-    let expr_input = expr_input
-        .flatten()
-        .into_iter()
-        .map(|(us, v)| {
-            let mut map = BTreeMap::new();
-            for mut u in us {
-                if let Some(c) = map.get_mut(&mut u) {
-                    *c = *c + 1;
-                } else {
-                    map.insert(u.clone(), 1);
-                }
-            }
-            (map, v.clone())
-        })
-        .collect::<Vec<_, _>>();
-
-    let mut expr_table = ProveExpression::<F>::from_expr(&table[0]);
-    for table in table.iter().skip(1) {
-        expr_table = ProveExpression::Scale(
-            Box::new(expr_table),
-            BTreeMap::from_iter([(0, theta)].into_iter()),
-        );
-        expr_table = ProveExpression::Op(
-            Box::new(expr_table),
-            Box::new(ProveExpression::<F>::from_expr(table)),
-            Bop::Sum,
-        );
-    }
-
-    expr_table = ProveExpression::Op(
-        Box::new(expr_table),
-        Box::new(ProveExpression::Y(BTreeMap::from_iter(
-            [(0, gamma)].into_iter(),
-        ))),
-        Bop::Sum,
-    );
-
-    let expr_table = expr_table
-        .flatten()
-        .into_iter()
-        .map(|(us, v)| {
-            let mut map = BTreeMap::new();
-            for mut u in us {
-                if let Some(c) = map.get_mut(&mut u) {
-                    *c = *c + 1;
-                } else {
-                    map.insert(u.clone(), 1);
-                }
-            }
-            (map, v.clone())
-        })
-        .collect::<Vec<_, _>>();
-
-    [expr_input, expr_table]
-}
-
-fn flatten_shuffle_expression<F: FieldExt>(
-    inputs: &Vec<Vec<Expression<F>>>,
-    tables: &Vec<Vec<Expression<F>>>,
-    beta: F,
-    theta: F,
-) -> [Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>; 2] {
-    let construct_expr_input = |inputs: &Vec<Vec<Expression<F>>>| {
-        let expr_inputs = inputs
-            .iter()
-            .map(|input| {
-                let mut expr_input = ProveExpression::<F>::from_expr(&input[0]);
-                for input in input.iter().skip(1) {
-                    expr_input = ProveExpression::Scale(
-                        Box::new(expr_input),
-                        BTreeMap::from_iter([(0, theta)].into_iter()),
-                    );
-                    expr_input = ProveExpression::Op(
-                        Box::new(expr_input),
-                        Box::new(ProveExpression::<F>::from_expr(input)),
-                        Bop::Sum,
-                    );
-                }
-                expr_input
-            })
-            .collect::<Vec<_>>();
-
-        let mut expr_input = ProveExpression::Op(
-            Box::new(expr_inputs[0].clone()),
-            Box::new(ProveExpression::Y(BTreeMap::from_iter(
-                [(0, beta)].into_iter(),
-            ))),
-            Bop::Sum,
-        );
-        for (i, input) in expr_inputs.iter().enumerate().skip(1) {
-            let beta_pow_i = beta.pow_vartime([1 + i as u64]);
-            let next_input = ProveExpression::Op(
-                Box::new(input.clone()),
-                Box::new(ProveExpression::Y(BTreeMap::from_iter(
-                    [(0, beta_pow_i)].into_iter(),
-                ))),
-                Bop::Sum,
-            );
-            expr_input = ProveExpression::Op(
-                Box::new(expr_input.clone()),
-                Box::new(next_input.clone()),
-                Bop::Product,
-            );
-        }
-
-        let expr_input = expr_input
-            .flatten()
-            .into_iter()
-            .map(|(us, v)| {
-                let mut map = BTreeMap::new();
-                for mut u in us {
-                    if let Some(c) = map.get_mut(&mut u) {
-                        *c = *c + 1;
-                    } else {
-                        map.insert(u.clone(), 1);
-                    }
-                }
-                (map, v.clone())
-            })
-            .collect::<Vec<_, _>>();
-        expr_input
-    };
-    let expr_input = construct_expr_input(inputs);
-    let expr_table = construct_expr_input(tables);
-
-    [expr_input, expr_table]
 }
 
 fn do_extended_ntt_v2<F: FieldExt>(
