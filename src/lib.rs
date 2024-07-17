@@ -30,7 +30,6 @@ use rayon::slice::ParallelSlice as _;
 use std::collections::BTreeMap;
 use std::iter;
 use std::mem::ManuallyDrop;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -44,6 +43,7 @@ use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
 use crate::device::cuda::CudaDeviceBufRaw;
+use crate::device::cuda::CudaStreamWrapper;
 use crate::device::cuda::CUDA_BUFFER_ALLOCATOR;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
@@ -1182,52 +1182,44 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let timer = start_timer!(|| "generate lookup z");
         {
             const MAX_CONCURRENCY: usize = 3;
-            let mut streams = [None; MAX_CONCURRENCY];
+            let streams = [0; MAX_CONCURRENCY].map(|_| CudaStreamWrapper::new());
             let mut buffers = [0; MAX_CONCURRENCY].map(|_| {
-                Rc::new([0; 5].map(|_| {
+                [0; 5].map(|_| {
                     device
                         .alloc_device_buffer_non_zeroed::<C::Scalar>(size)
                         .unwrap()
-                }))
+                })
             });
 
             let beta_gamma_buf = device.alloc_device_buffer_from_slice(&[beta, gamma])?;
             for (i, (permuted_input, permuted_table, input, table, z)) in lookups.iter_mut() {
-                unsafe {
-                    let idx = *i % MAX_CONCURRENCY;
-                    let [z_buf, input_buf, table_buf, permuted_input_buf, permuted_table_buf] =
-                        Rc::get_mut(&mut buffers[idx]).unwrap();
+                let idx = *i % MAX_CONCURRENCY;
+                let [z_buf, input_buf, table_buf, permuted_input_buf, permuted_table_buf] =
+                    &mut buffers[idx];
+                let stream = (&streams[idx]).into();
 
-                    if let Some(last_stream) = streams[idx] {
-                        cuda_runtime_sys::cudaStreamSynchronize(last_stream);
-                        cuda_runtime_sys::cudaStreamDestroy(last_stream);
-                    }
-
-                    let mut stream = std::mem::zeroed();
-                    let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-                    crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
-
-                    for (j, (d_buf, h_buf)) in [
-                        (&mut *input_buf, &mut input[..]),
-                        (&mut *table_buf, &mut table[..]),
-                        (&mut *permuted_input_buf, &mut permuted_input[..]),
-                        (&mut *permuted_table_buf, &mut permuted_table[..]),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        let buf = lookup_device_buffers.remove(&(*i, j));
-                        match buf {
-                            Some(buf) => {
-                                *d_buf = buf;
-                            }
-                            None => {
-                                device.copy_from_host_to_device_async(&*d_buf, h_buf, stream)?;
-                            }
+                for (j, (d_buf, h_buf)) in [
+                    (&mut *input_buf, &mut input[..]),
+                    (&mut *table_buf, &mut table[..]),
+                    (&mut *permuted_input_buf, &mut permuted_input[..]),
+                    (&mut *permuted_table_buf, &mut permuted_table[..]),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let buf = lookup_device_buffers.remove(&(*i, j));
+                    match buf {
+                        Some(buf) => {
+                            *d_buf = buf;
+                        }
+                        None => {
+                            device.copy_from_host_to_device_async(&*d_buf, h_buf, stream)?;
                         }
                     }
+                }
 
-                    let err = eval_lookup_z(
+                let err = unsafe {
+                    eval_lookup_z(
                         z_buf.ptr(),
                         input_buf.ptr(),
                         table_buf.ptr(),
@@ -1236,47 +1228,38 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         beta_gamma_buf.ptr(),
                         size as i32,
                         stream,
-                    );
+                    )
+                };
 
-                    to_result((), err, "failed to run eval_lookup_z")?;
+                to_result((), err, "failed to run eval_lookup_z")?;
 
-                    for s_buf in [
-                        &mut *permuted_input_buf,
-                        &mut *permuted_table_buf,
-                        &mut *z_buf,
-                    ] {
-                        intt_raw_async(
-                            &device,
-                            s_buf,
-                            &mut *input_buf,
-                            &intt_pq_buf,
-                            &intt_omegas_buf,
-                            &intt_divisor_buf,
-                            k,
-                            Some(stream),
-                        )?;
-                    }
+                for s_buf in [
+                    &mut *permuted_input_buf,
+                    &mut *permuted_table_buf,
+                    &mut *z_buf,
+                ] {
+                    intt_raw_async(
+                        &device,
+                        s_buf,
+                        &mut *input_buf,
+                        &intt_pq_buf,
+                        &intt_omegas_buf,
+                        &intt_divisor_buf,
+                        k,
+                        Some(stream),
+                    )?;
+                }
 
-                    for (col, s_buf) in [
-                        (&mut permuted_input[..], permuted_input_buf),
-                        (&mut permuted_table[..], permuted_table_buf),
-                        (&mut z[..], z_buf),
-                    ] {
-                        device.copy_from_device_to_host_async(col, &s_buf, stream)?;
-                    }
-
-                    streams[idx] = Some(stream);
+                for (col, s_buf) in [
+                    (&mut permuted_input[..], permuted_input_buf),
+                    (&mut permuted_table[..], permuted_table_buf),
+                    (&mut z[..], z_buf),
+                ] {
+                    device.copy_from_device_to_host_async(col, &s_buf, stream)?;
                 }
             }
 
-            unsafe {
-                for last_stream in streams {
-                    if let Some(last_stream) = last_stream {
-                        cuda_runtime_sys::cudaStreamSynchronize(last_stream);
-                        cuda_runtime_sys::cudaStreamDestroy(last_stream);
-                    }
-                }
-            }
+            drop(streams);
         }
 
         let mut lookups = lookups.into_iter().map(|(_, b)| b).collect::<Vec<_>>();
