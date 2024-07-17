@@ -14,6 +14,7 @@ use halo2_proofs::plonk::evaluation_gpu::ProveExpressionUnit;
 use halo2_proofs::plonk::Expression;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 fn flatten_prove_expression<F: FieldExt>(
     prove_expression: ProveExpression<F>,
@@ -202,6 +203,7 @@ fn pick_prove_unit_slice<'a, F: FieldExt>(
 
 pub(crate) fn evaluate_exprs_in_gpu<F: FieldExt>(
     device: &CudaDevice,
+    advice_buffer: HashMap<usize, CudaDeviceBufRaw>,
     exprs: &[&[Expression<F>]],
     fixed: &[&[F]],
     advice: &[&[F]],
@@ -238,12 +240,21 @@ pub(crate) fn evaluate_exprs_in_gpu<F: FieldExt>(
             });
 
             for (unit, exp) in units {
-                let (values, rot) = pick_prove_unit_slice(&unit, fixed, advice, instance);
-                let buf = unit_buffers.entry(unit).or_insert_with(|| {
-                    device
-                        .alloc_device_buffer_from_slice_async(values, stream)
-                        .unwrap()
-                });
+                let (buf, rot) = match unit {
+                    ProveExpressionUnit::Advice {
+                        column_index,
+                        rotation,
+                    } => (advice_buffer.get(&column_index).unwrap(), rotation.0),
+                    _ => {
+                        let (values, rot) = pick_prove_unit_slice(&unit, fixed, advice, instance);
+                        let buf = unit_buffers.entry(unit).or_insert_with(|| {
+                            device
+                                .alloc_device_buffer_from_slice_async(values, stream)
+                                .unwrap()
+                        });
+                        (&*buf, rot)
+                    }
+                };
                 for _ in 0..exp {
                     terms.push(buf.ptr());
                     rots.push(rot);

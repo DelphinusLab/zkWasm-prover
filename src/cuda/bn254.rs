@@ -15,7 +15,7 @@ use icicle_cuda_runtime::memory::DeviceSlice;
 use icicle_cuda_runtime::memory::DeviceVec;
 use icicle_cuda_runtime::memory::HostSlice;
 use icicle_cuda_runtime::stream::CudaStream;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub(crate) fn extended_prepare(
     device: &CudaDevice,
@@ -345,8 +345,9 @@ pub(crate) fn batch_msm_and_conditional_intt<C: CurveAffine>(
     len_log: usize,
     values: Vec<&mut [C::Scalar]>,
     intt_map: &HashSet<usize>,
+    cache_map: &HashSet<usize>,
     skip_intt: usize,
-) -> Result<Vec<C>, Error> {
+) -> Result<(Vec<C>, HashMap<usize, CudaDeviceBufRaw>), Error> {
     unsafe {
         cudaDeviceSynchronize();
     }
@@ -379,6 +380,8 @@ pub(crate) fn batch_msm_and_conditional_intt<C: CurveAffine>(
         }
     };
 
+    let mut ret_device_buffers = HashMap::new();
+
     for (idx, value) in values.into_iter().enumerate() {
         let stream = &streams[idx % MSM_STREAMS_NR];
         let scalars = {
@@ -400,21 +403,31 @@ pub(crate) fn batch_msm_and_conditional_intt<C: CurveAffine>(
         cfg.are_points_montgomery_form = true;
         msm::msm(scalars, points, &cfg, &mut msm_results_buf[idx][..]).unwrap();
 
-        if idx >= skip_intt && intt_map.contains(&(idx - skip_intt)) {
-            let stream = unsafe { *(stream as *const _ as *const *mut _) };
+        if idx >= skip_intt {
+            if intt_map.contains(&(idx - skip_intt)) {
+                let stream = unsafe { *(stream as *const _ as *const *mut _) };
 
-            intt_raw_async(
-                device,
-                &mut s_buf[idx % MSM_STREAMS_NR],
-                &mut t_buf[idx % MSM_STREAMS_NR],
-                pq_buf,
-                omegas_buf,
-                divisor,
-                len_log,
-                Some(stream),
-            )?;
+                intt_raw_async(
+                    device,
+                    &mut s_buf[idx % MSM_STREAMS_NR],
+                    &mut t_buf[idx % MSM_STREAMS_NR],
+                    pq_buf,
+                    omegas_buf,
+                    divisor,
+                    len_log,
+                    Some(stream),
+                )?;
 
-            device.copy_from_device_to_host_async(value, &s_buf[idx % MSM_STREAMS_NR], stream)?;
+                device.copy_from_device_to_host_async(
+                    value,
+                    &s_buf[idx % MSM_STREAMS_NR],
+                    stream,
+                )?;
+            } else if cache_map.contains(&(idx - skip_intt)) {
+                let mut new_buffer = device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?;
+                core::mem::swap(&mut s_buf[idx % MSM_STREAMS_NR], &mut new_buffer);
+                ret_device_buffers.insert(idx - skip_intt, new_buffer);
+            }
         }
     }
 
@@ -422,12 +435,12 @@ pub(crate) fn batch_msm_and_conditional_intt<C: CurveAffine>(
         stream.synchronize().unwrap();
     }
 
-    let res_vec = msm_results_buf
+    let ret_vec = msm_results_buf
         .into_iter()
         .map(|x| copy_and_to_affine(&x).unwrap())
         .collect();
 
-    Ok(res_vec)
+    Ok((ret_vec, ret_device_buffers))
 }
 
 pub(crate) fn batch_msm_and_intt<C: CurveAffine>(

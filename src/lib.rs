@@ -624,7 +624,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let mut s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
 
-        let (_, _, _, uninvolved_advices) = crate::analyze::analyze_involved_advices(pk);
+        let (tuple_lookups_involved_units, _, _, _, uninvolved_advices) =
+            crate::analyze::analyze_involved_advices(pk);
 
         // Advice MSM
         let timer = start_timer!(|| format!(
@@ -633,23 +634,25 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         ));
 
         let instances_len = instances.len();
-        let commitments = crate::cuda::bn254::batch_msm_and_conditional_intt(
-            &device,
-            &g_lagrange_buf,
-            &intt_pq_buf,
-            &intt_omegas_buf,
-            &intt_divisor_buf,
-            k,
-            unsafe {
-                Arc::get_mut_unchecked(&mut instances)
-                    .iter_mut()
-                    .chain(Arc::get_mut_unchecked(&mut advices).iter_mut())
-                    .map(|x| &mut x[..])
-                    .collect()
-            },
-            &uninvolved_advices,
-            instances_len,
-        )?;
+        let (commitments, advice_device_buffers) =
+            crate::cuda::bn254::batch_msm_and_conditional_intt(
+                &device,
+                &g_lagrange_buf,
+                &intt_pq_buf,
+                &intt_omegas_buf,
+                &intt_divisor_buf,
+                k,
+                unsafe {
+                    Arc::get_mut_unchecked(&mut instances)
+                        .iter_mut()
+                        .chain(Arc::get_mut_unchecked(&mut advices).iter_mut())
+                        .map(|x| &mut x[..])
+                        .collect()
+                },
+                &uninvolved_advices,
+                &tuple_lookups_involved_units,
+                instances_len,
+            )?;
         for commitment in commitments.iter().take(instances.len()) {
             transcript.common_point(*commitment).unwrap();
         }
@@ -690,6 +693,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
             let tuple_lookup_device_buffers = evaluate_exprs_in_gpu(
                 &device,
+                advice_device_buffers,
                 &tuple_lookup_exprs[..],
                 fixed_ref,
                 advice_ref,
