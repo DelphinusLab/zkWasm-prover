@@ -241,6 +241,10 @@ impl CudaDevice {
         self.copy_from_host_to_device_async(&buf, data, stream)?;
         Ok(buf)
     }
+
+    pub fn alloc_device_buffer_non_zeroed<T>(&self, size: usize) -> DeviceResult<CudaDeviceBufRaw> {
+        self._alloc_device_buffer::<T>(size, false)
+    }
 }
 
 impl Device<CudaDeviceBufRaw> for CudaDevice {

@@ -652,6 +652,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         ) = lookup_handler.join().unwrap();
         end_timer!(timer);
 
+        let mut lookup_device_buffers = BTreeMap::new();
         // tuple lookup prepare input/table buffer
         {
             let timer = start_timer!(|| "eval tuple lookup buffer");
@@ -679,7 +680,17 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 &mut tuple_host_buffers[..],
                 size,
             )?;
-            drop(tuple_lookup_device_buffers);
+
+            let mut tuple_lookup_device_buffers_iter = tuple_lookup_device_buffers.into_iter();
+
+            for (i, _) in tuple_lookups.iter() {
+                lookup_device_buffers
+                    .insert((*i, 0), tuple_lookup_device_buffers_iter.next().unwrap());
+                lookup_device_buffers
+                    .insert((*i, 1), tuple_lookup_device_buffers_iter.next().unwrap());
+            }
+
+            assert_eq!(tuple_lookup_device_buffers_iter.count(), 0);
             end_timer!(timer);
         }
 
@@ -1154,7 +1165,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             const MAX_CONCURRENCY: usize = 3;
             let mut streams = [None; MAX_CONCURRENCY];
             let mut buffers = [0; MAX_CONCURRENCY].map(|_| {
-                Rc::new([0; 5].map(|_| (device.alloc_device_buffer::<C::Scalar>(size).unwrap())))
+                Rc::new([0; 5].map(|_| {
+                    device
+                        .alloc_device_buffer_non_zeroed::<C::Scalar>(size)
+                        .unwrap()
+                }))
             });
 
             let beta_gamma_buf = device.alloc_device_buffer_from_slice(&[beta, gamma])?;
@@ -1173,13 +1188,24 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
                     crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
 
-                    for (d_buf, h_buf) in [
-                        (&*input_buf, &mut input[..]),
-                        (&*table_buf, &mut table[..]),
-                        (&*permuted_input_buf, &mut permuted_input[..]),
-                        (&*permuted_table_buf, &mut permuted_table[..]),
-                    ] {
-                        device.copy_from_host_to_device_async(d_buf, h_buf, stream)?;
+                    for (j, (d_buf, h_buf)) in [
+                        (&mut *input_buf, &mut input[..]),
+                        (&mut *table_buf, &mut table[..]),
+                        (&mut *permuted_input_buf, &mut permuted_input[..]),
+                        (&mut *permuted_table_buf, &mut permuted_table[..]),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let buf = lookup_device_buffers.remove(&(*i, j));
+                        match buf {
+                            Some(buf) => {
+                                *d_buf = buf;
+                            }
+                            None => {
+                                device.copy_from_host_to_device_async(&*d_buf, h_buf, stream)?;
+                            }
+                        }
                     }
 
                     let err = eval_lookup_z(

@@ -280,10 +280,5 @@ pub(crate) fn evaluate_exprs_in_gpu<F: FieldExt>(
         res.push(buf);
     }
 
-    println!(
-        "buffers {} {:?}",
-        unit_buffers.keys().len(),
-        unit_buffers.keys()
-    );
     Ok(res)
 }
