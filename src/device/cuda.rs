@@ -200,6 +200,9 @@ impl CudaDevice {
             } else {
                 let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
                 let ptr = allocator.alloc(size);
+                if zero {
+                    cuda_runtime_sys::cudaMemset(ptr, 0, size);
+                }
                 Ok(CudaDeviceBufRaw {
                     ptr,
                     device: self.clone(),
