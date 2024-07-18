@@ -778,6 +778,61 @@ __global__ void _lookup_eval_h(
     res[i] = t;
 }
 
+__global__ void _shuffle_eval_h_v2(
+    Bn254FrField *res,
+    const Bn254FrField **input,
+    const Bn254FrField **table,
+    const Bn254FrField *beta,
+    const int group_len,
+    const Bn254FrField *z,
+    const Bn254FrField *l0,
+    const Bn254FrField *l_last,
+    const Bn254FrField *l_active_row,
+    const Bn254FrField *y,
+    int rot,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = gid;
+    int r_next = (i + rot) & (n - 1);
+
+    Bn254FrField l, r;
+    l = input[0][i] + beta[0];
+    r = table[0][i] + beta[0];
+
+    for (int j = 1; j < group_len; j++)
+    {
+        l = l * (input[j][i] + beta[j]);
+        r = r * (table[j][i] + beta[j]);
+    }
+
+    Bn254FrField t, u, p;
+    t = res[i];
+
+    // l_0(X) * (1 - z(X)) = 0
+    t = t * *y;
+    u = Bn254FrField(1) - z[i];
+    u = l0[i] * u;
+    t += u;
+
+    // l_last(X) * (z(X)^2 - z(X)) = 0
+    t = t * *y;
+    u = z[i] * z[i];
+    u -= z[i];
+    u = l_last[i] * u;
+    t += u;
+
+    // (1 - (l_last(X) + l_blind(X))) *
+    // (z(\omega X) (s(X) + \beta^i)- z(X) (a(X) + \beta^i))=0
+    t = t * *y;
+    u = r * z[r_next];
+    u -= l * z[i];
+    u = u * l_active_row[i];
+    t += u;
+
+    res[i] = t;
+}
+
 __global__ void _shuffle_eval_h(
     Bn254FrField *res,
     const Bn254FrField *input,
@@ -1147,6 +1202,31 @@ extern "C"
         _shuffle_eval_h<<<blocks, threads>>>(
             res,
             input, table, z,
+            l0, l_last, l_active_row,
+            y, rot, n);
+        return cudaGetLastError();
+    }
+
+    cudaError_t shuffle_eval_h_v2(
+        Bn254FrField *res,
+        const Bn254FrField **input,
+        const Bn254FrField **table,
+        const Bn254FrField *betas,
+        const int group_len,
+        const Bn254FrField *z,
+        const Bn254FrField *l0,
+        const Bn254FrField *l_last,
+        const Bn254FrField *l_active_row,
+        const Bn254FrField *y,
+        int rot,
+        int n)
+    {
+        int threads = n >= 64 ? 64 : 1;
+        int blocks = n / threads;
+        _shuffle_eval_h_v2<<<blocks, threads>>>(
+            res,
+            input, table, betas, group_len,
+            z,
             l0, l_last, l_active_row,
             y, rot, n);
         return cudaGetLastError();

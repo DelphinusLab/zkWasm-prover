@@ -457,6 +457,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
     let size = 1 << k;
 
     println!("k is {}", k);
+    println!("fixed is {}", pk.vk.fixed_commitments.len());
+    println!("permutation is {}", pk.vk.permutation.commitments.len());
 
     {
         let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();

@@ -7,6 +7,7 @@ use crate::to_result;
 use crate::CudaDevice;
 use crate::CudaDeviceBufRaw;
 
+use ark_std::iterable::Iterable;
 use halo2_proofs::arithmetic::FieldExt;
 use halo2_proofs::plonk::evaluation_gpu::Bop;
 use halo2_proofs::plonk::evaluation_gpu::ProveExpression;
@@ -15,6 +16,15 @@ use halo2_proofs::plonk::Expression;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+
+pub(crate) fn is_expr_unit<F: FieldExt>(expr: &Expression<F>) -> bool {
+    match expr {
+        Expression::Fixed { rotation, .. }
+        | Expression::Advice { rotation, .. }
+        | Expression::Instance { rotation, .. } => rotation.0 == 0,
+        _ => false,
+    }
+}
 
 fn flatten_prove_expression<F: FieldExt>(
     prove_expression: ProveExpression<F>,

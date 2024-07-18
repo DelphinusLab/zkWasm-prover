@@ -1,6 +1,6 @@
 use core::cell::RefCell;
 use core::mem;
-use cuda_runtime_sys::{cudaError, cudaStream_t};
+use cuda_runtime_sys::{cudaError, cudaStream_t, CUstream_st};
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::{ffi::c_void, sync::Mutex};
@@ -37,14 +37,14 @@ impl CudaDevice {
     pub(crate) fn acitve_ctx(&self) -> DeviceResult<()> {
         ACITVE_CUDA_DEVICE.with(|x| {
             if *x.borrow() != self.device {
-                *x.borrow_mut() = self.device
+                *x.borrow_mut() = self.device;
+                unsafe {
+                    let res = cuda_runtime_sys::cudaSetDevice(self.device);
+                    to_result((), res, "fail to set device")?
+                }
             }
-        });
-
-        unsafe {
-            let res = cuda_runtime_sys::cudaSetDevice(self.device);
-            to_result((), res, "fail to set device")
-        }
+            Ok(())
+        })
     }
 }
 
@@ -380,6 +380,14 @@ impl CudaStreamWrapper {
             let mut stream = std::mem::zeroed();
             let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
             Self(stream)
+        }
+    }
+
+    pub fn new_with_inner() -> (Self, *mut CUstream_st) {
+        unsafe {
+            let mut stream = std::mem::zeroed();
+            let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+            (Self(stream), stream)
         }
     }
 

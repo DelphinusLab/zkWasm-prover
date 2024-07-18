@@ -38,14 +38,17 @@ use crate::cuda::bn254_c;
 use crate::cuda::bn254_c::field_op_batch_mul_sum;
 use crate::cuda::bn254_c::lookup_eval_h;
 use crate::cuda::bn254_c::shuffle_eval_h;
+use crate::cuda::bn254_c::shuffle_eval_h_v2;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
 use crate::device::cuda::CudaDeviceBufRaw;
+use crate::device::cuda::CudaStreamWrapper;
 use crate::device::Device as _;
 use crate::device::DeviceResult;
 use crate::expr::flatten_lookup_expression;
 use crate::expr::flatten_shuffle_expression;
+use crate::expr::is_expr_unit;
 use crate::hugetlb::HugePageAllocator;
 
 struct EvalHContext<F: FieldExt> {
@@ -64,7 +67,7 @@ impl<F: FieldExt> EvalHContext<F> {
     fn alloc(&mut self, device: &CudaDevice) -> DeviceResult<CudaDeviceBufRaw> {
         let buf = self.extended_allocator.pop();
         if buf.is_none() {
-            device.alloc_device_buffer::<F>(self.extended_size)
+            device.alloc_device_buffer_non_zeroed::<F>(self.extended_size)
         } else {
             Ok(buf.unwrap())
         }
@@ -698,55 +701,140 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h shuffle");
+
+    let pick_host_buf_and_do_ntt_async =
+        |ctx: &mut _,
+         expr: &Expression<_>,
+         tmp_buf: &mut Vec<_>,
+         tmp_stream: &mut Vec<CudaStreamWrapper>,
+         device_buf_vec: &mut Vec<_>| {
+            let host_buf = match expr {
+                Expression::Fixed { column_index, .. } => &*fixed[*column_index],
+                Expression::Advice { column_index, .. } => &*advice[*column_index],
+                Expression::Instance { column_index, .. } => &*instance[*column_index],
+                _ => unreachable!(),
+            };
+            let (device_buf, tmp, stream) = do_extended_ntt_async(device, ctx, host_buf).unwrap();
+            tmp_buf.push(tmp);
+            tmp_stream.push(stream);
+            device_buf_vec.push(device_buf);
+        };
+
     let shuffle_group = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
     for (_i, (shuffle, z)) in shuffle_group
         .iter()
         .zip(shuffle_products.iter())
         .enumerate()
     {
-        let (input_expressions, table_expressions) = shuffle
+        if shuffle
             .0
             .iter()
-            .map(|x| (x.input_expressions.clone(), x.shuffle_expressions.clone()))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .unzip();
+            .find(|x| {
+                x.input_expressions.len() > 1
+                    || !is_expr_unit(&x.input_expressions[0])
+                    || x.shuffle_expressions.len() > 1
+                    || !is_expr_unit(&x.shuffle_expressions[0])
+            })
+            .is_none()
+        {
+            let mut inputs = vec![];
+            let mut shuffles = vec![];
 
-        let [e1, e2] =
-            flatten_shuffle_expression(&input_expressions, &table_expressions, beta, theta);
+            let mut tmps = vec![];
+            let mut streams = vec![];
 
-        let input_buf = evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx)?;
-        let table_buf = evaluate_prove_expr(device, &vec![e2], fixed, advice, instance, &mut ctx)?;
+            let (z_buf, tmp, stream) = do_extended_ntt_async(device, &mut ctx, z)?;
+            tmps.push(tmp);
+            streams.push(stream);
 
-        let (z_buf, tmp0, stream0) = do_extended_ntt_v2_async(device, &mut ctx, z)?;
+            for x in shuffle.0.iter() {
+                pick_host_buf_and_do_ntt_async(
+                    &mut ctx,
+                    &x.input_expressions[0],
+                    &mut tmps,
+                    &mut streams,
+                    &mut inputs,
+                );
+                pick_host_buf_and_do_ntt_async(
+                    &mut ctx,
+                    &x.shuffle_expressions[0],
+                    &mut tmps,
+                    &mut streams,
+                    &mut shuffles,
+                );
+            }
 
-        unsafe {
-            cuda_runtime_sys::cudaStreamSynchronize(stream0);
-            cuda_runtime_sys::cudaStreamDestroy(stream0);
-            ctx.extended_allocator.push(tmp0);
+            drop(streams);
+
+            let mut betas = vec![beta];
+            for _ in 1..inputs.len() {
+                betas.push(*betas.last().unwrap() * beta);
+            }
+
+            let betas_buf = device.alloc_device_buffer_from_slice(&betas[..])?;
+            let inputs_buf = device.alloc_device_buffer_from_slice(
+                &inputs.iter().map(|x| x.ptr()).collect::<Vec<_>>()[..],
+            )?;
+            let shuffles_buf = device.alloc_device_buffer_from_slice(
+                &shuffles.iter().map(|x| x.ptr()).collect::<Vec<_>>()[..],
+            )?;
+
+            unsafe {
+                let err = shuffle_eval_h_v2(
+                    h_buf.ptr(),
+                    inputs_buf.ptr(),
+                    shuffles_buf.ptr(),
+                    betas_buf.ptr(),
+                    inputs.len() as i32,
+                    z_buf.ptr(),
+                    l0_buf.ptr(),
+                    l_last_buf.ptr(),
+                    l_active_buf.ptr(),
+                    y_buf.ptr(),
+                    1 << (extended_k - k),
+                    ctx.extended_size as i32,
+                );
+
+                to_result((), err, "fail to run field_op_batch_mul_sum")?;
+                device.synchronize()?;
+            }
+        } else {
+            let (input_expressions, table_expressions) = shuffle
+                .0
+                .iter()
+                .map(|x| (x.input_expressions.clone(), x.shuffle_expressions.clone()))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .unzip();
+            let [e1, e2] =
+                flatten_shuffle_expression(&input_expressions, &table_expressions, beta, theta);
+
+            let input_buf =
+                evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx)?;
+            let table_buf =
+                evaluate_prove_expr(device, &vec![e2], fixed, advice, instance, &mut ctx)?;
+            let z_buf = do_extended_ntt_v2(device, &mut ctx, z)?;
+
+            let timer = start_timer!(|| "shuffle_eval_h");
+            unsafe {
+                let err = shuffle_eval_h(
+                    h_buf.ptr(),
+                    input_buf.ptr(),
+                    table_buf.ptr(),
+                    z_buf.ptr(),
+                    l0_buf.ptr(),
+                    l_last_buf.ptr(),
+                    l_active_buf.ptr(),
+                    y_buf.ptr(),
+                    1 << (extended_k - k),
+                    ctx.extended_size as i32,
+                );
+
+                to_result((), err, "fail to run field_op_batch_mul_sum")?;
+                device.synchronize()?;
+            }
+            end_timer!(timer);
         }
-
-        unsafe {
-            let err = shuffle_eval_h(
-                h_buf.ptr(),
-                input_buf.ptr(),
-                table_buf.ptr(),
-                z_buf.ptr(),
-                l0_buf.ptr(),
-                l_last_buf.ptr(),
-                l_active_buf.ptr(),
-                y_buf.ptr(),
-                1 << (extended_k - k),
-                ctx.extended_size as i32,
-            );
-
-            to_result((), err, "fail to run field_op_batch_mul_sum")?;
-            device.synchronize()?;
-        }
-
-        ctx.extended_allocator.push(input_buf);
-        ctx.extended_allocator.push(table_buf);
-        ctx.extended_allocator.push(z_buf);
     }
     end_timer!(timer);
 
@@ -761,17 +849,32 @@ fn get_expr_degree<F: FieldExt>(expr: &Vec<Expression<F>>) -> usize {
     deg
 }
 
+fn do_extended_ntt_async<F: FieldExt>(
+    device: &CudaDevice,
+    ctx: &mut EvalHContext<F>,
+    data: &[F],
+) -> DeviceResult<(CudaDeviceBufRaw, CudaDeviceBufRaw, CudaStreamWrapper)> {
+    let buf = ctx.extended_allocator.pop();
+    let mut buf = if buf.is_none() {
+        device.alloc_device_buffer_non_zeroed::<F>(ctx.extended_size)?
+    } else {
+        buf.unwrap()
+    };
+
+    let (stream_wrapper, stream) = CudaStreamWrapper::new_with_inner();
+    device.copy_from_host_to_device_async::<F>(&buf, data, stream)?;
+    do_extended_prepare(device, ctx, &mut buf, Some(stream))?;
+    let tmp = do_extended_ntt_pure_async(device, ctx, &mut buf, Some(stream))?;
+
+    Ok((buf, tmp, stream_wrapper))
+}
+
 fn do_extended_ntt_v2<F: FieldExt>(
     device: &CudaDevice,
     ctx: &mut EvalHContext<F>,
     data: &[F],
 ) -> DeviceResult<CudaDeviceBufRaw> {
-    let buf = ctx.extended_allocator.pop();
-    let mut buf = if buf.is_none() {
-        device.alloc_device_buffer::<F>(ctx.extended_size)?
-    } else {
-        buf.unwrap()
-    };
+    let mut buf = ctx.alloc(device)?;
     device.copy_from_host_to_device::<F>(&buf, data)?;
     do_extended_ntt(device, ctx, &mut buf)?;
 
@@ -783,12 +886,7 @@ fn do_extended_ntt_v2_async<F: FieldExt>(
     ctx: &mut EvalHContext<F>,
     data: &[F],
 ) -> DeviceResult<(CudaDeviceBufRaw, CudaDeviceBufRaw, *mut CUstream_st)> {
-    let buf = ctx.extended_allocator.pop();
-    let mut buf = if buf.is_none() {
-        device.alloc_device_buffer::<F>(ctx.extended_size)?
-    } else {
-        buf.unwrap()
-    };
+    let mut buf = ctx.alloc(device)?;
     let (tmp, stream) = unsafe {
         let mut stream = std::mem::zeroed();
         let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
@@ -840,7 +938,7 @@ fn _do_extended_ntt_pure_async<F: FieldExt>(
 ) -> DeviceResult<CudaDeviceBufRaw> {
     let tmp = tmp.or_else(|| ctx.extended_allocator.pop());
     let mut tmp = if tmp.is_none() {
-        device.alloc_device_buffer::<F>(ctx.extended_size)?
+        device.alloc_device_buffer_non_zeroed::<F>(ctx.extended_size)?
     } else {
         tmp.unwrap()
     };
