@@ -183,7 +183,6 @@ pub mod shplonk {
     use halo2_proofs::transcript::TranscriptWrite;
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
-    use std::mem::ManuallyDrop;
 
     use crate::cuda::bn254::batch_msm;
     use crate::cuda::bn254::batch_msm_v2;
@@ -286,7 +285,7 @@ pub mod shplonk {
         size: usize,
         s_buf: [&CudaDeviceBufRaw; 2],
         eval_map: BTreeMap<(usize, C::Scalar), C::Scalar>,
-        poly_cache: BTreeMap<usize, &ManuallyDrop<CudaDeviceBufRaw>>,
+        poly_cache: BTreeMap<usize, CudaDeviceBufRaw>,
         transcript: &mut T,
     ) -> DeviceResult<()>
     where
@@ -333,7 +332,7 @@ pub mod shplonk {
                             )?;
                             let poly_buf =
                                 if let Some(buf) = poly_cache.get(&(poly.as_ptr() as usize)) {
-                                    *buf
+                                    buf
                                 } else {
                                     device.copy_from_host_to_device_async(
                                         &tmp_buf,

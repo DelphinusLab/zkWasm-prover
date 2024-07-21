@@ -1411,26 +1411,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             );
         }
 
-        let mut poly_buf_cache = BTreeMap::new();
-        let extended_buffers_count = if k < 23 { 30 } else { 15 };
-        let mut extended_buffers = vec![];
-        let mut cache_buffers = vec![];
-        let extended_k = pk.vk.domain.extended_k() as usize;
-        for _ in 0..extended_buffers_count {
-            let buf = device.alloc_device_buffer::<C::Scalar>(1 << extended_k)?;
-            for i in 0..1 << (extended_k - k) {
-                cache_buffers.push(ManuallyDrop::new(CudaDeviceBufRaw {
-                    ptr: unsafe {
-                        buf.ptr()
-                            .offset(((i << k) * core::mem::size_of::<C::Scalar>()) as isize)
-                    },
-                    device: device.clone(),
-                    size: core::mem::size_of::<C::Scalar>(),
-                }));
-            }
-            extended_buffers.push(buf);
-        }
-
         let mut evals = vec![C::Scalar::zero(); inputs.len()];
 
         let timer = start_timer!(|| format!("compute eval {}", collection.len()));
@@ -1438,51 +1418,39 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let mut streams = vec![];
         let mut bufs = vec![];
-        let max = 6;
+        let max = 2;
         for _ in 0..max {
             bufs.push((
                 device.alloc_device_buffer::<C::Scalar>(size)?,
                 device.alloc_device_buffer::<C::Scalar>(size)?,
                 device.alloc_device_buffer::<C::Scalar>(size)?,
             ));
-            unsafe {
-                let mut stream = std::mem::zeroed();
-                let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-                assert_eq!(err, cuda_runtime_sys::cudaError::cudaSuccess);
-                streams.push(stream);
-            }
+            streams.push(CudaStreamWrapper::new_with_inner());
         }
 
         let mut collection = collection.into_iter().collect::<Vec<_>>();
         collection.sort_by(|a, b| a.1 .1.len().cmp(&b.1 .1.len()));
 
-        let mut l = 0;
-        let mut r = collection.len();
-        let mut inc = false;
-        let mut used_cache_idx = 0;
-        while l < r {
-            let i = if inc { l } else { r - 1 };
-            if inc {
-                l += 1;
-            } else {
-                r -= 1;
-            }
-            inc = !inc;
+        let mut poly_buf_cache = BTreeMap::new();
+        let cache_count = 120;
+
+        for i in 0..collection.len() {
             let (p, arr) = &collection[i].1;
             let p = *p;
-            unsafe {
-                let stream = streams[i % max];
-                let (poly_buf, eval_buf, tmp_buf) = &bufs[i % max];
-                let poly_buf = if used_cache_idx < cache_buffers.len() {
-                    let buf = &cache_buffers[used_cache_idx];
-                    poly_buf_cache.insert((*p).as_ptr() as usize, buf);
-                    used_cache_idx += 1;
-                    buf
-                } else {
-                    poly_buf
-                };
-                device.copy_from_host_to_device_async(poly_buf, p, stream)?;
-                for (idx, x) in arr {
+            let stream = streams[i % max].1;
+            let (poly_buf, eval_buf, tmp_buf) = &bufs[i % max];
+            let poly_buf = if poly_buf_cache.len() < cache_count {
+                let key = p.as_ptr() as usize;
+                let buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+                poly_buf_cache.insert(key, buf);
+                poly_buf_cache.get(&key).unwrap()
+            } else {
+                poly_buf
+            };
+
+            device.copy_from_host_to_device_async(poly_buf, p, stream)?;
+            for (idx, x) in arr {
+                unsafe {
                     let err = crate::cuda::bn254_c::poly_eval(
                         poly_buf.ptr(),
                         eval_buf.ptr(),
@@ -1502,13 +1470,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             }
         }
 
-        for stream in streams {
-            unsafe {
-                cuda_runtime_sys::cudaStreamSynchronize(stream);
-                cuda_runtime_sys::cudaStreamDestroy(stream);
-            }
-        }
-
+        drop(streams);
         drop(bufs);
 
         let eval_map = eval_map

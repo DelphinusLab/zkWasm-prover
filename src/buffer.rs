@@ -11,22 +11,6 @@ use crate::hugetlb::HugePageAllocator;
 use crate::Error;
 use crate::ProvingKey;
 
-pub fn unpin_advice_buffer<C: CurveAffine>(
-    pk: &ProvingKey<C>,
-    advices: &mut Vec<Vec<C::Scalar, HugePageAllocator>>,
-) {
-    let device = CudaDevice::get_device(0).unwrap();
-    for x in advices.iter() {
-        device.unpin_memory(&x[..]).unwrap();
-    }
-    for x in pk.fixed_values.iter() {
-        device.unpin_memory(&x[..]).unwrap();
-    }
-    for x in pk.permutation.polys.iter() {
-        device.unpin_memory(&x[..]).unwrap();
-    }
-}
-
 pub(crate) fn prepare_advice_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
 ) -> Vec<Vec<C::Scalar, HugePageAllocator>> {
