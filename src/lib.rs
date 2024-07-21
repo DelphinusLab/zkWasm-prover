@@ -5,14 +5,15 @@
 extern crate lazy_static;
 
 use ark_std::end_timer;
-use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
+
+use ark_std::rand::rngs::OsRng;
 use cuda::bn254::batch_msm_v2;
 use cuda::bn254::intt_raw_async;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
-use halo2_proofs::pairing::group::ff::BatchInvert as _;
+use halo2_proofs::pairing::group::ff::BatchInvert;
 use halo2_proofs::plonk::Any;
 use halo2_proofs::plonk::Expression;
 use halo2_proofs::plonk::ProvingKey;
@@ -25,8 +26,7 @@ use rayon::iter::IntoParallelIterator as _;
 use rayon::iter::IntoParallelRefIterator as _;
 use rayon::iter::IntoParallelRefMutIterator as _;
 use rayon::iter::ParallelIterator as _;
-use rayon::prelude::ParallelSliceMut as _;
-use rayon::slice::ParallelSlice as _;
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::iter;
 use std::mem::ManuallyDrop;
@@ -35,6 +35,7 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::thread;
 
+use crate::buffer::*;
 use crate::cuda::bn254::batch_intt_raw;
 use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::ntt_prepare;
@@ -63,6 +64,7 @@ pub mod device;
 pub mod expr;
 
 mod analyze;
+mod buffer;
 mod eval_h;
 mod hugetlb;
 mod multiopen;
@@ -73,48 +75,7 @@ pub fn prepare_advice_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
     _pin_memory: bool,
 ) -> Vec<Vec<C::Scalar, HugePageAllocator>> {
-    let rows = 1 << pk.get_vk().domain.k();
-    let columns = pk.get_vk().cs.num_advice_columns;
-    let zero = C::Scalar::zero();
-    let advices = (0..columns)
-        .into_par_iter()
-        .map(|_| {
-            let mut buf = Vec::new_in(HugePageAllocator);
-            buf.resize(rows, zero);
-            buf
-        })
-        .collect::<Vec<_>>();
-
-    let device = CudaDevice::get_device(0).unwrap();
-    if false {
-        for x in advices.iter() {
-            device.pin_memory(&x[..]).unwrap();
-        }
-        for x in pk.fixed_values.iter() {
-            device.pin_memory(&x[..]).unwrap();
-        }
-        for x in pk.permutation.polys.iter() {
-            device.pin_memory(&x[..]).unwrap();
-        }
-    }
-
-    advices
-}
-
-pub fn unpin_advice_buffer<C: CurveAffine>(
-    pk: &ProvingKey<C>,
-    advices: &mut Vec<Vec<C::Scalar, HugePageAllocator>>,
-) {
-    let device = CudaDevice::get_device(0).unwrap();
-    for x in advices.iter() {
-        device.unpin_memory(&x[..]).unwrap();
-    }
-    for x in pk.fixed_values.iter() {
-        device.unpin_memory(&x[..]).unwrap();
-    }
-    for x in pk.permutation.polys.iter() {
-        device.unpin_memory(&x[..]).unwrap();
-    }
+    buffer::prepare_advice_buffer(pk)
 }
 
 #[derive(Debug)]
@@ -332,112 +293,6 @@ pub fn create_proof_from_advices_with_shplonk<
     transcript: &mut T,
 ) -> Result<(), Error> {
     _create_proof_from_advices(params, pk, instances, advices, transcript, false)
-}
-
-pub fn prepare_lookup_buffer<C: CurveAffine>(
-    pk: &ProvingKey<C>,
-) -> Result<
-    Vec<(
-        Vec<C::Scalar, HugePageAllocator>,
-        Vec<C::Scalar, HugePageAllocator>,
-        Vec<C::Scalar, HugePageAllocator>,
-        Vec<C::Scalar, HugePageAllocator>,
-        Vec<C::Scalar, HugePageAllocator>,
-    )>,
-    Error,
-> {
-    let size = 1 << pk.get_vk().domain.k();
-    let timer = start_timer!(|| format!("prepare lookup buffer, count {}", pk.vk.cs.lookups.len()));
-    let lookups = pk
-        .vk
-        .cs
-        .lookups
-        .par_iter()
-        .map(|_| {
-            let mut input = Vec::new_in(HugePageAllocator);
-            input.resize(size, C::Scalar::zero());
-            let mut table = Vec::new_in(HugePageAllocator);
-            table.resize(size, C::Scalar::zero());
-            let mut permuted_input = Vec::new_in(HugePageAllocator);
-            permuted_input.resize(size, C::Scalar::zero());
-            let mut permuted_table = Vec::new_in(HugePageAllocator);
-            permuted_table.resize(size, C::Scalar::zero());
-            let mut z = Vec::new_in(HugePageAllocator);
-            z.resize(size, C::Scalar::zero());
-
-            if false {
-                let device = CudaDevice::get_device(0).unwrap();
-                device.pin_memory(&permuted_input[..]).unwrap();
-                device.pin_memory(&permuted_table[..]).unwrap();
-                device.pin_memory(&z[..]).unwrap();
-            }
-
-            (input, table, permuted_input, permuted_table, z)
-        })
-        .collect::<Vec<_>>();
-    end_timer!(timer);
-    Ok(lookups)
-}
-
-pub fn prepare_permutation_buffers<C: CurveAffine>(
-    pk: &ProvingKey<C>,
-) -> Result<Vec<Vec<C::Scalar, HugePageAllocator>>, Error> {
-    let size = 1 << pk.get_vk().domain.k();
-    let chunk_len = &pk.vk.cs.degree() - 2;
-    let timer = start_timer!(|| format!(
-        "prepare permutation buffer, count {}",
-        pk.vk.cs.permutation.columns.par_chunks(chunk_len).len()
-    ));
-    let buffers = pk
-        .vk
-        .cs
-        .permutation
-        .columns
-        .par_chunks(chunk_len)
-        .map(|_| {
-            let mut z = Vec::new_in(HugePageAllocator);
-            z.resize(size, C::Scalar::one());
-
-            if false {
-                let device = CudaDevice::get_device(0).unwrap();
-                device.pin_memory(&z[..]).unwrap();
-            }
-
-            z
-        })
-        .collect::<Vec<_>>();
-    end_timer!(timer);
-    Ok(buffers)
-}
-
-pub fn prepare_shuffle_buffers<C: CurveAffine>(
-    pk: &ProvingKey<C>,
-) -> Result<Vec<Vec<C::Scalar, HugePageAllocator>>, Error> {
-    let size = 1 << pk.get_vk().domain.k();
-    let timer = start_timer!(|| format!(
-        "prepare shuffle buffer, count {}",
-        pk.vk.cs.shuffles.group(pk.vk.cs.degree()).len()
-    ));
-    let buffers = pk
-        .vk
-        .cs
-        .shuffles
-        .group(pk.vk.cs.degree())
-        .iter()
-        .map(|_| {
-            let mut z = Vec::new_in(HugePageAllocator);
-            z.resize(size, C::Scalar::one());
-
-            if false {
-                let device = CudaDevice::get_device(0).unwrap();
-                device.pin_memory(&z[..]).unwrap();
-            }
-
-            z
-        })
-        .collect::<Vec<_>>();
-    end_timer!(timer);
-    Ok(buffers)
 }
 
 fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
