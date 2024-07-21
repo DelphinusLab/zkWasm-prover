@@ -174,6 +174,7 @@ pub(crate) mod gwc {
 
 pub mod shplonk {
     use halo2_proofs::arithmetic::eval_polynomial_st;
+    use halo2_proofs::arithmetic::lagrange_interpolate;
     use halo2_proofs::arithmetic::CurveAffine;
     use halo2_proofs::arithmetic::Field;
     use halo2_proofs::arithmetic::FieldExt;
@@ -191,6 +192,7 @@ pub mod shplonk {
     use crate::device::cuda::CudaBuffer;
     use crate::device::cuda::CudaDevice;
     use crate::device::cuda::CudaDeviceBufRaw;
+    use crate::device::cuda::CudaStreamWrapper;
     use crate::device::Device as _;
     use crate::device::DeviceResult;
     use crate::hugetlb::HugePageAllocator;
@@ -285,97 +287,83 @@ pub mod shplonk {
         size: usize,
         s_buf: [&CudaDeviceBufRaw; 2],
         eval_map: BTreeMap<(usize, C::Scalar), C::Scalar>,
-        poly_cache: BTreeMap<usize, CudaDeviceBufRaw>,
+        mut poly_cache: BTreeMap<usize, CudaDeviceBufRaw>,
         transcript: &mut T,
     ) -> DeviceResult<()>
     where
         I: IntoIterator<Item = ProverQuery<'a, C::Scalar>>,
     {
         let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
-        let v: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
+        let y_buf = device.alloc_device_buffer_from_slice(&[y][..])?;
 
+        let v: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
         let (rotation_sets, super_point_set) = construct_intermediate_sets(queries, eval_map);
 
+        let mut streams = vec![];
         let rotation_sets: Vec<(_, _, Vec<_>)> = rotation_sets
             .iter()
             .map(|(queries, points)| -> DeviceResult<(_, _, Vec<_>)> {
-                use halo2_proofs::arithmetic::lagrange_interpolate;
-
-                let v_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-
-                if queries.len() == 1 {
-                    if let Some(buf) = poly_cache.get(&(queries[0].0.as_ptr() as usize)) {
-                        device.copy_from_device_to_device::<C::Scalar>(&v_buf, 0, buf, 0, size)?;
-                    } else {
-                        device.copy_from_host_to_device(&v_buf, &queries[0].0[..])?;
-                    }
-                    let evals_acc = lagrange_interpolate(&points[..], &queries[0].1[..]);
-                    Ok((points, v_buf, evals_acc))
+                let v_buf = if let Some(buf) = poly_cache.remove(&(queries[0].0.as_ptr() as usize))
+                {
+                    buf
                 } else {
-                    let mut evals_acc = vec![];
-                    evals_acc.resize(points.len(), C::Scalar::zero());
+                    let (stream_wrapper, stream) = CudaStreamWrapper::new_with_inner();
+                    let buf =
+                        device.alloc_device_buffer_from_slice_async(&queries[0].0[..], stream)?;
+                    streams.push(stream_wrapper);
+                    buf
+                };
 
-                    let mut tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-                    let y_buf = device.alloc_device_buffer_from_slice(&[y][..])?;
+                let mut evals_acc = lagrange_interpolate(&points[..], &queries[0].1[..]);
 
-                    let mut last_stream = None;
-                    let mut last_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+                if queries.len() > 1 {
+                    streams.last().unwrap().sync();
 
-                    for (poly, evals) in queries.iter() {
-                        unsafe {
-                            let mut stream = std::mem::zeroed();
-                            let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-                            crate::device::cuda::to_result(
-                                (),
-                                err,
-                                "fail to run cudaStreamCreate",
-                            )?;
-                            let poly_buf =
-                                if let Some(buf) = poly_cache.get(&(poly.as_ptr() as usize)) {
-                                    buf
-                                } else {
-                                    device.copy_from_host_to_device_async(
-                                        &tmp_buf,
-                                        &poly[..],
-                                        stream,
-                                    )?;
-                                    &tmp_buf
-                                };
-                            if let Some(last_stream) = last_stream {
-                                cuda_runtime_sys::cudaStreamSynchronize(last_stream);
-                                cuda_runtime_sys::cudaStreamDestroy(last_stream);
-                            }
-                            field_op_v3(
-                                device,
-                                &v_buf,
-                                Some(&v_buf),
-                                Some(&y_buf),
-                                Some(&poly_buf),
-                                None,
-                                size,
-                                FieldOp::Add,
-                                Some(stream),
-                            )?;
-                            last_stream = Some(stream);
-                            std::mem::swap(&mut last_buf, &mut tmp_buf);
-                        }
+                    let mut buf = None;
+                    let calc_streams = CudaStreamWrapper::new_with_inner();
+                    for (poly, evals) in queries.iter().skip(1) {
+                        let poly_buf =
+                            if let Some(buf) = poly_cache.remove(&(poly.as_ptr() as usize)) {
+                                buf
+                            } else {
+                                let (stream_wrapper, stream) = CudaStreamWrapper::new_with_inner();
+                                let buf = device
+                                    .alloc_device_buffer_from_slice_async(&poly[..], stream)?;
+                                drop(stream_wrapper);
+                                buf
+                            };
+
+                        calc_streams.0.sync();
+
+                        field_op_v3(
+                            device,
+                            &v_buf,
+                            Some(&v_buf),
+                            Some(&y_buf),
+                            Some(&poly_buf),
+                            None,
+                            size,
+                            FieldOp::Add,
+                            Some(calc_streams.1),
+                        )?;
+
+                        // Can't release poly_buf before calc_streams sync.
+                        buf = Some(poly_buf);
 
                         let evals = lagrange_interpolate(&points[..], &evals[..]);
-
                         for i in 0..evals_acc.len() {
                             evals_acc[i] = evals_acc[i] * y + evals[i];
                         }
                     }
-                    unsafe {
-                        if let Some(last_stream) = last_stream {
-                            cuda_runtime_sys::cudaStreamSynchronize(last_stream);
-                            cuda_runtime_sys::cudaStreamDestroy(last_stream);
-                        }
-                    }
-                    Ok((points, v_buf, evals_acc))
+                    drop(calc_streams);
+                    drop(buf);
                 }
+
+                Ok((points, v_buf, evals_acc))
             })
             .collect::<DeviceResult<Vec<_>>>()?;
+        drop(streams);
+        drop(poly_cache);
 
         let k = pk.vk.domain.k as usize;
         let (ntt_omegas_buf, ntt_pq_buf) =

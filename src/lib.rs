@@ -1432,7 +1432,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         collection.sort_by(|a, b| a.1 .1.len().cmp(&b.1 .1.len()));
 
         let mut poly_buf_cache = BTreeMap::new();
-        let cache_count = 120;
+        let cache_count = 130;
 
         for i in 0..collection.len() {
             let (p, arr) = &collection[i].1;
