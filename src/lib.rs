@@ -1522,7 +1522,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         }
 
         let mut poly_buf_cache = BTreeMap::new();
-        let extended_buffers_count = if k < 23 { 30 } else { 15 };
+        let extended_buffers_count = if k < 23 { 30 } else { 10 };
         let mut extended_buffers = vec![];
         let mut cache_buffers = vec![];
         let extended_k = pk.vk.domain.extended_k() as usize;

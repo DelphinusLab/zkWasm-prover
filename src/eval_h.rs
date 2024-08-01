@@ -719,22 +719,34 @@ fn evaluate_h_gates_core<C: CurveAffine>(
 
             to_result((), err, "fail to run field_op_batch_mul_sum")?;
 
-            if let Some(stream) = last_stream.0 {
+            if k <= 22 {
+                if let Some(stream) = last_stream.0 {
+                    cuda_runtime_sys::cudaStreamSynchronize(stream);
+                    cuda_runtime_sys::cudaStreamDestroy(stream);
+                    ctx.extended_allocator.append(&mut last_stream.1)
+                }
+
+                last_stream = (
+                    Some(stream),
+                    vec![
+                        input_buf,
+                        table_buf,
+                        permuted_input_buf,
+                        permuted_table_buf,
+                        z_buf,
+                    ],
+                );
+            } else {
                 cuda_runtime_sys::cudaStreamSynchronize(stream);
                 cuda_runtime_sys::cudaStreamDestroy(stream);
-                ctx.extended_allocator.append(&mut last_stream.1)
-            }
-
-            last_stream = (
-                Some(stream),
-                vec![
+                ctx.extended_allocator.append(&mut vec![
                     input_buf,
                     table_buf,
                     permuted_input_buf,
                     permuted_table_buf,
                     z_buf,
-                ],
-            );
+                ])
+            }
         }
     }
 
