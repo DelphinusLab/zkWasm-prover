@@ -13,17 +13,6 @@ dependencies = [
 
 [[package]]
 name = "ark-std"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1df2c09229cbc5a028b1d70e00fdb2acee28b1055dfb5ca73eea49c5a25c4e7c"
-dependencies = [
- "colored",
- "num-traits",
- "rand",
-]
-
-[[package]]
-name = "ark-std"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94893f1e0c6eeab764ade8dc4c0db24caf4fe7cbbaafc0eba0a9030f447b5185"
@@ -327,14 +316,14 @@ dependencies = [
 [[package]]
 name = "ec-gpu"
 version = "0.2.0"
-source = "git+https://github.com/lanbones/ec-gpu#165d1dd6215f6fd1dd85c83cf430ff511a03a00a"
+source = "git+https://github.com/lanbones/ec-gpu#36b9abf8611347e2fe44f21a2f3607eba3aed71d"
 
 [[package]]
 name = "ec-gpu-gen"
 version = "0.4.0"
-source = "git+https://github.com/lanbones/ec-gpu?branch=halo2-opt-v2#5481be558da026bb9bddcd5807f973f6b1a8346e"
+source = "git+https://github.com/lanbones/ec-gpu?branch=halo2-opt-v2#aedc591657644f047f25a2e089f0b489eba0bf38"
 dependencies = [
- "ark-std 0.3.0",
+ "ark-std",
  "bitvec",
  "crossbeam-channel",
  "ec-gpu",
@@ -493,9 +482,9 @@ dependencies = [
 [[package]]
 name = "halo2_proofs"
 version = "0.1.0-beta.1"
-source = "git+https://github.com/DelphinusLab/halo2-gpu-specific#9a81f601607bdc3ff3360a9ad66885c9796f487b"
+source = "git+https://github.com/DelphinusLab/halo2-gpu-specific#12655ca7406a8c21a154bfd36dd2f8e520c569b1"
 dependencies = [
- "ark-std 0.4.0",
+ "ark-std",
  "blake2b_simd",
  "bumpalo",
  "cfg-if 0.1.10",
@@ -696,11 +685,10 @@ dependencies = [
 
 [[package]]
 name = "num-bigint"
-version = "0.4.4"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "608e7659b5c3d7cba262d894801b9ec9d00de989e8a82bd4bef91d08da45cdc0"
+checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
 dependencies = [
- "autocfg",
  "num-integer",
  "num-traits",
  "rand",
@@ -728,11 +716,10 @@ dependencies = [
 
 [[package]]
 name = "num-integer"
-version = "0.1.45"
+version = "0.1.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "225d3389fb3509a24c93f5c29eb6bde2586b98d9f016636dff58d7c6f7569cd9"
+checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
 dependencies = [
- "autocfg",
  "num-traits",
 ]
 
@@ -761,9 +748,9 @@ dependencies = [
 
 [[package]]
 name = "num-traits"
-version = "0.2.17"
+version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39e3200413f237f41ab11ad6d161bc7239c84dcb631773ccd7de3dfe4b5c267c"
+checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
 ]
@@ -796,12 +783,14 @@ dependencies = [
 [[package]]
 name = "pairing_bn256"
 version = "0.1.1"
-source = "git+https://github.com/lanbones/pairing#5ab08062f53cd29c946f96572aefdb688952d725"
+source = "git+https://github.com/lanbones/pairing#30b052f29d7ec3e68e20528584d9495de678ea05"
 dependencies = [
  "bls12_381",
  "ec-gpu",
  "ff",
  "group",
+ "num-bigint",
+ "num-traits",
  "rand",
  "rand_core",
  "static_assertions",
@@ -1326,7 +1315,7 @@ dependencies = [
 name = "zkwasm-prover"
 version = "0.1.0"
 dependencies = [
- "ark-std 0.4.0",
+ "ark-std",
  "cc",
  "cuda-runtime-sys",
  "halo2_proofs",
