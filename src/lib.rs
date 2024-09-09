@@ -317,7 +317,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
     {
         let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
-        let count = if k < 23 { 147 } else { 51 };
+        let count = if k < 23 { 147 } else { 66 };
         allocator.reset((1 << k) * core::mem::size_of::<C::Scalar>(), count);
     }
 
@@ -1275,6 +1275,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     )
                     .collect::<Vec<_>>()
             };
+
 
             let timer =
                 start_timer!(|| format!("partial instances and advices intt {}", buffers.len()));

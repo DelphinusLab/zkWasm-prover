@@ -317,8 +317,9 @@ pub mod shplonk {
                 let mut evals_acc = lagrange_interpolate(&points[..], &queries[0].1[..]);
 
                 if queries.len() > 1 {
-                    streams.last().unwrap().sync();
-
+                    if let Some(stream) = streams.last() {
+                        stream.sync();
+                    }
                     let mut buf = None;
                     let calc_streams = CudaStreamWrapper::new_with_inner();
                     for (poly, evals) in queries.iter().skip(1) {

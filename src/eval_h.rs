@@ -501,7 +501,6 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     let timer = start_timer!(|| "evaluate_h lookup");
     let gamma_buf = device.alloc_device_buffer_from_slice(&[gamma][..])?;
     let beta_buf = device.alloc_device_buffer_from_slice(&[beta][..])?;
-    let mut last_stream = (None, vec![]);
     for (_i, (lookup, (permuted_input, permuted_table, input, table, z))) in pk
         .vk
         .cs
@@ -619,34 +618,29 @@ fn evaluate_h_gates_core<C: CurveAffine>(
             }
         };
 
-        let (z_buf, tmp2, stream0) = do_extended_ntt_v2_async(device, &mut ctx, *z)?;
-        let (permuted_input_buf, tmp0, stream1) =
-            do_extended_ntt_v2_async(device, &mut ctx, permuted_input)?;
-        let (permuted_table_buf, tmp1, stream2) =
-            do_extended_ntt_v2_async(device, &mut ctx, permuted_table)?;
+        if let Some((stream, buf)) = stream_input {
+            unsafe {
+                cuda_runtime_sys::cudaStreamSynchronize(stream);
+                cuda_runtime_sys::cudaStreamDestroy(stream);
+            }
+            ctx.extended_allocator.push(buf);
+        }
+
+        let (z_buf, tmp, stream) = if let Some((stream, tmp)) = stream_table {
+            do_extended_ntt_v3_async(device, &mut ctx, stream, tmp, *z)?
+        } else {
+            do_extended_ntt_v2_async(device, &mut ctx, *z)?
+        };
+
+        let (permuted_input_buf, tmp, stream) =
+            do_extended_ntt_v3_async(device, &mut ctx, stream, tmp, permuted_input)?;
+        let (permuted_table_buf, tmp, stream) =
+            do_extended_ntt_v3_async(device, &mut ctx, stream, tmp, permuted_table)?;
 
         unsafe {
-            cuda_runtime_sys::cudaStreamSynchronize(stream0);
-            cuda_runtime_sys::cudaStreamDestroy(stream0);
-            ctx.extended_allocator.push(tmp0);
-            cuda_runtime_sys::cudaStreamSynchronize(stream1);
-            cuda_runtime_sys::cudaStreamDestroy(stream1);
-            ctx.extended_allocator.push(tmp1);
-            cuda_runtime_sys::cudaStreamSynchronize(stream2);
-            cuda_runtime_sys::cudaStreamDestroy(stream2);
-            ctx.extended_allocator.push(tmp2);
-
-            if let Some((stream, buf)) = stream_input {
-                cuda_runtime_sys::cudaStreamSynchronize(stream);
-                cuda_runtime_sys::cudaStreamDestroy(stream);
-                ctx.extended_allocator.push(buf);
-            }
-
-            if let Some((stream, buf)) = stream_table {
-                cuda_runtime_sys::cudaStreamSynchronize(stream);
-                cuda_runtime_sys::cudaStreamDestroy(stream);
-                ctx.extended_allocator.push(buf);
-            }
+            cuda_runtime_sys::cudaStreamSynchronize(stream);
+            cuda_runtime_sys::cudaStreamDestroy(stream);
+            ctx.extended_allocator.push(tmp);
         }
 
         unsafe {
@@ -672,30 +666,17 @@ fn evaluate_h_gates_core<C: CurveAffine>(
 
             to_result((), err, "fail to run field_op_batch_mul_sum")?;
 
-            if let Some(stream) = last_stream.0 {
+            {
                 cuda_runtime_sys::cudaStreamSynchronize(stream);
                 cuda_runtime_sys::cudaStreamDestroy(stream);
-                ctx.extended_allocator.append(&mut last_stream.1)
-            }
-
-            last_stream = (
-                Some(stream),
-                vec![
+                ctx.extended_allocator.append(&mut vec![
                     input_buf,
                     table_buf,
                     permuted_input_buf,
                     permuted_table_buf,
                     z_buf,
-                ],
-            );
-        }
-    }
-
-    if let Some(stream) = last_stream.0 {
-        unsafe {
-            cuda_runtime_sys::cudaStreamSynchronize(stream);
-            cuda_runtime_sys::cudaStreamDestroy(stream);
-            ctx.extended_allocator.append(&mut last_stream.1)
+                ])
+            }
         }
     }
     end_timer!(timer);
@@ -892,6 +873,32 @@ fn do_extended_ntt_v2_async<F: FieldExt>(
         let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
         assert_eq!(err, cuda_runtime_sys::cudaError::cudaSuccess);
         device.copy_from_host_to_device_async::<F>(&buf, data, stream)?;
+        do_extended_prepare(device, ctx, &mut buf, Some(stream))?;
+        (
+            do_extended_ntt_pure_async(device, ctx, &mut buf, Some(stream))?,
+            stream,
+        )
+    };
+
+    Ok((buf, tmp, stream))
+}
+
+fn do_extended_ntt_v3_async<F: FieldExt>(
+    device: &CudaDevice,
+    ctx: &mut EvalHContext<F>,
+    last_stream: *mut CUstream_st,
+    last_tmp: CudaDeviceBufRaw,
+    data: &[F],
+) -> DeviceResult<(CudaDeviceBufRaw, CudaDeviceBufRaw, *mut CUstream_st)> {
+    let mut buf = ctx.alloc(device)?;
+    let (tmp, stream) = unsafe {
+        let mut stream = std::mem::zeroed();
+        let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+        assert_eq!(err, cuda_runtime_sys::cudaError::cudaSuccess);
+        device.copy_from_host_to_device_async::<F>(&buf, data, stream)?;
+        cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+        cuda_runtime_sys::cudaStreamDestroy(last_stream);
+        ctx.extended_allocator.push(last_tmp);
         do_extended_prepare(device, ctx, &mut buf, Some(stream))?;
         (
             do_extended_ntt_pure_async(device, ctx, &mut buf, Some(stream))?,

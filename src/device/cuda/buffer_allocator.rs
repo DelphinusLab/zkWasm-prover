@@ -70,7 +70,13 @@ impl CudaBufferAllocator {
             let res = (self.ptr_base + (end - picked) * self.chunk_size) as _;
             return res;
         } else {
-            println!("failed to alloc device buffer with {} bytes", size);
+            let mut sum = 0;
+            for used in self.bit_map.iter() {
+                if *used {
+                    sum += 1;
+                }
+            }
+            println!("failed to alloc device buffer with {} bytes, count is {}, used chunks {}", size, count, sum);
             panic!("Cuda Device OOM");
         }
     }
