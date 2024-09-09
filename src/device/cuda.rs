@@ -274,7 +274,7 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
             let mut free = 0;
             let mut total = 0;
             cuda_runtime_sys::cudaMemGetInfo(&mut free, &mut total);
-            println!("free is {},total is {}", free, total);
+            println!("free is {}, total is {}", free, total);
         }
         Ok(())
     }
