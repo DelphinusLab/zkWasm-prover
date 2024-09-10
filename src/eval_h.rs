@@ -377,7 +377,8 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     let l_active_row = &pk.l_active_row;
     let l0_buf = do_extended_ntt_v2(device, &mut ctx, &l0.values[..])?;
     let l_last_buf = do_extended_ntt_v2(device, &mut ctx, &l_last.values[..])?;
-    let l_active_buf = device.alloc_device_buffer_from_slice(&l_active_row.values[..])?;
+    let l_active_buf = ctx.alloc(device)?;
+    device.copy_from_host_to_device(&l_active_buf, &l_active_row.values[..])?;
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h permutation");
