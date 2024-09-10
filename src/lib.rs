@@ -363,11 +363,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         }
 
         let timer = start_timer!(|| "copy g_lagrange buffer");
-        let g_lagrange_buf = device
-            .alloc_device_buffer_from_slice(&params.g_lagrange[..])
-            .unwrap();
         let g_buf = device
             .alloc_device_buffer_from_slice(&params.g[..])
+            .unwrap();
+        let g_lagrange_buf = device
+            .alloc_device_buffer_from_slice(&params.g_lagrange[..])
             .unwrap();
         end_timer!(timer);
 
@@ -1226,6 +1226,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         )?;
         drop(batch_ntt_t0_buf);
         drop(batch_ntt_t1_buf);
+        drop(g_lagrange_buf);
         end_timer!(timer);
 
         for commitment in permutation_commitments {
@@ -1239,9 +1240,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         for commitment in shuffle_commitments {
             transcript.write_point(commitment).unwrap();
         }
-
-        let g_buf = g_lagrange_buf;
-        device.copy_from_host_to_device(&g_buf, &params.g[..])?;
 
         // TODO: move to sub-thread
         let timer = start_timer!(|| "random_poly");
@@ -1274,6 +1272,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     .collect::<Vec<_>>()
             };
 
+            drop(s_buf);
+            drop(t_buf);
 
             let timer =
                 start_timer!(|| format!("partial instances and advices intt {}", buffers.len()));
@@ -1570,6 +1570,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     })),
             );
 
+        let s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         if use_gwc {
             gwc::multiopen(
                 &device,
