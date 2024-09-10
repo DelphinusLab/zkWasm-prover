@@ -54,8 +54,7 @@ impl CudaBufferAllocator {
 
         while picked < count && end < self.bit_map.len() {
             if self.bit_map[end] {
-                // for alignment
-                end = (end + count) / count * count;
+                end += 1;
                 picked = 0;
             } else {
                 end += 1;
