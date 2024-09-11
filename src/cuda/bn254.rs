@@ -352,6 +352,8 @@ pub(crate) fn batch_msm_and_conditional_intt<C: CurveAffine>(
         cudaDeviceSynchronize();
     }
 
+    device.print_memory_info();
+
     let len = 1 << len_log;
 
     let mut s_buf = [
