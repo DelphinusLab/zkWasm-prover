@@ -264,6 +264,10 @@ pub fn batch_msm_v2<C: CurveAffine>(
         cfg.are_scalars_montgomery_form = true;
         cfg.are_points_montgomery_form = true;
         msm::msm(scalars, points, &cfg, &mut msm_results_buf[idx][..]).unwrap();
+
+        streams[(idx + MSM_STREAMS_NR - 1) % MSM_STREAMS_NR]
+            .synchronize()
+            .unwrap();
     }
 
     for stream in streams {
@@ -323,6 +327,10 @@ pub(crate) fn batch_msm<const MSM_STREAMS_NR: usize, C: CurveAffine>(
         cfg.are_scalars_montgomery_form = true;
         cfg.are_points_montgomery_form = true;
         msm::msm(scalars, points, &cfg, &mut msm_results_buf[idx][..]).unwrap();
+
+        streams[(idx + MSM_STREAMS_NR - 1) % MSM_STREAMS_NR]
+            .synchronize()
+            .unwrap();
     }
 
     for stream in streams {
@@ -433,7 +441,9 @@ pub(crate) fn batch_msm_and_conditional_intt<C: CurveAffine>(
             }
         }
 
-        streams[(idx + MSM_STREAMS_NR - 1) % MSM_STREAMS_NR].synchronize().unwrap();
+        streams[(idx + MSM_STREAMS_NR - 1) % MSM_STREAMS_NR]
+            .synchronize()
+            .unwrap();
     }
 
     for stream in streams {
@@ -515,6 +525,10 @@ pub(crate) fn batch_msm_and_intt<C: CurveAffine>(
         )?;
 
         device.copy_from_device_to_host_async(value, &s_buf[idx % MSM_STREAMS_NR], stream)?;
+
+        streams[(idx + MSM_STREAMS_NR - 1) % MSM_STREAMS_NR]
+            .synchronize()
+            .unwrap();
     }
 
     for stream in streams {
