@@ -381,7 +381,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         // thread for part of lookups
-        let sub_pk = pk.clone();
+        let sub_pk = pk;
         let sub_advices = advices.clone();
         let sub_instances = instances.clone();
         let lookup_handler = s.spawn(move || {
@@ -687,7 +687,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 (&pk).vk.cs.permutation.columns.chunks(chunk_len).len()
             ));
 
-            let sub_pk = pk.clone();
+            let sub_pk = pk;
             let sub_advices = advices.clone();
             let sub_instance = instances.clone();
             let permutation_products_handler = s.spawn(move || {
@@ -823,7 +823,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 shuffle_groups.len()
             ));
 
-            let sub_pk = pk.clone();
+            let sub_pk = pk;
             let sub_advices = advices.clone();
             let sub_instance = instances.clone();
             let shuffle_products_handler = s.spawn(move || {
