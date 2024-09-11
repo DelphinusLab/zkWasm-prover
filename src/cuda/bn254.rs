@@ -364,17 +364,18 @@ pub(crate) fn batch_msm_and_conditional_intt<C: CurveAffine>(
 
     let len = 1 << len_log;
 
-    let mut s_buf = [
-        device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?,
-        device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?,
-    ];
+    const MSM_STREAMS_NR: usize = 4;
+    let mut s_buf = [0; MSM_STREAMS_NR].map(|_| {
+        device
+            .alloc_device_buffer_non_zeroed::<C::Scalar>(len)
+            .unwrap()
+    });
+    let mut t_buf = [0; MSM_STREAMS_NR].map(|_| {
+        device
+            .alloc_device_buffer_non_zeroed::<C::Scalar>(len)
+            .unwrap()
+    });
 
-    let mut t_buf = [
-        device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?,
-        device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?,
-    ];
-
-    const MSM_STREAMS_NR: usize = 2;
     let streams = [0; MSM_STREAMS_NR].map(|_| CudaStream::create().unwrap());
     let mut msm_results_buf = values
         .iter()
