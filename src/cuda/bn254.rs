@@ -401,6 +401,7 @@ pub(crate) fn batch_msm_and_conditional_intt<C: CurveAffine>(
         cfg.is_async = true;
         cfg.are_scalars_montgomery_form = true;
         cfg.are_points_montgomery_form = true;
+
         msm::msm(scalars, points, &cfg, &mut msm_results_buf[idx][..]).unwrap();
 
         if idx >= skip_intt {
@@ -429,6 +430,8 @@ pub(crate) fn batch_msm_and_conditional_intt<C: CurveAffine>(
                 ret_device_buffers.insert(idx - skip_intt, new_buffer);
             }
         }
+
+        streams[(idx + MSM_STREAMS_NR - 1) % MSM_STREAMS_NR].synchronize().unwrap();
     }
 
     for stream in streams {
