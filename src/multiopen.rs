@@ -1,6 +1,6 @@
 use std::iter;
 
-use crate::hugetlb::HugePageAllocator;
+use crate::pinned_page::PinnedPageAllocator;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::FieldExt;
 use halo2_proofs::plonk::ProvingKey;
@@ -36,7 +36,7 @@ pub(crate) mod gwc {
     use crate::device::cuda::CudaDeviceBufRaw;
     use crate::device::Device as _;
     use crate::device::DeviceResult;
-    use crate::hugetlb::HugePageAllocator;
+    use crate::pinned_page::PinnedPageAllocator;
     use crate::multiopen::ProverQuery;
 
     pub struct CommitmentData<'a, F: FieldExt> {
@@ -133,7 +133,7 @@ pub(crate) mod gwc {
         let mut ws = commitment_data
             .par_iter()
             .map(|_| {
-                let mut poly_batch = Vec::new_in(HugePageAllocator);
+                let mut poly_batch = Vec::new_in(PinnedPageAllocator);
                 poly_batch.resize(size, C::Scalar::zero());
                 poly_batch
             })
@@ -195,7 +195,7 @@ pub mod shplonk {
     use crate::device::cuda::CudaStreamWrapper;
     use crate::device::Device as _;
     use crate::device::DeviceResult;
-    use crate::hugetlb::HugePageAllocator;
+    use crate::pinned_page::PinnedPageAllocator;
     use crate::multiopen::ProverQuery;
 
     fn construct_intermediate_sets<'a, F: FieldExt, I>(
@@ -536,7 +536,7 @@ pub mod shplonk {
             None,
         )?;
 
-        let mut lx = Vec::new_in(HugePageAllocator);
+        let mut lx = Vec::new_in(PinnedPageAllocator);
         lx.resize(size, C::Scalar::zero());
 
         device.copy_from_device_to_host(&mut lx[..], &fz_buf)?;
@@ -564,7 +564,7 @@ pub mod shplonk {
 
 pub(crate) fn permutation_product_open<'a, C: CurveAffine>(
     pk: &'a ProvingKey<C>,
-    products: &'a [Vec<C::Scalar, HugePageAllocator>],
+    products: &'a [Vec<C::Scalar, PinnedPageAllocator>],
     x: C::Scalar,
 ) -> impl Iterator<Item = ProverQuery<'a, C::Scalar>> + Clone {
     let blinding_factors = pk.vk.cs.blinding_factors();

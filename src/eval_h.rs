@@ -49,7 +49,7 @@ use crate::device::DeviceResult;
 use crate::expr::flatten_lookup_expression;
 use crate::expr::flatten_shuffle_expression;
 use crate::expr::is_expr_unit;
-use crate::hugetlb::HugePageAllocator;
+use crate::pinned_page::PinnedPageAllocator;
 
 struct EvalHContext<F: FieldExt> {
     y: Vec<F>,
@@ -155,7 +155,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     intt_divisor_buf: CudaDeviceBufRaw,
     g_buf: &CudaDeviceBufRaw,
     transcript: &mut T,
-) -> DeviceResult<(C::Scalar, C::Scalar, Vec<C::Scalar, HugePageAllocator>)> {
+) -> DeviceResult<(C::Scalar, C::Scalar, Vec<C::Scalar, PinnedPageAllocator>)> {
     let domain = &pk.vk.domain;
     let k = &pk.vk.domain.k();
     let size = 1 << k;
@@ -267,7 +267,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     let x: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
     let xn = x.pow_vartime(&[1u64 << k]);
 
-    let mut h_pieces = Vec::new_in(HugePageAllocator);
+    let mut h_pieces = Vec::new_in(PinnedPageAllocator);
     h_pieces.resize(size, C::Scalar::zero());
     // pre-compute h_pieces for multi open
     {

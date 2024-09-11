@@ -50,9 +50,8 @@ use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
 use crate::expr::evaluate_exprs;
 use crate::expr::evaluate_exprs_in_gpu;
-use crate::hugetlb::print_hugetbl_cache_info;
-use crate::hugetlb::HugePageAllocator;
-use crate::hugetlb::UnpinnedHugePageAllocator;
+use crate::pinned_page::print_pinned_cache_info;
+use crate::pinned_page::PinnedPageAllocator;
 use crate::multiopen::gwc;
 use crate::multiopen::lookup_open;
 use crate::multiopen::permutation_product_open;
@@ -67,7 +66,7 @@ pub mod expr;
 mod analyze;
 mod buffer;
 mod eval_h;
-mod hugetlb;
+mod pinned_page;
 mod multiopen;
 
 const ADD_RANDOM: bool = true;
@@ -75,7 +74,7 @@ const ADD_RANDOM: bool = true;
 pub fn prepare_advice_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
     _pin_memory: bool,
-) -> Vec<Vec<C::Scalar, HugePageAllocator>> {
+) -> Vec<Vec<C::Scalar, PinnedPageAllocator>> {
     buffer::prepare_advice_buffer(pk)
 }
 
@@ -132,12 +131,12 @@ fn lookup_classify<'a, 'b, C: CurveAffine, T>(
 }
 
 fn handle_lookup_pair<F: FieldExt>(
-    input: &mut Vec<F, HugePageAllocator>,
-    table: &mut Vec<F, HugePageAllocator>,
-    mut permuted_input: Vec<F, HugePageAllocator>,
-    mut permuted_table: Vec<F, HugePageAllocator>,
+    input: &mut Vec<F, PinnedPageAllocator>,
+    table: &mut Vec<F, PinnedPageAllocator>,
+    mut permuted_input: Vec<F, PinnedPageAllocator>,
+    mut permuted_table: Vec<F, PinnedPageAllocator>,
     unusable_rows_start: usize,
-) -> (Vec<F, HugePageAllocator>, Vec<F, HugePageAllocator>) {
+) -> (Vec<F, PinnedPageAllocator>, Vec<F, PinnedPageAllocator>) {
     let compare = |a: &_, b: &_| unsafe {
         let a: &[u64; 4] = std::mem::transmute(a);
         let b: &[u64; 4] = std::mem::transmute(b);
@@ -150,7 +149,7 @@ fn handle_lookup_pair<F: FieldExt>(
     permuted_input[0..unusable_rows_start].sort_unstable_by(compare);
     sorted_table[0..unusable_rows_start].sort_unstable_by(compare);
 
-    let mut permuted_table_state = Vec::new_in(UnpinnedHugePageAllocator);
+    let mut permuted_table_state = Vec::new_in(PinnedPageAllocator);
     permuted_table_state.resize(input.len(), false);
 
     permuted_input
@@ -262,7 +261,7 @@ pub fn create_proof_from_advices<
     params: &Params<C>,
     pk: &ProvingKey<C>,
     instances: &[&[C::Scalar]],
-    advices: Arc<Vec<Vec<C::Scalar, HugePageAllocator>>>,
+    advices: Arc<Vec<Vec<C::Scalar, PinnedPageAllocator>>>,
     transcript: &mut T,
 ) -> Result<(), Error> {
     create_proof_from_advices_with_gwc(params, pk, instances, advices, transcript)
@@ -276,7 +275,7 @@ pub fn create_proof_from_advices_with_gwc<
     params: &Params<C>,
     pk: &ProvingKey<C>,
     instances: &[&[C::Scalar]],
-    advices: Arc<Vec<Vec<C::Scalar, HugePageAllocator>>>,
+    advices: Arc<Vec<Vec<C::Scalar, PinnedPageAllocator>>>,
     transcript: &mut T,
 ) -> Result<(), Error> {
     _create_proof_from_advices(params, pk, instances, advices, transcript, true)
@@ -290,7 +289,7 @@ pub fn create_proof_from_advices_with_shplonk<
     params: &Params<C>,
     pk: &ProvingKey<C>,
     instances: &[&[C::Scalar]],
-    advices: Arc<Vec<Vec<C::Scalar, HugePageAllocator>>>,
+    advices: Arc<Vec<Vec<C::Scalar, PinnedPageAllocator>>>,
     transcript: &mut T,
 ) -> Result<(), Error> {
     _create_proof_from_advices(params, pk, instances, advices, transcript, false)
@@ -300,7 +299,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
     params: &Params<C>,
     pk: &ProvingKey<C>,
     instances: &[&[C::Scalar]],
-    mut advices: Arc<Vec<Vec<C::Scalar, HugePageAllocator>>>,
+    mut advices: Arc<Vec<Vec<C::Scalar, PinnedPageAllocator>>>,
     transcript: &mut T,
     use_gwc: bool,
 ) -> Result<(), Error> {
@@ -335,7 +334,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             instances
                 .par_iter()
                 .map(|x| {
-                    let mut instance = Vec::new_in(HugePageAllocator);
+                    let mut instance = Vec::new_in(PinnedPageAllocator);
                     instance.resize(size, C::Scalar::zero());
                     instance[0..x.len()].clone_from_slice(&x[..]);
                     instance
@@ -347,7 +346,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         device.synchronize()?;
         device.print_memory_info()?;
-        print_hugetbl_cache_info();
+        print_pinned_cache_info();
 
         // add random value
         if ADD_RANDOM {
@@ -853,7 +852,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                 {
                                     None
                                 } else {
-                                    let mut buffer = Vec::new_in(UnpinnedHugePageAllocator);
+                                    let mut buffer = Vec::new_in(PinnedPageAllocator);
                                     buffer.resize(size, C::Scalar::zero());
                                     Some(buffer)
                                 };
@@ -863,7 +862,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                 {
                                     None
                                 } else {
-                                    let mut buffer = Vec::new_in(UnpinnedHugePageAllocator);
+                                    let mut buffer = Vec::new_in(PinnedPageAllocator);
                                     buffer.resize(size, C::Scalar::zero());
                                     Some(buffer)
                                 };
@@ -1609,12 +1608,12 @@ fn vanish_commit<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E
     g_buf: &CudaDeviceBufRaw,
     size: usize,
     transcript: &mut T,
-) -> Result<Vec<C::Scalar, HugePageAllocator>, Error> {
+) -> Result<Vec<C::Scalar, PinnedPageAllocator>, Error> {
     use rand::thread_rng;
     use rand::RngCore;
 
     let random_nr = 32;
-    let mut random_poly = Vec::new_in(HugePageAllocator);
+    let mut random_poly = Vec::new_in(PinnedPageAllocator);
     random_poly.resize(size, C::Scalar::zero());
 
     let random = vec![0; 32usize]
