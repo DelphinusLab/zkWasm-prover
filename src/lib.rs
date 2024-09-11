@@ -50,6 +50,7 @@ use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
 use crate::expr::evaluate_exprs;
 use crate::expr::evaluate_exprs_in_gpu;
+use crate::hugetlb::print_hugetbl_cache_info;
 use crate::hugetlb::HugePageAllocator;
 use crate::hugetlb::UnpinnedHugePageAllocator;
 use crate::multiopen::gwc;
@@ -346,6 +347,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         device.synchronize()?;
         device.print_memory_info()?;
+        print_hugetbl_cache_info();
 
         // add random value
         if ADD_RANDOM {

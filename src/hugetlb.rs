@@ -1,7 +1,6 @@
 use core::slice;
 use libc::{
-    c_void, mmap, MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_PRIVATE, PROT_READ,
-    PROT_WRITE,
+    c_void, mmap, MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_PRIVATE, PROT_READ, PROT_WRITE,
 };
 use std::{
     alloc::{AllocError, Allocator, Layout},
@@ -20,6 +19,31 @@ lazy_static! {
 }
 
 const HUGEPAGE_SIZE: usize = 2 << 20;
+
+pub fn print_hugetbl_cache_info() {
+    let mut unpinned_hugepage_size = 0;
+    let unpinned_cache = UNPINNED_BUFFER_CACHE.lock().unwrap();
+
+    let mut pinned_hugepage_size = 0;
+    let pinned_cache = PINNED_BUFFER_CACHE.lock().unwrap();
+
+    for (size, arr) in pinned_cache.iter() {
+        pinned_hugepage_size += size * arr.len();
+    }
+
+    for (size, arr) in unpinned_cache.iter() {
+        unpinned_hugepage_size += size * arr.len();
+    }
+
+    println!(
+        "zkwasm-prover cached pinned huge pages: {}",
+        pinned_hugepage_size >> 21
+    );
+    println!(
+        "zkwasm-prover cached unpinned huge pages: {}",
+        unpinned_hugepage_size >> 21
+    );
+}
 
 #[derive(Clone)]
 pub struct HugePageAllocator;
