@@ -49,6 +49,7 @@ use crate::device::DeviceResult;
 use crate::expr::flatten_lookup_expression;
 use crate::expr::flatten_shuffle_expression;
 use crate::expr::is_expr_unit;
+use crate::msm::batch_msm;
 use crate::pinned_page::PinnedPageAllocator;
 
 struct EvalHContext<F: FieldExt> {
@@ -253,11 +254,17 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
             buffers.push(s_buf);
         }
 
-        let commitments = crate::cuda::bn254::batch_msm_v2(
+        let commitments = batch_msm(
+            device,
             &g_buf,
-            buffers.iter().map(|x| x as &CudaDeviceBufRaw).collect(),
+            buffers
+                .iter()
+                .map(|x| x as &CudaDeviceBufRaw)
+                .collect::<Vec<_>>(),
+            None,
             size,
-        )?;
+        )?
+        .0;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }

@@ -29,15 +29,15 @@ pub(crate) mod gwc {
     use rayon::iter::ParallelIterator;
     use std::collections::BTreeMap;
 
-    use crate::cuda::bn254::batch_msm;
     use crate::cuda::bn254::field_op_v3;
     use crate::cuda::bn254::FieldOp;
     use crate::device::cuda::CudaDevice;
     use crate::device::cuda::CudaDeviceBufRaw;
     use crate::device::Device as _;
     use crate::device::DeviceResult;
-    use crate::pinned_page::PinnedPageAllocator;
+    use crate::msm::batch_msm;
     use crate::multiopen::ProverQuery;
+    use crate::pinned_page::PinnedPageAllocator;
 
     pub struct CommitmentData<'a, F: FieldExt> {
         queries: Vec<ProverQuery<'a, F>>,
@@ -76,7 +76,6 @@ pub(crate) mod gwc {
         g_buf: &CudaDeviceBufRaw,
         queries: I,
         size: usize,
-        s_buf: [&CudaDeviceBufRaw; 2],
         eval_map: BTreeMap<(usize, C::Scalar), C::Scalar>,
         transcript: &mut T,
     ) -> DeviceResult<()>
@@ -161,7 +160,14 @@ pub(crate) mod gwc {
 
         let timer = start_timer!(|| "msm");
 
-        let commitments = batch_msm(&g_buf, s_buf, ws.iter().map(|x| &x[..]).collect(), size)?;
+        let commitments = batch_msm(
+            device,
+            &g_buf,
+            ws.iter().map(|x| &x[..]).collect::<Vec<_>>(),
+            None,
+            size,
+        )?
+        .0;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }
@@ -185,8 +191,6 @@ pub mod shplonk {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
-    use crate::cuda::bn254::batch_msm;
-    use crate::cuda::bn254::batch_msm_v2;
     use crate::cuda::bn254::field_op_v3;
     use crate::cuda::bn254::FieldOp;
     use crate::device::cuda::CudaBuffer;
@@ -195,8 +199,9 @@ pub mod shplonk {
     use crate::device::cuda::CudaStreamWrapper;
     use crate::device::Device as _;
     use crate::device::DeviceResult;
-    use crate::pinned_page::PinnedPageAllocator;
+    use crate::msm::batch_msm;
     use crate::multiopen::ProverQuery;
+    use crate::pinned_page::PinnedPageAllocator;
 
     fn construct_intermediate_sets<'a, F: FieldExt, I>(
         queries: I,
@@ -285,7 +290,6 @@ pub mod shplonk {
         g_buf: &CudaDeviceBufRaw,
         queries: I,
         size: usize,
-        s_buf: [&CudaDeviceBufRaw; 2],
         eval_map: BTreeMap<(usize, C::Scalar), C::Scalar>,
         mut poly_cache: BTreeMap<usize, CudaDeviceBufRaw>,
         transcript: &mut T,
@@ -451,7 +455,7 @@ pub mod shplonk {
             k,
         )?;
 
-        let commitment = batch_msm_v2::<C>(&g_buf, vec![&hx_buf], size)?;
+        let commitment = batch_msm(device, &g_buf, vec![&hx_buf], None, size)?.0;
         transcript.write_point(commitment[0]).unwrap();
 
         let u: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
@@ -553,7 +557,7 @@ pub mod shplonk {
             lx[0] = tmp;
         }
 
-        let commitments = batch_msm(&g_buf, s_buf, vec![&lx[..]], size)?;
+        let commitments = batch_msm(device, &g_buf, vec![&lx[..]], None, size)?.0;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }

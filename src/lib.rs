@@ -8,7 +8,6 @@ use ark_std::end_timer;
 use ark_std::start_timer;
 
 use ark_std::rand::rngs::OsRng;
-use cuda::bn254::batch_msm_v2;
 use cuda::bn254::intt_raw_async;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
@@ -50,14 +49,15 @@ use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
 use crate::expr::evaluate_exprs;
 use crate::expr::evaluate_exprs_in_gpu;
-use crate::pinned_page::print_pinned_cache_info;
-use crate::pinned_page::PinnedPageAllocator;
+use crate::msm::batch_msm;
 use crate::multiopen::gwc;
 use crate::multiopen::lookup_open;
 use crate::multiopen::permutation_product_open;
 use crate::multiopen::shplonk;
 use crate::multiopen::shuffle_open;
 use crate::multiopen::ProverQuery;
+use crate::pinned_page::print_pinned_cache_info;
+use crate::pinned_page::PinnedPageAllocator;
 
 pub mod cuda;
 pub mod device;
@@ -66,8 +66,9 @@ pub mod expr;
 mod analyze;
 mod buffer;
 mod eval_h;
-mod pinned_page;
+mod msm;
 mod multiopen;
+mod pinned_page;
 
 const ADD_RANDOM: bool = true;
 
@@ -477,8 +478,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             )
         });
 
-        let mut s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-        let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
 
         let (
             _,
@@ -495,24 +496,25 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         ));
 
         let instances_len = instances.len();
-        let (commitments, mut advice_device_buffers) =
-            crate::cuda::bn254::batch_msm_and_conditional_intt(
-                &device,
-                &g_lagrange_buf,
+        let (commitments, mut advice_device_buffers) = batch_msm(
+            &device,
+            &g_lagrange_buf,
+            unsafe { Arc::get_mut_unchecked(&mut instances) }
+                .iter_mut()
+                .chain(unsafe { Arc::get_mut_unchecked(&mut advices) }.iter_mut())
+                .map(|x| &mut x[..])
+                .collect::<Vec<_>>(),
+            Some((
                 &intt_pq_buf,
                 &intt_omegas_buf,
                 &intt_divisor_buf,
                 k,
-                unsafe {
-                    Arc::get_mut_unchecked(&mut instances)
-                        .iter_mut()
-                        .chain(Arc::get_mut_unchecked(&mut advices).iter_mut())
-                        .map(|x| &mut x[..])
-                        .collect()
-                },
-                &uninvolved_advices,
+                Some(&uninvolved_advices),
                 instances_len,
-            )?;
+            )),
+            size,
+        )?;
+
         for commitment in commitments.iter().take(instances.len()) {
             transcript.common_point(*commitment).unwrap();
         }
@@ -617,12 +619,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 lookup_scalars.push(&permuted_input[..]);
                 lookup_scalars.push(&permuted_table[..])
             }
-            let commitments = crate::cuda::bn254::batch_msm(
-                &g_lagrange_buf,
-                [&s_buf, &t_buf],
-                lookup_scalars,
-                size,
-            )?;
+            let commitments = batch_msm(&device, &g_lagrange_buf, lookup_scalars, None, size)?.0;
             let mut tidx = 0;
             for (i, _) in single_unit_lookups.iter() {
                 lookup_permuted_commitments[i * 2] = commitments[tidx];
@@ -648,12 +645,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 lookup_scalars.push(&permuted_input[..]);
                 lookup_scalars.push(&permuted_table[..])
             }
-            let commitments = crate::cuda::bn254::batch_msm(
-                &g_lagrange_buf,
-                [&s_buf, &t_buf],
-                lookup_scalars,
-                size,
-            )?;
+            let commitments = batch_msm(&device, &g_lagrange_buf, lookup_scalars, None, size)?.0;
             let mut tidx = 0;
             for (i, _) in tuple_lookups.iter() {
                 lookup_permuted_commitments[i * 2] = commitments[tidx];
@@ -1122,12 +1114,14 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
-        let lookup_z_commitments = crate::cuda::bn254::batch_msm(
+        let lookup_z_commitments = batch_msm(
+            &device,
             &g_buf,
-            [&s_buf, &t_buf],
             lookups.iter().map(|x| &x.4[..]).collect::<Vec<_>>(),
+            None,
             size,
-        )?;
+        )?
+        .0;
         end_timer!(timer);
 
         let buffers = unsafe {
@@ -1162,22 +1156,24 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "permutation z msm and intt");
-        let mut batch_ntt_t0_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-        let mut batch_ntt_t1_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-        let permutation_commitments = crate::cuda::bn254::batch_msm_and_intt::<C>(
+        let permutation_commitments = batch_msm(
             &device,
             &g_lagrange_buf,
-            [&mut s_buf, &mut t_buf],
-            [&mut batch_ntt_t0_buf, &mut batch_ntt_t1_buf],
-            &intt_pq_buf,
-            &intt_omegas_buf,
-            &intt_divisor_buf,
-            k,
             permutation_products
                 .par_iter_mut()
                 .map(|x| &mut x[..])
                 .collect::<Vec<_>>(),
-        )?;
+            Some((
+                &intt_pq_buf,
+                &intt_omegas_buf,
+                &intt_divisor_buf,
+                k,
+                None,
+                0,
+            )),
+            1 << k,
+        )?
+        .0;
         end_timer!(timer);
 
         let buffers = unsafe {
@@ -1211,22 +1207,24 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "shuffle z msm and intt");
-        let shuffle_commitments = crate::cuda::bn254::batch_msm_and_intt::<C>(
+        let shuffle_commitments = batch_msm(
             &device,
             &g_lagrange_buf,
-            [&mut s_buf, &mut t_buf],
-            [&mut batch_ntt_t0_buf, &mut batch_ntt_t1_buf],
-            &intt_pq_buf,
-            &intt_omegas_buf,
-            &intt_divisor_buf,
-            k,
             shuffle_products
                 .iter_mut()
                 .map(|x| &mut x[..])
                 .collect::<Vec<_>>(),
-        )?;
-        drop(batch_ntt_t0_buf);
-        drop(batch_ntt_t1_buf);
+            Some((
+                &intt_pq_buf,
+                &intt_omegas_buf,
+                &intt_divisor_buf,
+                k,
+                None,
+                0,
+            )),
+            1 << k,
+        )?
+        .0;
         drop(g_lagrange_buf);
         end_timer!(timer);
 
@@ -1571,18 +1569,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     })),
             );
 
-        let s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-        let t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         if use_gwc {
-            gwc::multiopen(
-                &device,
-                &g_buf,
-                queries,
-                size,
-                [&s_buf, &t_buf],
-                eval_map,
-                transcript,
-            )?;
+            gwc::multiopen(&device, &g_buf, queries, size, eval_map, transcript)?;
         } else {
             shplonk::multiopen(
                 &pk,
@@ -1590,7 +1578,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 &g_buf,
                 queries,
                 size,
-                [&s_buf, &t_buf],
                 eval_map,
                 poly_buf_cache,
                 transcript,
@@ -1630,8 +1617,8 @@ fn vanish_commit<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E
     });
 
     // Commit
-    device.copy_from_host_to_device(&s_buf, &random_poly[..])?;
-    let commitment = batch_msm_v2(&g_buf, vec![&s_buf], size)?;
+    device.copy_from_host_to_device(s_buf, &random_poly[..])?;
+    let commitment = batch_msm(&device, &g_buf, vec![s_buf], None, size)?.0;
     transcript.write_point(commitment[0]).unwrap();
 
     Ok(random_poly)
