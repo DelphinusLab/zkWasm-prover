@@ -1,12 +1,17 @@
 use core::slice;
 use cuda_runtime_sys::cudaError;
-use libc::c_void;
+use libc::{
+    c_void, mmap, MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_PRIVATE, PROT_READ, PROT_WRITE,
+};
 use std::{
     alloc::{AllocError, Allocator, Layout},
     collections::HashMap,
     ptr::NonNull,
     sync::Mutex,
 };
+
+use crate::device::cuda::CudaDevice;
+use crate::device::Device;
 
 // Design for k22 and k23
 
@@ -35,9 +40,30 @@ impl SimpleAllocator {
 
     fn ensure_full_buffer(&mut self) {
         if self.full_free_buffers.is_empty() {
-            let mut p: *mut c_void = unsafe { std::mem::zeroed() };
-            let res = unsafe { cuda_runtime_sys::cudaMallocHost(&mut p, ALLOC_SIZE) };
-            assert_eq!(res, cudaError::cudaSuccess);
+            let p = unsafe {
+                mmap(
+                    std::ptr::null_mut(),
+                    ALLOC_SIZE,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+                    -1,
+                    0,
+                )
+            };
+
+            let p = if p != MAP_FAILED {
+                let device = CudaDevice::get_device(0).unwrap();
+                device
+                    .pin_memory(unsafe { slice::from_raw_parts_mut(p as *mut _, ALLOC_SIZE) })
+                    .unwrap();
+                p
+            } else {
+                let mut p: *mut c_void = unsafe { std::mem::zeroed() };
+                let res = unsafe { cuda_runtime_sys::cudaMallocHost(&mut p, ALLOC_SIZE) };
+                assert_eq!(res, cudaError::cudaSuccess);
+                p
+            };
+
             self.full_free_buffers.push(self.buffers.len());
             self.buffers.push((p as usize, [false; CHUNCKS], 0));
         }
