@@ -31,11 +31,11 @@ pub(crate) mod gwc {
 
     use crate::cuda::bn254::field_op_v3;
     use crate::cuda::bn254::FieldOp;
+    use crate::cuda::msm::batch_msm;
     use crate::device::cuda::CudaDevice;
     use crate::device::cuda::CudaDeviceBufRaw;
     use crate::device::Device as _;
     use crate::device::DeviceResult;
-    use crate::msm::batch_msm;
     use crate::multiopen::ProverQuery;
     use crate::pinned_page::PinnedPageAllocator;
 
@@ -193,13 +193,13 @@ pub mod shplonk {
 
     use crate::cuda::bn254::field_op_v3;
     use crate::cuda::bn254::FieldOp;
+    use crate::cuda::msm::batch_msm;
     use crate::device::cuda::CudaBuffer;
     use crate::device::cuda::CudaDevice;
     use crate::device::cuda::CudaDeviceBufRaw;
     use crate::device::cuda::CudaStreamWrapper;
     use crate::device::Device as _;
     use crate::device::DeviceResult;
-    use crate::msm::batch_msm;
     use crate::multiopen::ProverQuery;
     use crate::pinned_page::PinnedPageAllocator;
 

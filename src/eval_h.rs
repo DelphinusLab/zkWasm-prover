@@ -39,6 +39,7 @@ use crate::cuda::bn254_c::field_op_batch_mul_sum;
 use crate::cuda::bn254_c::lookup_eval_h;
 use crate::cuda::bn254_c::shuffle_eval_h;
 use crate::cuda::bn254_c::shuffle_eval_h_v2;
+use crate::cuda::msm::batch_msm;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
@@ -49,7 +50,6 @@ use crate::device::DeviceResult;
 use crate::expr::flatten_lookup_expression;
 use crate::expr::flatten_shuffle_expression;
 use crate::expr::is_expr_unit;
-use crate::msm::batch_msm;
 use crate::pinned_page::PinnedPageAllocator;
 
 struct EvalHContext<F: FieldExt> {

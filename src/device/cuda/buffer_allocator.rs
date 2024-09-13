@@ -75,7 +75,10 @@ impl CudaBufferAllocator {
                     sum += 1;
                 }
             }
-            println!("failed to alloc device buffer with {} bytes, count is {}, used chunks {}", size, count, sum);
+            println!(
+                "failed to alloc device buffer with {} bytes, count is {}, used chunks {}",
+                size, count, sum
+            );
             println!("chunck status: {:?}", self.bit_map);
             panic!("Cuda Device OOM");
         }
