@@ -358,20 +358,6 @@ pub fn intt_raw_async(
     Ok(())
 }
 
-pub fn ntt<F: FieldExt>(
-    device: &CudaDevice,
-    s_buf: &mut CudaDeviceBufRaw,
-    tmp_buf: &mut CudaDeviceBufRaw,
-    pq_buf: &CudaDeviceBufRaw,
-    omegas_buf: &CudaDeviceBufRaw,
-    result: &mut [F],
-    len_log: usize,
-) -> Result<(), Error> {
-    ntt_raw(device, s_buf, tmp_buf, pq_buf, omegas_buf, len_log, None)?;
-    device.copy_from_device_to_host(result, s_buf)?;
-    Ok(())
-}
-
 // plonk permutation
 pub fn permutation_eval_h_p1(
     device: &CudaDevice,

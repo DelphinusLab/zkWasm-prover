@@ -3,14 +3,6 @@ use std::ffi::c_void;
 
 #[link(name = "zkwasm_prover_kernel", kind = "static")]
 extern "C" {
-    pub fn msm(
-        res: *mut c_void,
-        p: *mut c_void,
-        s: *mut c_void,
-        array_len: i32,
-        stream: *mut CUstream_st,
-    ) -> cudaError;
-
     pub fn ntt(
         buf: *mut c_void,
         tmp: *mut c_void,
@@ -71,16 +63,6 @@ extern "C" {
         beta: *mut c_void,
         gamma: *mut c_void,
         p: *mut c_void,
-        n: i32,
-    ) -> cudaError;
-
-    pub fn field_sum(
-        res: *mut c_void,
-        v: *mut c_void,
-        v_c: *mut c_void,
-        v_rot: *mut c_void,
-        omegas: *mut c_void,
-        v_n: i32,
         n: i32,
     ) -> cudaError;
 
