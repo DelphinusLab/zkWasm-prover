@@ -71,8 +71,124 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
         }
     }
 
-    fn free(&mut self, buf: CudaDeviceBufRaw) {
-        self.extended_allocator.push(buf);
+    fn free(&mut self, _buf: CudaDeviceBufRaw) {
+        //self.extended_allocator.push(buf);
+    }
+}
+
+impl<'a, F: FieldExt> EvalHContext<'a, F> {
+    fn eval_ys(&mut self, ys: &BTreeMap<u32, F>) -> F {
+        let max_y_order = *ys.keys().max().unwrap();
+        for _ in (self.y.len() as u32)..=max_y_order {
+            self.y.push(self.y[1] * self.y.last().unwrap());
+        }
+        ys.iter().fold(F::zero(), |acc, (y_order, f)| {
+            acc + self.y[*y_order as usize] * f
+        })
+    }
+
+    fn evaluate_prove_expr_with_async_ntt(
+        &mut self,
+        device: &CudaDevice,
+        exprs: &[Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>],
+        fixed: &[&[F]],
+        advice: &[&[F]],
+        instance: &[&[F]],
+    ) -> DeviceResult<CudaDeviceBufRaw> {
+        let res = self.alloc()?;
+        unsafe {
+            cudaMemset(res.ptr(), 0, self.extended_size * core::mem::size_of::<F>());
+        }
+
+        let mut last_bufs = BTreeMap::new();
+        for expr in exprs.iter() {
+            let coeffs = expr
+                .iter()
+                .map(|(_, ys)| self.eval_ys(ys))
+                .collect::<Vec<_>>();
+            let coeffs_buf = device.alloc_device_buffer_from_slice(&coeffs[..])?;
+
+            let mut bufs = BTreeMap::new();
+            unsafe {
+                let mut group = vec![];
+                let mut rots = vec![];
+
+                for (units, _) in expr.iter() {
+                    for (u, _) in units {
+                        let id = u.get_group();
+                        if !bufs.contains_key(&id) && last_bufs.contains_key(&id) {
+                            let buf = last_bufs.remove(&id).unwrap();
+                            bufs.insert(id, buf);
+                        }
+                    }
+                }
+
+                for (_, buf) in last_bufs {
+                    self.extended_allocator.push(buf)
+                }
+
+                let mut last_stream_and_tmp = None;
+                for (i, (units, _)) in expr.iter().enumerate() {
+                    group.push(
+                        coeffs_buf
+                            .ptr()
+                            .offset((i * core::mem::size_of::<F>()) as isize),
+                    );
+
+                    for (u, exp) in units {
+                        let id = u.get_group();
+                        let (src, rot) = match u {
+                            ProveExpressionUnit::Fixed {
+                                column_index,
+                                rotation,
+                            } => (&fixed[*column_index], rotation),
+                            ProveExpressionUnit::Advice {
+                                column_index,
+                                rotation,
+                            } => (&advice[*column_index], rotation),
+                            ProveExpressionUnit::Instance {
+                                column_index,
+                                rotation,
+                            } => (&instance[*column_index], rotation),
+                        };
+                        if !bufs.contains_key(&id) {
+                            let (buf, stream_and_tmp) = self.copy_and_extended_ntt_async(src)?;
+                            if let Some(stream_and_tmp) = last_stream_and_tmp {
+                                self.extended_ntt_wait(stream_and_tmp)?;
+                            }
+                            last_stream_and_tmp = Some(stream_and_tmp);
+                            bufs.insert(id, buf);
+                        }
+                        for _ in 0..*exp {
+                            group.push(bufs.get(&id).unwrap().ptr());
+                            rots.push(rot.0 << (self.extended_k - self.k));
+                        }
+                    }
+
+                    group.push(0usize as _);
+                }
+
+                last_stream_and_tmp.map(|stream_and_tmp| self.extended_ntt_wait(stream_and_tmp));
+
+                let group_buf = device.alloc_device_buffer_from_slice(&group[..])?;
+                let rots_buf = device.alloc_device_buffer_from_slice(&rots[..])?;
+
+                let err = field_op_batch_mul_sum(
+                    res.ptr(),
+                    group_buf.ptr(),
+                    rots_buf.ptr(),
+                    group.len() as i32,
+                    self.extended_size as i32,
+                    0 as _,
+                );
+
+                to_result((), err, "fail to run field_op_batch_mul_sum")?;
+
+                last_bufs = bufs;
+            }
+        }
+
+        Ok(res)
     }
 }
 
@@ -491,8 +607,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
 
     let timer = start_timer!(|| "evaluate_h gates");
     let exprs = analyze_expr_tree(&pk.ev.gpu_gates_expr[0], k);
-    let h_buf =
-        evaluate_prove_expr_with_async_ntt(device, &exprs, fixed, advice, instance, &mut ctx)?;
+    let h_buf = ctx.evaluate_prove_expr_with_async_ntt(device, &exprs, fixed, advice, instance)?;
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h prepare buffers for constants");
@@ -657,13 +772,12 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         let mut streams = vec![];
         for i in 0..2 {
             if degs[i] > 1 {
-                bufs.push(evaluate_prove_expr(
+                bufs.push(ctx.evaluate_prove_expr_with_async_ntt(
                     device,
                     &expr[i..i + 1],
                     fixed,
                     advice,
                     instance,
-                    &mut ctx,
                 )?);
             } else {
                 let (sw, stream) = CudaStreamWrapper::new_with_inner();
@@ -755,7 +869,8 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         |ctx: &mut EvalHContext<'_, _>,
          expr: &Expression<_>,
          stream_and_tmps: &mut Vec<(CudaStreamWrapper, CudaDeviceBufRaw)>,
-         device_buf_vec: &mut Vec<_>| {
+         device_buf_vec: &mut Vec<_>|
+         -> DeviceResult<()> {
             let host_buf = match expr {
                 Expression::Fixed { column_index, .. } => &*fixed[*column_index],
                 Expression::Advice { column_index, .. } => &*advice[*column_index],
@@ -763,9 +878,19 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                 _ => unreachable!(),
             };
             let (device_buf, stream_and_tmp) = ctx.copy_and_extended_ntt_async(host_buf).unwrap();
+            while stream_and_tmps.len() >= 2 {
+                ctx.extended_ntt_wait(stream_and_tmps.pop().unwrap())?;
+            }
             stream_and_tmps.push(stream_and_tmp);
             device_buf_vec.push(device_buf);
+            Ok(())
         };
+
+    let mut betas = vec![beta];
+    for _ in 1..16 {
+        betas.push(*betas.last().unwrap() * beta);
+    }
+    let betas_buf = device.alloc_device_buffer_from_slice(&betas[..])?;
 
     let shuffle_group = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
     for (_i, (shuffle, z)) in shuffle_group
@@ -798,23 +923,17 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                     &x.input_expressions[0],
                     &mut stream_and_tmps,
                     &mut inputs,
-                );
+                )?;
                 pick_host_buf_and_do_ntt_async(
                     &mut ctx,
                     &x.shuffle_expressions[0],
                     &mut stream_and_tmps,
                     &mut shuffles,
-                );
+                )?;
             }
 
             drop(stream_and_tmps);
 
-            let mut betas = vec![beta];
-            for _ in 1..inputs.len() {
-                betas.push(*betas.last().unwrap() * beta);
-            }
-
-            let betas_buf = device.alloc_device_buffer_from_slice(&betas[..])?;
             let inputs_buf = device.alloc_device_buffer_from_slice(
                 &inputs.iter().map(|x| x.ptr()).collect::<Vec<_>>()[..],
             )?;
@@ -853,9 +972,9 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                 flatten_shuffle_expression(&input_expressions, &table_expressions, beta, theta);
 
             let input_buf =
-                evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx)?;
+                ctx.evaluate_prove_expr_with_async_ntt(device, &vec![e1], fixed, advice, instance)?;
             let table_buf =
-                evaluate_prove_expr(device, &vec![e2], fixed, advice, instance, &mut ctx)?;
+                ctx.evaluate_prove_expr_with_async_ntt(device, &vec![e2], fixed, advice, instance)?;
             let z_buf = ctx.copy_and_extended_ntt_sync(z)?;
 
             let timer = start_timer!(|| "shuffle_eval_h");
@@ -890,215 +1009,4 @@ fn get_expr_degree<F: FieldExt>(expr: &Vec<Expression<F>>) -> usize {
         deg = deg.max(expr.degree());
     }
     deg
-}
-
-fn eval_ys<F: FieldExt>(ys: &BTreeMap<u32, F>, ctx: &mut EvalHContext<F>) -> F {
-    let max_y_order = *ys.keys().max().unwrap();
-    for _ in (ctx.y.len() as u32)..=max_y_order {
-        ctx.y.push(ctx.y[1] * ctx.y.last().unwrap());
-    }
-    ys.iter().fold(F::zero(), |acc, (y_order, f)| {
-        acc + ctx.y[*y_order as usize] * f
-    })
-}
-
-fn evaluate_prove_expr<F: FieldExt>(
-    device: &CudaDevice,
-    exprs: &[Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>],
-    fixed: &[&[F]],
-    advice: &[&[F]],
-    instance: &[&[F]],
-    ctx: &mut EvalHContext<F>,
-) -> DeviceResult<CudaDeviceBufRaw> {
-    let res = ctx.alloc()?;
-    unsafe {
-        cudaMemset(res.ptr(), 0, ctx.extended_size * core::mem::size_of::<F>());
-    }
-
-    let mut last_bufs = BTreeMap::new();
-    for expr in exprs.iter() {
-        let mut bufs = BTreeMap::new();
-        let mut coeffs = vec![];
-        for (_, ys) in expr {
-            coeffs.push(eval_ys(&ys, ctx));
-        }
-        let coeffs_buf = device.alloc_device_buffer_from_slice(&coeffs[..])?;
-
-        unsafe {
-            let mut group = vec![];
-            let mut rots = vec![];
-
-            for (units, _) in expr.iter() {
-                for (u, _) in units {
-                    let id = u.get_group();
-                    if !bufs.contains_key(&id) && last_bufs.contains_key(&id) {
-                        let buf = last_bufs.remove(&id).unwrap();
-                        bufs.insert(id, buf);
-                    }
-                }
-            }
-
-            for (_, buf) in last_bufs {
-                ctx.extended_allocator.push(buf)
-            }
-
-            for (i, (units, _)) in expr.iter().enumerate() {
-                group.push(
-                    coeffs_buf
-                        .ptr()
-                        .offset((i * core::mem::size_of::<F>()) as isize),
-                );
-
-                for (u, exp) in units {
-                    let id = u.get_group();
-                    let (src, rot) = match u {
-                        ProveExpressionUnit::Fixed {
-                            column_index,
-                            rotation,
-                        } => (&fixed[*column_index], rotation),
-                        ProveExpressionUnit::Advice {
-                            column_index,
-                            rotation,
-                        } => (&advice[*column_index], rotation),
-                        ProveExpressionUnit::Instance {
-                            column_index,
-                            rotation,
-                        } => (&instance[*column_index], rotation),
-                    };
-                    if !bufs.contains_key(&id) {
-                        let buf = ctx.copy_and_extended_ntt_sync(src)?;
-                        bufs.insert(id, buf);
-                    }
-                    for _ in 0..*exp {
-                        group.push(bufs.get(&id).unwrap().ptr());
-                        rots.push(rot.0 << (ctx.extended_k - ctx.k));
-                    }
-                }
-
-                group.push(0usize as _);
-            }
-
-            let group_buf = device.alloc_device_buffer_from_slice(&group[..])?;
-            let rots_buf = device.alloc_device_buffer_from_slice(&rots[..])?;
-
-            let err = field_op_batch_mul_sum(
-                res.ptr(),
-                group_buf.ptr(),
-                rots_buf.ptr(),
-                group.len() as i32,
-                ctx.extended_size as i32,
-                0 as _,
-            );
-
-            to_result((), err, "fail to run field_op_batch_mul_sum")?;
-
-            last_bufs = bufs;
-        }
-    }
-
-    Ok(res)
-}
-
-fn evaluate_prove_expr_with_async_ntt<F: FieldExt>(
-    device: &CudaDevice,
-    exprs: &Vec<Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>>,
-    fixed: &[&[F]],
-    advice: &[&[F]],
-    instance: &[&[F]],
-    ctx: &mut EvalHContext<F>,
-) -> DeviceResult<CudaDeviceBufRaw> {
-    let res = ctx.alloc()?;
-    unsafe {
-        cudaMemset(res.ptr(), 0, ctx.extended_size * core::mem::size_of::<F>());
-    }
-
-    let mut last_bufs = BTreeMap::new();
-    for expr in exprs.iter() {
-        let mut bufs = BTreeMap::new();
-        let mut coeffs = vec![];
-        for (_, ys) in expr {
-            coeffs.push(eval_ys(&ys, ctx));
-        }
-        let coeffs_buf = device.alloc_device_buffer_from_slice(&coeffs[..])?;
-
-        unsafe {
-            let mut group = vec![];
-            let mut rots = vec![];
-
-            for (units, _) in expr.iter() {
-                for (u, _) in units {
-                    let id = u.get_group();
-                    if !bufs.contains_key(&id) && last_bufs.contains_key(&id) {
-                        let buf = last_bufs.remove(&id).unwrap();
-                        bufs.insert(id, buf);
-                    }
-                }
-            }
-
-            for (_, buf) in last_bufs {
-                ctx.extended_allocator.push(buf)
-            }
-
-            let mut last_stream_and_tmp = None;
-            for (i, (units, _)) in expr.iter().enumerate() {
-                group.push(
-                    coeffs_buf
-                        .ptr()
-                        .offset((i * core::mem::size_of::<F>()) as isize),
-                );
-
-                for (u, exp) in units {
-                    let id = u.get_group();
-                    let (src, rot) = match u {
-                        ProveExpressionUnit::Fixed {
-                            column_index,
-                            rotation,
-                        } => (&fixed[*column_index], rotation),
-                        ProveExpressionUnit::Advice {
-                            column_index,
-                            rotation,
-                        } => (&advice[*column_index], rotation),
-                        ProveExpressionUnit::Instance {
-                            column_index,
-                            rotation,
-                        } => (&instance[*column_index], rotation),
-                    };
-                    if !bufs.contains_key(&id) {
-                        let (buf, stream_and_tmp) = ctx.copy_and_extended_ntt_async(src)?;
-                        if let Some(stream_and_tmp) = last_stream_and_tmp {
-                            ctx.extended_ntt_wait(stream_and_tmp)?;
-                        }
-                        last_stream_and_tmp = Some(stream_and_tmp);
-                        bufs.insert(id, buf);
-                    }
-                    for _ in 0..*exp {
-                        group.push(bufs.get(&id).unwrap().ptr());
-                        rots.push(rot.0 << (ctx.extended_k - ctx.k));
-                    }
-                }
-
-                group.push(0usize as _);
-            }
-
-            last_stream_and_tmp.map(|stream_and_tmp| ctx.extended_ntt_wait(stream_and_tmp));
-
-            let group_buf = device.alloc_device_buffer_from_slice(&group[..])?;
-            let rots_buf = device.alloc_device_buffer_from_slice(&rots[..])?;
-
-            let err = field_op_batch_mul_sum(
-                res.ptr(),
-                group_buf.ptr(),
-                rots_buf.ptr(),
-                group.len() as i32,
-                ctx.extended_size as i32,
-                0 as _,
-            );
-
-            to_result((), err, "fail to run field_op_batch_mul_sum")?;
-
-            last_bufs = bufs;
-        }
-    }
-
-    Ok(res)
 }
