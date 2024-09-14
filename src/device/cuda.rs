@@ -372,7 +372,7 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
     }
 }
 
-pub struct CudaStreamWrapper(cudaStream_t);
+pub(crate) struct CudaStreamWrapper(cudaStream_t);
 
 impl CudaStreamWrapper {
     pub fn new() -> Self {

@@ -194,12 +194,14 @@ pub mod shplonk {
     use crate::cuda::bn254::field_op_v3;
     use crate::cuda::bn254::FieldOp;
     use crate::cuda::msm::batch_msm;
+    use crate::cuda::ntt::ntt_raw;
     use crate::device::cuda::CudaBuffer;
     use crate::device::cuda::CudaDevice;
     use crate::device::cuda::CudaDeviceBufRaw;
     use crate::device::cuda::CudaStreamWrapper;
     use crate::device::Device as _;
     use crate::device::DeviceResult;
+    use crate::generate_ntt_buffers;
     use crate::multiopen::ProverQuery;
     use crate::pinned_page::PinnedPageAllocator;
 
@@ -372,9 +374,9 @@ pub mod shplonk {
 
         let k = pk.vk.domain.k as usize;
         let (ntt_omegas_buf, ntt_pq_buf) =
-            crate::ntt_prepare(&device, pk.get_vk().domain.get_omega(), k)?;
+            generate_ntt_buffers(&device, pk.get_vk().domain.get_omega(), k)?;
         let (intt_omegas_buf, intt_pq_buf) =
-            crate::ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
+            generate_ntt_buffers(&device, pk.get_vk().domain.get_omega_inv(), k)?;
         let intt_divisor_buf = device
             .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
 
@@ -405,13 +407,14 @@ pub mod shplonk {
                 .copied()
                 .collect();
 
-            crate::cuda::bn254::ntt_raw(
+            ntt_raw(
                 &device,
                 &mut poly_buf,
                 &mut tmp_buf,
                 &ntt_pq_buf,
                 &ntt_omegas_buf,
                 k,
+                None,
                 None,
             )?;
 
@@ -445,14 +448,15 @@ pub mod shplonk {
             crate::device::cuda::to_result((), err, "failed to run shplonk_h_x_div_points")?;
         }
 
-        crate::intt_raw(
+        ntt_raw(
             &device,
             &mut hx_buf,
             &mut tmp_buf,
             &intt_pq_buf,
             &intt_omegas_buf,
-            &intt_divisor_buf,
             k,
+            Some(&intt_divisor_buf),
+            None,
         )?;
 
         let commitment = batch_msm(device, &g_buf, vec![&hx_buf], None, size)?.0;

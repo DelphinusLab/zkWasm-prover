@@ -8,7 +8,7 @@ use ark_std::end_timer;
 use ark_std::start_timer;
 
 use ark_std::rand::rngs::OsRng;
-use cuda::bn254::intt_raw_async;
+use cuda::ntt::ntt_raw;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
@@ -35,11 +35,10 @@ use std::sync::Mutex;
 use std::thread;
 
 use crate::buffer::*;
-use crate::cuda::bn254::batch_intt_raw;
-use crate::cuda::bn254::intt_raw;
-use crate::cuda::bn254::ntt_prepare;
 use crate::cuda::bn254_c::eval_lookup_z;
 use crate::cuda::msm::batch_msm;
+use crate::cuda::ntt::batch_ntt_raw;
+use crate::cuda::ntt::generate_ntt_buffers;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
@@ -374,7 +373,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let timer = start_timer!(|| "prepare ntt");
         let (intt_omegas_buf, intt_pq_buf) =
-            ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
+            generate_ntt_buffers(&device, pk.get_vk().domain.get_omega_inv(), k)?;
         let intt_divisor_buf = device
             .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
         end_timer!(timer);
@@ -1085,15 +1084,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     &mut *permuted_table_buf,
                     &mut *z_buf,
                 ] {
-                    intt_raw_async(
+                    ntt_raw(
                         &device,
                         s_buf,
                         &mut *input_buf,
                         &intt_pq_buf,
                         &intt_omegas_buf,
-                        &intt_divisor_buf,
                         k,
-                        Some(stream),
+                        Some(&intt_divisor_buf),
+                        Some(&streams[idx]),
                     )?;
                 }
 
@@ -1140,13 +1139,13 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .collect::<Vec<_>>()
         };
         let timer = start_timer!(|| format!("partial and advices intt {}", buffers.len()));
-        batch_intt_raw(
+        batch_ntt_raw(
             &device,
             buffers,
             &intt_pq_buf,
             &intt_omegas_buf,
-            &intt_divisor_buf,
             k,
+            Some(&intt_divisor_buf),
         )?;
         end_timer!(timer);
 
@@ -1191,13 +1190,13 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .collect::<Vec<_>>()
         };
         let timer = start_timer!(|| format!("partial and advices intt {}", buffers.len()));
-        batch_intt_raw(
+        batch_ntt_raw(
             &device,
             buffers,
             &intt_pq_buf,
             &intt_omegas_buf,
-            &intt_divisor_buf,
             k,
+            Some(&intt_divisor_buf),
         )?;
         end_timer!(timer);
 
@@ -1275,13 +1274,13 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
             let timer =
                 start_timer!(|| format!("partial instances and advices intt {}", buffers.len()));
-            batch_intt_raw(
+            batch_ntt_raw(
                 &device,
                 buffers,
                 &intt_pq_buf,
                 &intt_omegas_buf,
-                &intt_divisor_buf,
                 k,
+                Some(&intt_divisor_buf),
             )?;
             end_timer!(timer);
         }

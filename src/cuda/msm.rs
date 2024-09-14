@@ -1,11 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::cuda::bn254::intt_raw_async;
-use crate::device::cuda::{CudaBuffer, CudaDevice, CudaDeviceBufRaw};
+use crate::cuda::ntt::ntt_raw;
+use crate::device::cuda::{CudaBuffer, CudaDevice, CudaDeviceBufRaw, CudaStreamWrapper};
 use crate::device::Error;
 use crate::device::{Device, DeviceResult};
 
-use cuda_runtime_sys::cudaStream_t;
 use halo2_proofs::arithmetic::{CurveAffine, FieldExt};
 use icicle_bn254::curve::BaseField;
 use icicle_bn254::curve::CurveCfg;
@@ -236,20 +235,24 @@ pub(crate) fn batch_msm<'a, C: CurveAffine, T: CopyToCudaHost<'a> + 'a>(
                 let mut s_buf = s_buf_queue.remove(&inner_idx).unwrap();
                 if intt_map.map(|m| m.contains(&(idx - skips))).unwrap_or(true) {
                     let stream =
-                        *unsafe { std::mem::transmute::<&CudaStream, &cudaStream_t>(stream) };
+                        unsafe { std::mem::transmute::<&CudaStream, &CudaStreamWrapper>(stream) };
                     let mut t_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?;
-                    intt_raw_async(
+                    ntt_raw(
                         device,
                         &mut s_buf,
                         &mut t_buf,
                         pq_buf,
                         omegas_buf,
-                        divisor_buf,
                         len_log,
+                        Some(divisor_buf),
                         Some(stream),
                     )?;
 
-                    device.copy_from_device_to_host_async(value.to_mut_slice(), &s_buf, stream)?;
+                    device.copy_from_device_to_host_async(
+                        value.to_mut_slice(),
+                        &s_buf,
+                        stream.into(),
+                    )?;
                     s_buf_queue.insert(inner_idx, s_buf);
                     t_buf_queue.insert(inner_idx, t_buf);
                 } else {
