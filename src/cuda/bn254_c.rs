@@ -64,6 +64,7 @@ extern "C" {
         gamma: *mut c_void,
         p: *mut c_void,
         n: i32,
+        stream: *mut CUstream_st,
     ) -> cudaError;
 
     pub fn field_op_batch_mul_sum(

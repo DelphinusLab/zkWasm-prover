@@ -229,13 +229,19 @@ pub fn permutation_eval_h_l(
     gamma: &CudaDeviceBufRaw,
     p: &CudaDeviceBufRaw,
     n: usize,
+    stream: Option<cudaStream_t>,
 ) -> Result<(), Error> {
+    device.acitve_ctx()?;
     unsafe {
-        device.acitve_ctx()?;
-        let err =
-            bn254_c::permutation_eval_h_l(res.ptr(), beta.ptr(), gamma.ptr(), p.ptr(), n as i32);
+        let err = bn254_c::permutation_eval_h_l(
+            res.ptr(),
+            beta.ptr(),
+            gamma.ptr(),
+            p.ptr(),
+            n as i32,
+            stream.unwrap_or(0usize as _),
+        );
         to_result((), err, "fail to run permutation_eval_h_l")?;
-        device.synchronize()?;
     }
     Ok(())
 }

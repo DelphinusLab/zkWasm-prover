@@ -1058,11 +1058,12 @@ extern "C"
         const Bn254FrField *beta,
         const Bn254FrField *gamma,
         const Bn254FrField *p,
-        int n)
+        int n,
+        CUstream_st *stream)
     {
         int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
-        _permutation_eval_h_l<<<blocks, threads>>>(res, beta, gamma, p, n);
+        _permutation_eval_h_l<<<blocks, threads, 0, stream>>>(res, beta, gamma, p, n);
         return cudaGetLastError();
     }
 

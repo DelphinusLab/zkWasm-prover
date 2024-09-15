@@ -18,6 +18,7 @@ use halo2_proofs::transcript::TranscriptWrite;
 use crate::analyze::analyze_expr_tree;
 use crate::cuda::bn254::buffer_copy_with_shift;
 use crate::cuda::bn254::field_mul;
+use crate::cuda::bn254::field_op;
 use crate::cuda::bn254::field_op_v2;
 use crate::cuda::bn254::field_op_v3;
 use crate::cuda::bn254::field_sub;
@@ -232,18 +233,12 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
     fn extended_ntt_async(
         &mut self,
         data: &mut CudaDeviceBufRaw,
-    ) -> DeviceResult<(CudaStreamWrapper, CudaDeviceBufRaw)> {
-        let stream = CudaStreamWrapper::new();
+        stream: &CudaStreamWrapper,
+    ) -> DeviceResult<CudaDeviceBufRaw> {
         self.extended_ntt_prepare(data, Some(&stream))?;
         let tmp = self.extended_ntt_pure(data, Some(&stream))?;
 
-        Ok((stream, tmp))
-    }
-
-    fn extended_ntt_sync(&mut self, data: &mut CudaDeviceBufRaw) -> DeviceResult<()> {
-        let (stream, tmp) = self.extended_ntt_async(data)?;
-        self.extended_ntt_wait((stream, tmp))?;
-        Ok(())
+        Ok(tmp)
     }
 
     fn copy_and_extended_ntt_async(
@@ -689,36 +684,81 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                 {
                     let mut l_res = ctx.alloc()?;
                     let mut r_res = ctx.alloc()?;
-                    let p_coset_buf = ctx.alloc()?;
-                    device.copy_from_host_to_device(&p_coset_buf, &permutation.values[..])?;
 
                     device.copy_from_host_to_device(&l_res, value)?;
                     device
                         .copy_from_device_to_device::<C::Scalar>(&r_res, 0, &l_res, 0, ctx.size)?;
-                    permutation_eval_h_l(
-                        &device,
-                        &l_res,
-                        &beta_buf,
-                        &gamma_buf,
-                        &p_coset_buf,
-                        ctx.size,
-                    )?;
-                    ctx.extended_ntt_sync(&mut l_res)?;
-                    field_mul::<C::Scalar>(&device, &l, &l_res, ctx.extended_size)?;
 
-                    ctx.extended_ntt_prepare(&mut r_res, None)?;
-                    let coeff =
-                        pick_from_buf::<C::Scalar>(device, &r_res, 0, 1, ctx.extended_size)?;
-                    let short = vec![value[0] + gamma, coeff + curr_delta];
-                    device.copy_from_host_to_device(&r_res, &short[..])?;
-                    ctx.extended_ntt_pure(&mut r_res, None)?;
+                    let (l_sw, l_stream) = CudaStreamWrapper::new_with_inner();
+                    let (r_sw, r_stream) = CudaStreamWrapper::new_with_inner();
 
-                    field_mul::<C::Scalar>(&device, &r, &r_res, ctx.extended_size)?;
+                    let r_tmp = {
+                        ctx.extended_ntt_prepare(&mut r_res, Some(&r_sw))?;
+                        r_sw.sync();
+                        let coeff =
+                            pick_from_buf::<C::Scalar>(device, &r_res, 0, 1, ctx.extended_size)?;
+                        let short = vec![value[0] + gamma, coeff + curr_delta];
+                        device.copy_from_host_to_device_async(&r_res, &short[..], r_stream)?;
+                        let tmp = ctx.extended_ntt_pure(&mut r_res, Some(&r_sw))?;
+                        field_op::<C::Scalar>(
+                            &device,
+                            &r,
+                            Some(&r),
+                            0,
+                            None,
+                            Some(&r_res),
+                            0,
+                            None,
+                            ctx.extended_size,
+                            FieldOp::Mul,
+                            Some(r_stream),
+                        )?;
+                        tmp
+                    };
+
+                    let p_coset_buf = ctx.alloc()?;
+                    let l_tmp = {
+                        device.copy_from_host_to_device_async(
+                            &p_coset_buf,
+                            &permutation.values[..],
+                            l_stream,
+                        )?;
+                        permutation_eval_h_l(
+                            &device,
+                            &l_res,
+                            &beta_buf,
+                            &gamma_buf,
+                            &p_coset_buf,
+                            ctx.size,
+                            Some(l_stream),
+                        )?;
+                        let tmp = ctx.extended_ntt_async(&mut l_res, &l_sw)?;
+                        field_op::<C::Scalar>(
+                            &device,
+                            &l,
+                            Some(&l),
+                            0,
+                            None,
+                            Some(&l_res),
+                            0,
+                            None,
+                            ctx.extended_size,
+                            FieldOp::Mul,
+                            Some(l_stream),
+                        )?;
+                        tmp
+                    };
+
+                    r_sw.sync();
+                    l_sw.sync();
+
                     curr_delta *= &C::Scalar::DELTA;
 
-                    ctx.extended_allocator.push(l_res);
-                    ctx.extended_allocator.push(r_res);
-                    ctx.extended_allocator.push(p_coset_buf);
+                    ctx.free(l_res);
+                    ctx.free(r_res);
+                    ctx.free(p_coset_buf);
+                    ctx.free(r_tmp);
+                    ctx.free(l_tmp);
                 }
 
                 field_sub::<C::Scalar>(&device, &l, &r, ctx.extended_size)?;
