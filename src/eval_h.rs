@@ -47,7 +47,6 @@ use crate::pinned_page::PinnedPageAllocator;
 struct EvalHContext<'a, F: FieldExt> {
     device: &'a CudaDevice,
     y: Vec<F>,
-    extended_allocator: Vec<CudaDeviceBufRaw>,
     extended_k: usize,
     k: usize,
     size: usize,
@@ -60,16 +59,12 @@ struct EvalHContext<'a, F: FieldExt> {
 
 impl<'a, F: FieldExt> EvalHContext<'a, F> {
     fn alloc(&mut self) -> DeviceResult<CudaDeviceBufRaw> {
-        if let Some(buf) = self.extended_allocator.pop() {
-            Ok(buf)
-        } else {
-            self.device
-                .alloc_device_buffer_non_zeroed::<F>(self.extended_size)
-        }
+        self.device
+            .alloc_device_buffer_non_zeroed::<F>(self.extended_size)
     }
 
     fn free(&mut self, _buf: CudaDeviceBufRaw) {
-        //self.extended_allocator.push(buf);
+        // self.extended_allocator.push(buf);
     }
 }
 
@@ -118,10 +113,6 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
                             bufs.insert(id, buf);
                         }
                     }
-                }
-
-                for (_, buf) in last_bufs {
-                    self.extended_allocator.push(buf)
                 }
 
                 let mut last_stream_and_tmp = None;
@@ -461,10 +452,6 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
         ctx.to_coset = true;
         ctx.extended_ntt_prepare(&mut h_buf, None)?;
 
-        if ctx.size >= 1 << 23 {
-            ctx.extended_allocator.clear();
-        }
-
         let timer = start_timer!(|| format!("vanishing msm {}", domain.quotient_poly_degree));
         let mut buffers = vec![];
         for i in 0..domain.quotient_poly_degree as usize {
@@ -485,7 +472,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
             &g_buf,
             buffers
                 .iter()
-                .map(|x| x as &CudaDeviceBufRaw)
+                .map(|x| &x as &CudaDeviceBufRaw)
                 .collect::<Vec<_>>(),
             None,
             size,
@@ -582,7 +569,6 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
     let mut ctx = EvalHContext {
         device,
         y: vec![C::Scalar::one(), y],
-        extended_allocator: vec![],
         k,
         extended_k,
         size,
