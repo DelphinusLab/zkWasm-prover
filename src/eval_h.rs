@@ -64,8 +64,9 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
             .alloc_device_buffer_non_zeroed::<F>(self.extended_size)
     }
 
-    fn alloc_zeroed(&mut self) -> DeviceResult<CudaDeviceBufRaw> {
-        self.device.alloc_device_buffer::<F>(self.extended_size)
+    fn alloc_zeroed(&mut self, stream: &CudaStreamWrapper) -> DeviceResult<CudaDeviceBufRaw> {
+        self.device
+            .alloc_device_buffer_async::<F>(self.extended_size, stream)
     }
 
     fn free(&mut self, buf: CudaDeviceBufRaw) {
@@ -96,18 +97,21 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
 
     fn evaluate_prove_expr_with_async_ntt<'b>(
         &mut self,
-        device: &CudaDevice,
         exprs: &'b [Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>],
         fixed: &[&[F]],
         advice: &[&[F]],
         instance: &[&[F]],
-    ) -> DeviceResult<CudaDeviceBufRaw> {
-        let res = self.alloc_zeroed()?;
+    ) -> DeviceResult<(CudaDeviceBufRaw, (CudaStreamWrapper, Vec<CudaDeviceBufRaw>))> {
+        let (sw, stream) = CudaStreamWrapper::new_with_inner();
+        let res = self.alloc_zeroed(&sw)?;
 
         let mut last_bufs: HashMap<_, CudaDeviceBufRaw> = HashMap::new();
+        let mut pending_bufs = vec![];
         for expr in exprs.iter() {
             let coeffs = self.eval_ys(expr.iter().map(|(_, coeff)| coeff));
-            let coeffs_buf = device.alloc_device_buffer_from_slice(&coeffs[..])?;
+            let coeffs_buf = self
+                .device
+                .alloc_device_buffer_from_slice_async(&coeffs[..], stream)?;
 
             let mut bufs = HashMap::new();
             let mut group = vec![];
@@ -117,7 +121,9 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
                 let id = unit.get_group();
                 last_bufs.remove(&id).map(|buf| bufs.insert(id, buf));
             }
+            sw.sync();
             drop(last_bufs);
+            drop(pending_bufs);
 
             let pick = |unit: &'b _| match unit {
                 ProveExpressionUnit::Fixed {
@@ -172,12 +178,15 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
                 group.push(0usize as _);
             }
 
+            let group_buf = self
+                .device
+                .alloc_device_buffer_from_slice_async(&group[..], stream)?;
+            let rots_buf = self
+                .device
+                .alloc_device_buffer_from_slice_async(&rots[..], stream)?;
             for stream_and_tmp in stream_and_tmp_queue {
                 self.extended_ntt_wait(stream_and_tmp)?;
             }
-
-            let group_buf = device.alloc_device_buffer_from_slice(&group[..])?;
-            let rots_buf = device.alloc_device_buffer_from_slice(&rots[..])?;
 
             unsafe {
                 let err = field_op_batch_mul_sum(
@@ -186,16 +195,17 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
                     rots_buf.ptr(),
                     group.len() as i32,
                     self.extended_size as i32,
-                    0 as _,
+                    stream,
                 );
 
                 to_result((), err, "fail to run field_op_batch_mul_sum")?;
             }
 
             last_bufs = bufs;
+            pending_bufs = vec![group_buf, rots_buf];
         }
 
-        Ok(res)
+        Ok((res, (sw, pending_bufs)))
     }
 }
 
@@ -548,7 +558,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
 
     let timer = start_timer!(|| "evaluate_h gates");
     let exprs = analyze_expr_tree(&pk.ev.gpu_gates_expr[0], k);
-    let h_buf = ctx.evaluate_prove_expr_with_async_ntt(device, &exprs, fixed, advice, instance)?;
+    let (h_buf, _) = ctx.evaluate_prove_expr_with_async_ntt(&exprs, fixed, advice, instance)?;
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h prepare buffers for constants");
@@ -738,6 +748,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         device.alloc_device_buffer_from_slice(&[beta][..])?,
         device.alloc_device_buffer_from_slice(&[gamma][..])?,
     ];
+    let mut last_round_stream_and_buffers: Option<(CudaStreamWrapper, _)> = None;
     for (_i, (lookup, (permuted_input, permuted_table, input, table, z))) in pk
         .vk
         .cs
@@ -758,23 +769,40 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         );
 
         let degs = [input_deg, table_deg];
-        let host_bufs = [&**input, &**table];
+        let host_bufs = [&**input, &**permuted_input, &**table, &**permuted_table];
+
+        let (z_buf, z_stream_and_tmp) = ctx.copy_and_extended_ntt_async(z)?;
+
+        last_round_stream_and_buffers.map(|(sw, buffers)| {
+            sw.sync();
+            for buffer in buffers {
+                ctx.free(buffer);
+            }
+        });
 
         let mut bufs = vec![];
-        let mut streams = vec![];
+        let mut last_waiting = z_stream_and_tmp;
         for i in 0..2 {
             if degs[i] > 1 {
-                bufs.push(ctx.evaluate_prove_expr_with_async_ntt(
-                    device,
+                let (buf, pendings) = ctx.evaluate_prove_expr_with_async_ntt(
                     &expr[i..i + 1],
                     fixed,
                     advice,
                     instance,
-                )?);
+                )?;
+                bufs.push(buf);
+
+                ctx.extended_ntt_wait(last_waiting)?;
+                let (permuted_buf, stream_and_tmp) =
+                    ctx.copy_and_extended_ntt_async(host_bufs[i * 2 + 1])?;
+                last_waiting = stream_and_tmp;
+                bufs.push(permuted_buf);
+
+                drop(pendings);
             } else {
                 let (sw, stream) = CudaStreamWrapper::new_with_inner();
                 let mut buf = ctx.alloc()?;
-                device.copy_from_host_to_device_async(&buf, &host_bufs[i], stream)?;
+                device.copy_from_host_to_device_async(&buf, &host_bufs[i * 2], stream)?;
 
                 let mut tmp_buf = ctx.alloc()?;
                 field_op::<C::Scalar>(
@@ -808,14 +836,19 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                     Some(&sw),
                 )?;
                 bufs.push(buf);
-                streams.push((sw, tmp_buf));
+
+                ctx.extended_ntt_wait(last_waiting)?;
+                let (permuted_buf, stream_and_tmp) =
+                    ctx.copy_and_extended_ntt_async(host_bufs[i * 2 + 1])?;
+
+                ctx.extended_ntt_wait((sw, tmp_buf))?;
+                last_waiting = stream_and_tmp;
+                bufs.push(permuted_buf);
             }
         }
-        let [input_buf, table_buf]: [_; 2] = bufs.try_into().unwrap();
-
-        let bufs =
-            ctx.batch_copy_and_extended_ntt_async(&[*z, permuted_input, permuted_table], streams)?;
-        let [z_buf, permuted_input_buf, permuted_table_buf]: [_; 3] = bufs.try_into().unwrap();
+        let [input_buf, permuted_input_buf, table_buf, permuted_table_buf]: [_; 4] =
+            bufs.try_into().unwrap();
+        ctx.extended_ntt_wait(last_waiting)?;
 
         let (sw, stream) = CudaStreamWrapper::new_with_inner();
         unsafe {
@@ -839,17 +872,17 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
 
             to_result((), err, "fail to run field_op_batch_mul_sum")?;
         }
-        sw.sync();
 
-        for buf in [
-            input_buf,
-            table_buf,
-            permuted_input_buf,
-            permuted_table_buf,
-            z_buf,
-        ] {
-            ctx.free(buf);
-        }
+        last_round_stream_and_buffers = Some((
+            sw,
+            [
+                input_buf,
+                table_buf,
+                permuted_input_buf,
+                permuted_table_buf,
+                z_buf,
+            ],
+        ));
     }
     end_timer!(timer);
 
@@ -961,10 +994,10 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
             let [e1, e2] =
                 flatten_shuffle_expression(&input_expressions, &table_expressions, beta, theta);
 
-            let input_buf =
-                ctx.evaluate_prove_expr_with_async_ntt(device, &vec![e1], fixed, advice, instance)?;
-            let table_buf =
-                ctx.evaluate_prove_expr_with_async_ntt(device, &vec![e2], fixed, advice, instance)?;
+            let (input_buf, _) =
+                ctx.evaluate_prove_expr_with_async_ntt(&vec![e1], fixed, advice, instance)?;
+            let (table_buf, _) =
+                ctx.evaluate_prove_expr_with_async_ntt(&vec![e2], fixed, advice, instance)?;
             let z_buf = ctx.copy_and_extended_ntt_sync(z)?;
 
             let timer = start_timer!(|| "shuffle_eval_h");

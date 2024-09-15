@@ -163,7 +163,12 @@ impl CudaDevice {
         }
     }
 
-    fn _alloc_device_buffer<T>(&self, size: usize, zero: bool) -> DeviceResult<CudaDeviceBufRaw> {
+    fn _alloc_device_buffer<T>(
+        &self,
+        size: usize,
+        zero: bool,
+        stream: Option<cudaStream_t>,
+    ) -> DeviceResult<CudaDeviceBufRaw> {
         //println!("alloc device memory {}", size * mem::size_of::<T>());
         //self.print_memory_info()?;
         unsafe {
@@ -179,7 +184,12 @@ impl CudaDevice {
                         size,
                     };
                     if zero {
-                        cuda_runtime_sys::cudaMemset(ret.ptr(), 0, size);
+                        cuda_runtime_sys::cudaMemsetAsync(
+                            ret.ptr(),
+                            0,
+                            size,
+                            stream.unwrap_or(0usize as _),
+                        );
                     }
                     return Ok(ret);
                 }
@@ -201,7 +211,7 @@ impl CudaDevice {
                 let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
                 let ptr = allocator.alloc(size);
                 if zero {
-                    cuda_runtime_sys::cudaMemset(ptr, 0, size);
+                    cuda_runtime_sys::cudaMemsetAsync(ptr, 0, size, stream.unwrap_or(0usize as _));
                 }
                 Ok(CudaDeviceBufRaw {
                     ptr,
@@ -210,6 +220,14 @@ impl CudaDevice {
                 })
             }
         }
+    }
+
+    pub(crate) fn alloc_device_buffer_async<T>(
+        &self,
+        size: usize,
+        stream: &CudaStreamWrapper,
+    ) -> DeviceResult<CudaDeviceBufRaw> {
+        self._alloc_device_buffer::<T>(size, true, Some(stream.into()))
     }
 
     pub fn copy_from_device_to_device_async<T>(
@@ -237,13 +255,13 @@ impl CudaDevice {
         data: &[T],
         stream: cudaStream_t,
     ) -> DeviceResult<CudaDeviceBufRaw> {
-        let buf = self._alloc_device_buffer::<T>(data.len(), false)?;
+        let buf = self._alloc_device_buffer::<T>(data.len(), false, None)?;
         self.copy_from_host_to_device_async(&buf, data, stream)?;
         Ok(buf)
     }
 
     pub fn alloc_device_buffer_non_zeroed<T>(&self, size: usize) -> DeviceResult<CudaDeviceBufRaw> {
-        self._alloc_device_buffer::<T>(size, false)
+        self._alloc_device_buffer::<T>(size, false, None)
     }
 }
 
@@ -280,11 +298,11 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
     }
 
     fn alloc_device_buffer<T>(&self, size: usize) -> DeviceResult<CudaDeviceBufRaw> {
-        self._alloc_device_buffer::<T>(size, true)
+        self._alloc_device_buffer::<T>(size, true, None)
     }
 
     fn alloc_device_buffer_from_slice<T>(&self, data: &[T]) -> DeviceResult<CudaDeviceBufRaw> {
-        let buf = self._alloc_device_buffer::<T>(data.len(), false)?;
+        let buf = self._alloc_device_buffer::<T>(data.len(), false, None)?;
         self.copy_from_host_to_device(&buf, data)?;
         Ok(buf)
     }
