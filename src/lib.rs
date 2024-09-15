@@ -314,7 +314,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
     {
         let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
-        let count = if k < 23 { 140 } else { 64 };
+        let count = if k < 23 { 140 } else { 65 };
         allocator.reset((1 << k) * core::mem::size_of::<C::Scalar>(), count);
     }
 
@@ -700,7 +700,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         let mut delta_omega =
                             C::Scalar::DELTA.pow_vartime([i as u64 * chunk_len as u64]);
 
-                        let chunk_size = size >> 2;
+                        let chunk_size = size >> 3;
                         // Iterate over each column of the permutation
                         for (j, (&column, permuted_column_values)) in
                             columns.iter().zip(permutations.iter()).enumerate()
@@ -943,7 +943,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             .map(|i| beta.pow_vartime([1 + i as u64, 0, 0, 0]))
                             .collect();
 
-                        let chunk_size = size >> 2;
+                        let chunk_size = size >> 3;
                         group.iter().zip(beta_pows.iter()).enumerate().for_each(
                             |(j, (e, beta_pow_i))| {
                                 modified_values
@@ -981,7 +981,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     .collect::<Vec<_>>();
 
                 p_z.par_iter_mut().for_each(|z| {
-                    let chunks = 4;
+                    let chunks = 8;
                     let chunk_size = (size + chunks - 1) / chunks;
 
                     let mut tails = z
