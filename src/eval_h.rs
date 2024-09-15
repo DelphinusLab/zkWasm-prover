@@ -17,11 +17,7 @@ use halo2_proofs::transcript::TranscriptWrite;
 
 use crate::analyze::analyze_expr_tree;
 use crate::cuda::bn254::buffer_copy_with_shift;
-use crate::cuda::bn254::field_mul;
 use crate::cuda::bn254::field_op;
-use crate::cuda::bn254::field_op_v2;
-use crate::cuda::bn254::field_op_v3;
-use crate::cuda::bn254::field_sub;
 use crate::cuda::bn254::permutation_eval_h_l;
 use crate::cuda::bn254::permutation_eval_h_p1;
 use crate::cuda::bn254::permutation_eval_h_p2;
@@ -530,13 +526,11 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
                     size: size * core::mem::size_of::<C::Scalar>(),
                 })
             };
-            field_op_v3(
+            field_op::<C::Scalar>(
                 device,
                 &last_ptr,
-                Some(&last_ptr),
-                Some(&xn_buf),
-                Some(&curr_ptr),
-                None,
+                (&last_ptr as &CudaDeviceBufRaw, &xn_buf),
+                &curr_ptr as &CudaDeviceBufRaw,
                 size,
                 FieldOp::Add,
                 None,
@@ -662,16 +656,15 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                 .zip(pk.vk.cs.permutation.columns.chunks(chunk_len))
                 .zip(pk.permutation.polys.chunks(chunk_len))
             {
-                let l = ctx.alloc()?;
+                let l_acc = ctx.alloc()?;
+                let r_acc = extended_p_buf;
                 buffer_copy_with_shift::<C::Scalar>(
                     &device,
-                    &l,
-                    &extended_p_buf,
+                    &l_acc,
+                    &r_acc,
                     1 << (extended_k - k),
                     ctx.extended_size,
                 )?;
-
-                let r = extended_p_buf;
 
                 for (value, permutation) in columns
                     .iter()
@@ -702,13 +695,9 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                         let tmp = ctx.extended_ntt_pure(&mut r_res, Some(&r_sw))?;
                         field_op::<C::Scalar>(
                             &device,
-                            &r,
-                            Some(&r),
-                            0,
-                            None,
-                            Some(&r_res),
-                            0,
-                            None,
+                            &r_acc,
+                            &r_acc,
+                            &r_res,
                             ctx.extended_size,
                             FieldOp::Mul,
                             Some(r_stream),
@@ -735,13 +724,9 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                         let tmp = ctx.extended_ntt_async(&mut l_res, &l_sw)?;
                         field_op::<C::Scalar>(
                             &device,
-                            &l,
-                            Some(&l),
-                            0,
-                            None,
-                            Some(&l_res),
-                            0,
-                            None,
+                            &l_acc,
+                            &l_acc,
+                            &l_res,
                             ctx.extended_size,
                             FieldOp::Mul,
                             Some(l_stream),
@@ -761,21 +746,36 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                     ctx.free(l_tmp);
                 }
 
-                field_sub::<C::Scalar>(&device, &l, &r, ctx.extended_size)?;
-                field_mul::<C::Scalar>(&device, &l, &l_active_buf, ctx.extended_size)?;
-                field_op_v2::<C::Scalar>(
+                field_op::<C::Scalar>(
+                    &device,
+                    &l_acc,
+                    &l_acc,
+                    &r_acc,
+                    ctx.extended_size,
+                    FieldOp::Sub,
+                    None,
+                )?;
+                field_op::<C::Scalar>(
+                    &device,
+                    &l_acc,
+                    &l_acc,
+                    &l_active_buf,
+                    ctx.extended_size,
+                    FieldOp::Mul,
+                    None,
+                )?;
+                field_op::<C::Scalar>(
                     &device,
                     &h_buf,
-                    Some(&h_buf),
-                    Some(y),
-                    Some(&l),
-                    None,
+                    (&h_buf, 0, y),
+                    &l_acc,
                     ctx.extended_size,
                     FieldOp::Add,
+                    None,
                 )?;
 
-                ctx.extended_allocator.push(l);
-                ctx.extended_allocator.push(r);
+                ctx.free(l_acc);
+                ctx.free(r_acc);
             }
         }
     }
@@ -825,13 +825,11 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                 device.copy_from_host_to_device_async(&buf, &host_bufs[i], stream)?;
 
                 let mut tmp_buf = ctx.alloc()?;
-                field_op_v3(
+                field_op::<C::Scalar>(
                     device,
                     &buf,
-                    Some(&buf),
-                    None,
-                    None,
-                    Some(&challenge_bufs[i]),
+                    &buf,
+                    ((), &challenge_bufs[i]),
                     size,
                     FieldOp::Add,
                     Some(stream),

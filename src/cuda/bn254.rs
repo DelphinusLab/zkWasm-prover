@@ -5,6 +5,7 @@ use crate::device::Error;
 
 use cuda_runtime_sys::cudaStream_t;
 use halo2_proofs::arithmetic::FieldExt;
+use libc::c_void;
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum FieldOp {
@@ -14,56 +15,108 @@ pub(crate) enum FieldOp {
     Sub = 3,
 }
 
-pub(crate) fn field_op_v2<F: FieldExt>(
+pub(crate) trait FieldOpArgs<F: FieldExt> {
+    fn ptr(&self) -> *mut c_void {
+        0 as *mut _
+    }
+    fn rot(&self) -> i32 {
+        0
+    }
+    fn constant(&self) -> Option<F> {
+        None
+    }
+    fn constant_ptr(&self) -> *mut c_void {
+        0 as *mut _
+    }
+}
+
+impl<F: FieldExt> FieldOpArgs<F> for Option<F> {
+    fn constant(&self) -> Option<F> {
+        match self {
+            Some(f) => Some(*f),
+            None => None,
+        }
+    }
+}
+
+impl<'a, F: FieldExt> FieldOpArgs<F> for &'a CudaDeviceBufRaw {
+    fn ptr(&self) -> *mut c_void {
+        (*self).ptr()
+    }
+}
+
+impl<'a, F: FieldExt> FieldOpArgs<F> for (&'a CudaDeviceBufRaw, i32) {
+    fn ptr(&self) -> *mut c_void {
+        (*self).0.ptr()
+    }
+    fn rot(&self) -> i32 {
+        self.1
+    }
+}
+
+impl<'a, F: FieldExt> FieldOpArgs<F> for (&'a CudaDeviceBufRaw, i32, F) {
+    fn ptr(&self) -> *mut c_void {
+        (*self).0.ptr()
+    }
+    fn rot(&self) -> i32 {
+        self.1
+    }
+    fn constant(&self) -> Option<F> {
+        Some(self.2)
+    }
+}
+
+impl<'a, F: FieldExt> FieldOpArgs<F> for (&'a CudaDeviceBufRaw, &'a CudaDeviceBufRaw) {
+    fn ptr(&self) -> *mut c_void {
+        (*self).0.ptr()
+    }
+    fn constant_ptr(&self) -> *mut c_void {
+        (*self).1.ptr()
+    }
+}
+
+impl<'a, F: FieldExt> FieldOpArgs<F> for ((), &'a CudaDeviceBufRaw) {
+    fn constant_ptr(&self) -> *mut c_void {
+        (*self).1.ptr()
+    }
+}
+
+pub(crate) fn field_op<F: FieldExt>(
     device: &CudaDevice,
     res: &CudaDeviceBufRaw,
-    l: Option<&CudaDeviceBufRaw>,
-    l_c: Option<F>,
-    r: Option<&CudaDeviceBufRaw>,
-    r_c: Option<F>,
+    l: impl FieldOpArgs<F>,
+    r: impl FieldOpArgs<F>,
     size: usize,
     op: FieldOp,
+    stream: Option<cudaStream_t>,
 ) -> Result<(), Error> {
-    field_op(device, res, l, 0, l_c, r, 0, r_c, size, op, None)?;
+    device.acitve_ctx()?;
 
-    Ok(())
-}
+    let l_c = match l.constant() {
+        Some(c) => Some(device.alloc_device_buffer_from_slice([c].as_slice())?),
+        None => None,
+    };
 
-pub(crate) fn field_sub<F: FieldExt>(
-    device: &CudaDevice,
-    res: &CudaDeviceBufRaw,
-    rhs: &CudaDeviceBufRaw,
-    size: usize,
-) -> Result<(), Error> {
-    field_op_v2::<F>(
-        device,
-        res,
-        Some(res),
-        None,
-        Some(rhs),
-        None,
-        size,
-        FieldOp::Sub,
-    )?;
-    Ok(())
-}
+    let r_c = match r.constant() {
+        Some(c) => Some(device.alloc_device_buffer_from_slice([c].as_slice())?),
+        None => None,
+    };
 
-pub(crate) fn field_mul<F: FieldExt>(
-    device: &CudaDevice,
-    res: &CudaDeviceBufRaw,
-    rhs: &CudaDeviceBufRaw,
-    size: usize,
-) -> Result<(), Error> {
-    field_op_v2::<F>(
-        device,
-        res,
-        Some(res),
-        None,
-        Some(rhs),
-        None,
-        size,
-        FieldOp::Mul,
-    )?;
+    unsafe {
+        let err = bn254_c::field_op(
+            res.ptr(),
+            l.ptr(),
+            l.rot(),
+            l_c.as_ref().map_or(l.constant_ptr(), |x| x.ptr()),
+            r.ptr(),
+            r.rot(),
+            r_c.as_ref().map_or(r.constant_ptr(), |x| x.ptr()),
+            size as i32,
+            op as i32,
+            stream.unwrap_or(0usize as _),
+        );
+        to_result((), err, "fail to run field_op")?;
+    }
     Ok(())
 }
 
@@ -89,79 +142,6 @@ pub(crate) fn pick_from_buf<F: FieldExt>(
         to_result((), err, "fail to pick_from_buf")?;
     }
     Ok(v[0])
-}
-
-pub(crate) fn field_op_v3(
-    device: &CudaDevice,
-    res: &CudaDeviceBufRaw,
-    l: Option<&CudaDeviceBufRaw>,
-    l_c: Option<&CudaDeviceBufRaw>,
-    r: Option<&CudaDeviceBufRaw>,
-    r_c: Option<&CudaDeviceBufRaw>,
-    size: usize,
-    op: FieldOp,
-    stream: Option<cudaStream_t>,
-) -> Result<(), Error> {
-    unsafe {
-        device.acitve_ctx()?;
-        let err = bn254_c::field_op(
-            res.ptr(),
-            l.map_or(0usize as *mut _, |x| x.ptr()),
-            0,
-            l_c.as_ref().map_or(0usize as *mut _, |x| x.ptr()),
-            r.map_or(0usize as *mut _, |x| x.ptr()),
-            0,
-            r_c.as_ref().map_or(0usize as *mut _, |x| x.ptr()),
-            size as i32,
-            op as i32,
-            stream.unwrap_or(0usize as _),
-        );
-        to_result((), err, "fail to run field_op")?;
-    }
-    Ok(())
-}
-
-pub(crate) fn field_op<F: FieldExt>(
-    device: &CudaDevice,
-    res: &CudaDeviceBufRaw,
-    l: Option<&CudaDeviceBufRaw>,
-    l_rot: i32,
-    l_c: Option<F>,
-    r: Option<&CudaDeviceBufRaw>,
-    r_rot: i32,
-    r_c: Option<F>,
-    size: usize,
-    op: FieldOp,
-    stream: Option<cudaStream_t>,
-) -> Result<(), Error> {
-    let l_c = if l_c.is_none() {
-        None
-    } else {
-        Some(device.alloc_device_buffer_from_slice([l_c.unwrap()].as_slice())?)
-    };
-    let r_c = if r_c.is_none() {
-        None
-    } else {
-        Some(device.alloc_device_buffer_from_slice([r_c.unwrap()].as_slice())?)
-    };
-
-    unsafe {
-        device.acitve_ctx()?;
-        let err = bn254_c::field_op(
-            res.ptr(),
-            l.map_or(0usize as *mut _, |x| x.ptr()),
-            l_rot,
-            l_c.as_ref().map_or(0usize as *mut _, |x| x.ptr()),
-            r.map_or(0usize as *mut _, |x| x.ptr()),
-            r_rot,
-            r_c.as_ref().map_or(0usize as *mut _, |x| x.ptr()),
-            size as i32,
-            op as i32,
-            stream.unwrap_or(0usize as _),
-        );
-        to_result((), err, "fail to run field_op")?;
-    }
-    Ok(())
 }
 
 // plonk permutation

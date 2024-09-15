@@ -29,7 +29,7 @@ pub(crate) mod gwc {
     use rayon::iter::ParallelIterator;
     use std::collections::BTreeMap;
 
-    use crate::cuda::bn254::field_op_v3;
+    use crate::cuda::bn254::field_op;
     use crate::cuda::bn254::FieldOp;
     use crate::cuda::msm::batch_msm;
     use crate::device::cuda::CudaDevice;
@@ -112,13 +112,11 @@ pub(crate) mod gwc {
                     vs.push(*vs.last().unwrap() * v);
                 }
                 device.copy_from_host_to_device_async(&v_buf, &[vs[inner_idx]][..], 0usize as _)?;
-                field_op_v3(
+                field_op::<C::Scalar>(
                     device,
                     &bufs[rot_idx],
-                    Some(&bufs[rot_idx]),
-                    None,
-                    Some(&tmp_buf),
-                    Some(&v_buf),
+                    &bufs[rot_idx],
+                    (&tmp_buf, &v_buf),
                     size,
                     FieldOp::Add,
                     None,
@@ -191,7 +189,7 @@ pub mod shplonk {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
-    use crate::cuda::bn254::field_op_v3;
+    use crate::cuda::bn254::field_op;
     use crate::cuda::bn254::FieldOp;
     use crate::cuda::msm::batch_msm;
     use crate::cuda::ntt::ntt_raw;
@@ -342,13 +340,11 @@ pub mod shplonk {
 
                         calc_streams.0.sync();
 
-                        field_op_v3(
+                        field_op::<C::Scalar>(
                             device,
                             &v_buf,
-                            Some(&v_buf),
-                            Some(&y_buf),
-                            Some(&poly_buf),
-                            None,
+                            (&v_buf, &y_buf),
+                            &poly_buf,
                             size,
                             FieldOp::Add,
                             Some(calc_streams.1),
@@ -390,15 +386,14 @@ pub mod shplonk {
             device.copy_from_device_to_device::<C::Scalar>(&poly_buf, 0, poly, 0, size)?;
             device.copy_from_host_to_device(&point_buf, &evals[..])?;
 
-            crate::cuda::bn254::field_op_v2::<C::ScalarExt>(
+            field_op::<C::Scalar>(
                 &device,
                 &poly_buf,
-                Some(&poly),
-                None,
-                Some(&point_buf),
-                None,
+                &poly_buf,
+                &point_buf,
                 evals.len(),
                 FieldOp::Sub,
+                None,
             )?;
 
             let diffs: Vec<C::Scalar> = super_point_set
@@ -502,13 +497,11 @@ pub mod shplonk {
         let z_buf = device.alloc_device_buffer::<C::Scalar>(1)?;
         for (_, (poly_buf, z_i)) in lx_parts.into_iter().enumerate() {
             device.copy_from_host_to_device(&z_buf, &[z_i][..])?;
-            field_op_v3(
+            field_op::<C::Scalar>(
                 device,
                 &fz_buf,
-                Some(&fz_buf),
-                Some(&v_buf),
-                Some(&poly_buf),
-                Some(&z_buf),
+                (&fz_buf, &v_buf),
+                (&poly_buf, &z_buf),
                 size,
                 FieldOp::Add,
                 None,
@@ -517,13 +510,11 @@ pub mod shplonk {
 
         let zt_eval_buf = v_buf;
         device.copy_from_host_to_device(&zt_eval_buf, &[zt_eval][..])?;
-        field_op_v3(
+        field_op::<C::Scalar>(
             device,
             &fz_buf,
-            Some(&fz_buf),
-            None,
-            Some(&hx_buf),
-            Some(&zt_eval_buf),
+            &fz_buf,
+            (&hx_buf, &zt_eval_buf),
             size,
             FieldOp::Sub,
             None,
@@ -532,12 +523,10 @@ pub mod shplonk {
 
         let z_diff_0_inv_buf = zt_eval_buf;
         device.copy_from_host_to_device(&z_diff_0_inv_buf, &[z_diff_0_inv][..])?;
-        field_op_v3(
+        field_op::<C::Scalar>(
             device,
             &fz_buf,
-            Some(&fz_buf),
-            Some(&z_diff_0_inv_buf),
-            None,
+            (&fz_buf, &z_diff_0_inv_buf),
             None,
             size,
             FieldOp::UOp,
