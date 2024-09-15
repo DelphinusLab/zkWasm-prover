@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::mem::swap;
 use std::mem::ManuallyDrop;
 
 use ark_std::end_timer;
 use ark_std::iterable::Iterable;
 use ark_std::start_timer;
-use cuda_runtime_sys::cudaMemset;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
@@ -63,104 +64,122 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
             .alloc_device_buffer_non_zeroed::<F>(self.extended_size)
     }
 
-    fn free(&mut self, _buf: CudaDeviceBufRaw) {
-        // self.extended_allocator.push(buf);
+    fn alloc_zeroed(&mut self) -> DeviceResult<CudaDeviceBufRaw> {
+        self.device.alloc_device_buffer::<F>(self.extended_size)
+    }
+
+    fn free(&mut self, buf: CudaDeviceBufRaw) {
+        drop(buf)
     }
 }
 
 impl<'a, F: FieldExt> EvalHContext<'a, F> {
-    fn eval_ys(&mut self, ys: &BTreeMap<u32, F>) -> F {
-        let max_y_order = *ys.keys().max().unwrap();
-        for _ in (self.y.len() as u32)..=max_y_order {
-            self.y.push(self.y[1] * self.y.last().unwrap());
+    fn eval_ys_unit(&mut self, index: usize) -> F {
+        while self.y.len() <= index {
+            self.y.push(self.y[1] * self.y.last().unwrap())
         }
-        ys.iter().fold(F::zero(), |acc, (y_order, f)| {
-            acc + self.y[*y_order as usize] * f
-        })
+
+        self.y[index]
     }
 
-    fn evaluate_prove_expr_with_async_ntt(
+    fn eval_ys<'b>(&mut self, ys_iter: impl Iterator<Item = &'b BTreeMap<u32, F>>) -> Vec<F> {
+        let mut res = vec![];
+        for ys in ys_iter {
+            let mut acc = F::zero();
+            for (ys, f) in ys.iter() {
+                acc = acc + self.eval_ys_unit(*ys as usize) * f
+            }
+            res.push(acc);
+        }
+        res
+    }
+
+    fn evaluate_prove_expr_with_async_ntt<'b>(
         &mut self,
         device: &CudaDevice,
-        exprs: &[Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>],
+        exprs: &'b [Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>],
         fixed: &[&[F]],
         advice: &[&[F]],
         instance: &[&[F]],
     ) -> DeviceResult<CudaDeviceBufRaw> {
-        let res = self.alloc()?;
-        unsafe {
-            cudaMemset(res.ptr(), 0, self.extended_size * core::mem::size_of::<F>());
-        }
+        let res = self.alloc_zeroed()?;
 
-        let mut last_bufs = BTreeMap::new();
+        let mut last_bufs: HashMap<_, CudaDeviceBufRaw> = HashMap::new();
         for expr in exprs.iter() {
-            let coeffs = expr
-                .iter()
-                .map(|(_, ys)| self.eval_ys(ys))
-                .collect::<Vec<_>>();
+            let coeffs = self.eval_ys(expr.iter().map(|(_, coeff)| coeff));
             let coeffs_buf = device.alloc_device_buffer_from_slice(&coeffs[..])?;
 
-            let mut bufs = BTreeMap::new();
+            let mut bufs = HashMap::new();
+            let mut group = vec![];
+            let mut rots = vec![];
+
+            for (unit, _) in expr.iter().flat_map(|(units, _)| units.iter()) {
+                let id = unit.get_group();
+                last_bufs.remove(&id).map(|buf| bufs.insert(id, buf));
+            }
+            drop(last_bufs);
+
+            let pick = |unit: &'b _| match unit {
+                ProveExpressionUnit::Fixed {
+                    column_index,
+                    rotation,
+                } => (&fixed[column_index.clone()], rotation),
+                ProveExpressionUnit::Advice {
+                    column_index,
+                    rotation,
+                } => (&advice[column_index.clone()], rotation),
+                ProveExpressionUnit::Instance {
+                    column_index,
+                    rotation,
+                } => (&instance[column_index.clone()], rotation),
+            };
+
+            let mut stream_and_tmp_queue = vec![];
+            let mut index = 0;
+            for (unit, _) in expr.iter().flat_map(|(units, _)| units.iter()) {
+                let id = unit.get_group();
+                let (src, _) = pick(unit);
+                if !bufs.contains_key(&id) {
+                    let (buf, mut stream_and_tmp) = self.copy_and_extended_ntt_async(src)?;
+                    bufs.insert(id, buf);
+                    if stream_and_tmp_queue.len() >= 2 {
+                        swap(&mut stream_and_tmp, &mut stream_and_tmp_queue[index & 1]);
+                        index += 1;
+                        self.extended_ntt_wait(stream_and_tmp)?;
+                    } else {
+                        stream_and_tmp_queue.push(stream_and_tmp)
+                    }
+                }
+            }
+
+            for (i, (units, _)) in expr.iter().enumerate() {
+                group.push(unsafe {
+                    coeffs_buf
+                        .ptr()
+                        .offset((i * core::mem::size_of::<F>()) as isize)
+                });
+
+                for (unit, exp) in units {
+                    let id = unit.get_group();
+                    let (_, rot) = pick(unit);
+
+                    for _ in 0..*exp {
+                        group.push(bufs.get(&id).unwrap().ptr());
+                        rots.push(rot.0 << (self.extended_k - self.k));
+                    }
+                }
+
+                group.push(0usize as _);
+            }
+
+            for stream_and_tmp in stream_and_tmp_queue {
+                self.extended_ntt_wait(stream_and_tmp)?;
+            }
+
+            let group_buf = device.alloc_device_buffer_from_slice(&group[..])?;
+            let rots_buf = device.alloc_device_buffer_from_slice(&rots[..])?;
+
             unsafe {
-                let mut group = vec![];
-                let mut rots = vec![];
-
-                for (units, _) in expr.iter() {
-                    for (u, _) in units {
-                        let id = u.get_group();
-                        if !bufs.contains_key(&id) && last_bufs.contains_key(&id) {
-                            let buf = last_bufs.remove(&id).unwrap();
-                            bufs.insert(id, buf);
-                        }
-                    }
-                }
-
-                let mut last_stream_and_tmp = None;
-                for (i, (units, _)) in expr.iter().enumerate() {
-                    group.push(
-                        coeffs_buf
-                            .ptr()
-                            .offset((i * core::mem::size_of::<F>()) as isize),
-                    );
-
-                    for (u, exp) in units {
-                        let id = u.get_group();
-                        let (src, rot) = match u {
-                            ProveExpressionUnit::Fixed {
-                                column_index,
-                                rotation,
-                            } => (&fixed[*column_index], rotation),
-                            ProveExpressionUnit::Advice {
-                                column_index,
-                                rotation,
-                            } => (&advice[*column_index], rotation),
-                            ProveExpressionUnit::Instance {
-                                column_index,
-                                rotation,
-                            } => (&instance[*column_index], rotation),
-                        };
-                        if !bufs.contains_key(&id) {
-                            let (buf, stream_and_tmp) = self.copy_and_extended_ntt_async(src)?;
-                            if let Some(stream_and_tmp) = last_stream_and_tmp {
-                                self.extended_ntt_wait(stream_and_tmp)?;
-                            }
-                            last_stream_and_tmp = Some(stream_and_tmp);
-                            bufs.insert(id, buf);
-                        }
-                        for _ in 0..*exp {
-                            group.push(bufs.get(&id).unwrap().ptr());
-                            rots.push(rot.0 << (self.extended_k - self.k));
-                        }
-                    }
-
-                    group.push(0usize as _);
-                }
-
-                last_stream_and_tmp.map(|stream_and_tmp| self.extended_ntt_wait(stream_and_tmp));
-
-                let group_buf = device.alloc_device_buffer_from_slice(&group[..])?;
-                let rots_buf = device.alloc_device_buffer_from_slice(&rots[..])?;
-
                 let err = field_op_batch_mul_sum(
                     res.ptr(),
                     group_buf.ptr(),
@@ -171,9 +190,9 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
                 );
 
                 to_result((), err, "fail to run field_op_batch_mul_sum")?;
-
-                last_bufs = bufs;
             }
+
+            last_bufs = bufs;
         }
 
         Ok(res)
@@ -297,59 +316,6 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
         self.free(tmp_buf);
         Ok(())
     }
-}
-
-pub fn _export_evaluate_h_gates<C: CurveAffine>(
-    pk: &ProvingKey<C>,
-    fixed: &[&[C::Scalar]],
-    advice: &[&[C::Scalar]],
-    instance: &[&[C::Scalar]],
-    permutation_products: &[&[C::Scalar]],
-    lookup_products: &mut [(
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-    )],
-    shuffle_products: &[&[C::Scalar]],
-    y: C::Scalar,
-    beta: C::Scalar,
-    gamma: C::Scalar,
-    theta: C::Scalar,
-    res: &mut [C::Scalar],
-) {
-    let device = CudaDevice::get_device(0).unwrap();
-    let (intt_omegas_buf, intt_pq_buf) = generate_ntt_buffers(
-        &device,
-        pk.get_vk().domain.get_omega_inv(),
-        pk.vk.domain.k() as usize,
-    )
-    .unwrap();
-    let intt_divisor_buf = device
-        .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])
-        .unwrap();
-
-    let (_, h_buf) = evaluate_h_gates_core(
-        &device,
-        pk,
-        fixed,
-        advice,
-        instance,
-        permutation_products,
-        lookup_products,
-        shuffle_products,
-        y,
-        beta,
-        gamma,
-        theta,
-        intt_pq_buf,
-        intt_omegas_buf,
-        intt_divisor_buf,
-    )
-    .unwrap();
-
-    device.copy_from_device_to_host(res, &h_buf).unwrap();
 }
 
 pub(crate) fn evaluate_h_gates_and_vanishing_construct<
