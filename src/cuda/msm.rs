@@ -4,6 +4,7 @@ use crate::cuda::ntt::ntt_raw;
 use crate::device::cuda::{CudaBuffer, CudaDevice, CudaDeviceBufRaw, CudaStreamWrapper};
 use crate::device::Error;
 use crate::device::{Device, DeviceResult};
+use crate::ADD_RANDOM;
 
 use halo2_proofs::arithmetic::{CurveAffine, FieldExt};
 use icicle_bn254::curve::BaseField;
@@ -146,6 +147,9 @@ fn copy_and_to_affine<C: CurveAffine>(
 
         let res = to_affine(&msm_host_result[0]);
         if res.is_some() {
+            if !ADD_RANDOM {
+                println!("commitment is {:?}", res);
+            }
             return Ok(res.unwrap());
         }
 

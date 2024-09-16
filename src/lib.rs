@@ -526,6 +526,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let theta: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
+        if !ADD_RANDOM {
+            println!("challenge is {:?}", theta);
+        }
+
         let timer = start_timer!(|| "wait single lookups");
         let (
             mut single_unit_lookups,
@@ -663,6 +667,13 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let beta: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
         let gamma: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
+
+        if !ADD_RANDOM {
+            println!("challenge is {:?}", beta);
+        }
+        if !ADD_RANDOM {
+            println!("challenge is {:?}", gamma);
+        }
 
         let mut lookups = vec![];
         lookups.append(&mut single_unit_lookups);
@@ -1242,6 +1253,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         transcript.write_point(vanish_commitment).unwrap();
 
         let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
+        if !ADD_RANDOM {
+            println!("challenge is {:?}", y);
+        }
 
         let timer = start_timer!(|| "h_poly");
         {
