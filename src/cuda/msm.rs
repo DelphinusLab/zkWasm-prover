@@ -72,11 +72,9 @@ impl<'a, F: FieldExt> CopyToCudaHost<'a> for &'a [F] {
         &self,
         device: &CudaDevice,
         len: usize,
-        stream: &CudaStream,
+        _stream: &CudaStream,
     ) -> DeviceResult<Option<CudaDeviceBufRaw>> {
-        let stream = unsafe { *(stream as *const _ as *const *mut _) };
         let buf = device.alloc_device_buffer_non_zeroed::<F>(len)?;
-        device.copy_from_host_to_device_async(&buf, *self, stream)?;
         Ok(Some(buf))
     }
 
@@ -92,11 +90,9 @@ impl<'a, F: FieldExt> CopyToCudaHost<'a> for &'a mut [F] {
         &self,
         device: &CudaDevice,
         len: usize,
-        stream: &CudaStream,
+        _stream: &CudaStream,
     ) -> DeviceResult<Option<CudaDeviceBufRaw>> {
-        let stream = unsafe { *(stream as *const _ as *const *mut _) };
         let buf = device.alloc_device_buffer_non_zeroed::<F>(len)?;
-        device.copy_from_host_to_device_async(&buf, *self, stream)?;
         Ok(Some(buf))
     }
 
