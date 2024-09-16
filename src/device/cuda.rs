@@ -1,6 +1,6 @@
 use core::cell::RefCell;
 use core::mem;
-use cuda_runtime_sys::{cudaError, cudaStream_t};
+use cuda_runtime_sys::{cudaError, cudaStream_t, CUstream_st};
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::{ffi::c_void, sync::Mutex};
@@ -222,6 +222,13 @@ impl CudaDevice {
         }
     }
 
+    pub(crate) fn alloc_device_buffer_async<T>(
+        &self,
+        size: usize,
+        stream: &CudaStreamWrapper,
+    ) -> DeviceResult<CudaDeviceBufRaw> {
+        self._alloc_device_buffer::<T>(size, true, Some(stream.into()))
+    }
 
     pub fn copy_from_device_to_device_async<T>(
         &self,
@@ -379,6 +386,50 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
         unsafe {
             let res = cuda_runtime_sys::cudaHostUnregister(dst.as_ptr() as *mut _);
             to_result((), res, "fail to synchronize")
+        }
+    }
+}
+
+pub(crate) struct CudaStreamWrapper(cudaStream_t);
+
+impl CudaStreamWrapper {
+    pub fn _new() -> Self {
+        unsafe {
+            let mut stream = std::mem::zeroed();
+            let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+            Self(stream)
+        }
+    }
+
+    pub fn new_with_inner() -> (Self, *mut CUstream_st) {
+        unsafe {
+            let mut stream = std::mem::zeroed();
+            let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+            (Self(stream), stream)
+        }
+    }
+
+    pub fn sync(&self) {
+        unsafe {
+            let err = cuda_runtime_sys::cudaStreamSynchronize(self.into());
+            to_result((), err, "fail to run cudaStreamSynchronize").unwrap();
+        }
+    }
+}
+
+impl From<&CudaStreamWrapper> for cudaStream_t {
+    fn from(value: &CudaStreamWrapper) -> Self {
+        value.0
+    }
+}
+
+impl Drop for CudaStreamWrapper {
+    fn drop(&mut self) {
+        unsafe {
+            let err = cuda_runtime_sys::cudaStreamSynchronize(self.0);
+            to_result((), err, "fail to run cudaStreamSynchronize").unwrap();
+            let err = cuda_runtime_sys::cudaStreamDestroy(self.0);
+            to_result((), err, "fail to run cudaStreamDestroy").unwrap();
         }
     }
 }

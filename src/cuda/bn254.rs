@@ -15,115 +15,12 @@ use icicle_core::traits::FieldImpl;
 use icicle_cuda_runtime::memory::HostOrDeviceSlice;
 use icicle_cuda_runtime::stream::CudaStream;
 
-pub(crate) fn extended_prepare(
-    device: &CudaDevice,
-    s: &CudaDeviceBufRaw,
-    coset_powers: &CudaDeviceBufRaw,
-    coset_powers_n: usize,
-    size: usize,
-    extended_size: usize,
-    stream: Option<cudaStream_t>,
-) -> Result<(), Error> {
-    unsafe {
-        device.acitve_ctx()?;
-        let err = bn254_c::extended_prepare(
-            s.ptr(),
-            coset_powers.ptr(),
-            coset_powers_n as i32,
-            size as i32,
-            extended_size as i32,
-            0,
-            stream.unwrap_or(0usize as _),
-        );
-        to_result((), err, "fail to run extended_prepare")?;
-        Ok(())
-    }
-}
-
-pub(crate) fn extended_intt_after(
-    device: &CudaDevice,
-    s: &CudaDeviceBufRaw,
-    coset_powers: &CudaDeviceBufRaw,
-    coset_powers_n: usize,
-    size: usize,
-    extended_size: usize,
-    stream: Option<cudaStream_t>,
-) -> Result<(), Error> {
-    unsafe {
-        device.acitve_ctx()?;
-        let err = bn254_c::extended_prepare(
-            s.ptr(),
-            coset_powers.ptr(),
-            coset_powers_n as i32,
-            size as i32,
-            extended_size as i32,
-            1,
-            stream.unwrap_or(0usize as _),
-        );
-        to_result((), err, "fail to run extended_prepare")?;
-        Ok(())
-    }
-}
-
 #[derive(Debug, PartialEq)]
 pub(crate) enum FieldOp {
     Add = 0,
     Mul = 1,
     UOp = 2,
     Sub = 3,
-}
-
-pub(crate) fn field_op_v2<F: FieldExt>(
-    device: &CudaDevice,
-    res: &CudaDeviceBufRaw,
-    l: Option<&CudaDeviceBufRaw>,
-    l_c: Option<F>,
-    r: Option<&CudaDeviceBufRaw>,
-    r_c: Option<F>,
-    size: usize,
-    op: FieldOp,
-) -> Result<(), Error> {
-    field_op(device, res, l, 0, l_c, r, 0, r_c, size, op, None)?;
-
-    Ok(())
-}
-
-pub(crate) fn field_sub<F: FieldExt>(
-    device: &CudaDevice,
-    res: &CudaDeviceBufRaw,
-    rhs: &CudaDeviceBufRaw,
-    size: usize,
-) -> Result<(), Error> {
-    field_op_v2::<F>(
-        device,
-        res,
-        Some(res),
-        None,
-        Some(rhs),
-        None,
-        size,
-        FieldOp::Sub,
-    )?;
-    Ok(())
-}
-
-pub(crate) fn field_mul<F: FieldExt>(
-    device: &CudaDevice,
-    res: &CudaDeviceBufRaw,
-    rhs: &CudaDeviceBufRaw,
-    size: usize,
-) -> Result<(), Error> {
-    field_op_v2::<F>(
-        device,
-        res,
-        Some(res),
-        None,
-        Some(rhs),
-        None,
-        size,
-        FieldOp::Mul,
-    )?;
-    Ok(())
 }
 
 pub(crate) fn pick_from_buf<F: FieldExt>(
@@ -170,49 +67,6 @@ pub(crate) fn field_op_v3(
             l_c.as_ref().map_or(0usize as *mut _, |x| x.ptr()),
             r.map_or(0usize as *mut _, |x| x.ptr()),
             0,
-            r_c.as_ref().map_or(0usize as *mut _, |x| x.ptr()),
-            size as i32,
-            op as i32,
-            stream.unwrap_or(0usize as _),
-        );
-        to_result((), err, "fail to run field_op")?;
-    }
-    Ok(())
-}
-
-pub(crate) fn field_op<F: FieldExt>(
-    device: &CudaDevice,
-    res: &CudaDeviceBufRaw,
-    l: Option<&CudaDeviceBufRaw>,
-    l_rot: i32,
-    l_c: Option<F>,
-    r: Option<&CudaDeviceBufRaw>,
-    r_rot: i32,
-    r_c: Option<F>,
-    size: usize,
-    op: FieldOp,
-    stream: Option<cudaStream_t>,
-) -> Result<(), Error> {
-    let l_c = if l_c.is_none() {
-        None
-    } else {
-        Some(device.alloc_device_buffer_from_slice([l_c.unwrap()].as_slice())?)
-    };
-    let r_c = if r_c.is_none() {
-        None
-    } else {
-        Some(device.alloc_device_buffer_from_slice([r_c.unwrap()].as_slice())?)
-    };
-
-    unsafe {
-        device.acitve_ctx()?;
-        let err = bn254_c::field_op(
-            res.ptr(),
-            l.map_or(0usize as *mut _, |x| x.ptr()),
-            l_rot,
-            l_c.as_ref().map_or(0usize as *mut _, |x| x.ptr()),
-            r.map_or(0usize as *mut _, |x| x.ptr()),
-            r_rot,
             r_c.as_ref().map_or(0usize as *mut _, |x| x.ptr()),
             size as i32,
             op as i32,
@@ -811,11 +665,18 @@ pub fn permutation_eval_h_l(
     gamma: &CudaDeviceBufRaw,
     p: &CudaDeviceBufRaw,
     n: usize,
+    stream: Option<cudaStream_t>,
 ) -> Result<(), Error> {
     unsafe {
         device.acitve_ctx()?;
-        let err =
-            bn254_c::permutation_eval_h_l(res.ptr(), beta.ptr(), gamma.ptr(), p.ptr(), n as i32);
+        let err = bn254_c::permutation_eval_h_l(
+            res.ptr(),
+            beta.ptr(),
+            gamma.ptr(),
+            p.ptr(),
+            n as i32,
+            stream.unwrap_or(0usize as _),
+        );
         to_result((), err, "fail to run permutation_eval_h_l")?;
         device.synchronize()?;
     }

@@ -72,6 +72,7 @@ extern "C" {
         gamma: *mut c_void,
         p: *mut c_void,
         n: i32,
+        stream: *mut CUstream_st,
     ) -> cudaError;
 
     pub fn field_sum(
@@ -90,6 +91,7 @@ extern "C" {
         rot: *mut c_void,
         v_n: i32,
         n: i32,
+        stream: *mut CUstream_st,
     ) -> cudaError;
 
     pub fn lookup_eval_h(
@@ -114,6 +116,21 @@ extern "C" {
         res: *mut c_void,
         input: *mut c_void,
         table: *mut c_void,
+        z: *mut c_void,
+        l0: *mut c_void,
+        l_last: *mut c_void,
+        l_active_row: *mut c_void,
+        y: *mut c_void,
+        rot: i32,
+        n: i32,
+    ) -> cudaError;
+
+    pub fn shuffle_eval_h_v2(
+        res: *mut c_void,
+        inputs: *mut c_void,
+        tables: *mut c_void,
+        betas: *mut c_void,
+        group_len: i32,
         z: *mut c_void,
         l0: *mut c_void,
         l_last: *mut c_void,

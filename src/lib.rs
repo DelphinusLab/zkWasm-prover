@@ -38,13 +38,13 @@ use rayon::prelude::ParallelSliceMut as _;
 use rayon::slice::ParallelSlice as _;
 
 use crate::cuda::bn254::batch_intt_raw;
-use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::ntt_prepare;
 use crate::cuda::bn254_c::eval_lookup_z;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
 use crate::device::cuda::CudaDeviceBufRaw;
+use crate::device::cuda::CudaStreamWrapper;
 use crate::device::cuda::CUDA_BUFFER_ALLOCATOR;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
@@ -60,7 +60,9 @@ use crate::multiopen::ProverQuery;
 pub mod cuda;
 pub mod device;
 
+mod analyze;
 mod eval_h;
+mod expr;
 mod hugetlb;
 mod multiopen;
 
@@ -566,12 +568,19 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 });
         }
 
+        let timer = start_timer!(|| "prepare ntt");
+        let (intt_omegas_buf, intt_pq_buf) =
+            ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
+        let intt_divisor_buf = device
+            .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
+        end_timer!(timer);
+
         let timer = start_timer!(|| "copy g_lagrange buffer");
-        let g_lagrange_buf = device
-            .alloc_device_buffer_from_slice(&params.g_lagrange[..])
-            .unwrap();
         let g_buf = device
             .alloc_device_buffer_from_slice(&params.g[..])
+            .unwrap();
+        let g_lagrange_buf = device
+            .alloc_device_buffer_from_slice(&params.g_lagrange[..])
             .unwrap();
         end_timer!(timer);
 
@@ -1200,13 +1209,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             shuffle_products_handler
         };
 
-        let timer = start_timer!(|| "prepare ntt");
-        let (intt_omegas_buf, intt_pq_buf) =
-            ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
-        let intt_divisor_buf = device
-            .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
-        end_timer!(timer);
-
         let timer = start_timer!(|| "generate lookup z");
         {
             const MAX_CONCURRENCY: usize = 3;
@@ -1343,6 +1345,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             shuffle_products.iter().map(|x| &x[..]).collect::<Vec<_>>(),
             size,
         )?;
+        drop(g_lagrange_buf);
 
         batch_intt_raw(
             &device,
@@ -1369,15 +1372,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             transcript.write_point(commitment).unwrap();
         }
 
-        let g_buf = g_lagrange_buf;
-        device.copy_from_host_to_device(&g_buf, &params.g[..])?;
-
         // TODO: move to sub-thread
         let timer = start_timer!(|| "random_poly");
         let random_poly = vanish_commit(&device, &s_buf, &g_buf, size, transcript).unwrap();
         end_timer!(timer);
 
         let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
+
+        drop(s_buf);
+        drop(t_buf);
 
         let timer = start_timer!(|| "h_poly");
         {
@@ -1528,26 +1531,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             );
         }
 
-        let mut poly_buf_cache = BTreeMap::new();
-        let extended_buffers_count = if k < 23 { 30 } else { 15 };
-        let mut extended_buffers = vec![];
-        let mut cache_buffers = vec![];
-        let extended_k = pk.vk.domain.extended_k() as usize;
-        for _ in 0..extended_buffers_count {
-            let buf = device.alloc_device_buffer::<C::Scalar>(1 << extended_k)?;
-            for i in 0..1 << (extended_k - k) {
-                cache_buffers.push(ManuallyDrop::new(CudaDeviceBufRaw {
-                    ptr: unsafe {
-                        buf.ptr()
-                            .offset(((i << k) * core::mem::size_of::<C::Scalar>()) as isize)
-                    },
-                    device: device.clone(),
-                    size: core::mem::size_of::<C::Scalar>(),
-                }));
-            }
-            extended_buffers.push(buf);
-        }
-
         let mut evals = vec![C::Scalar::zero(); inputs.len()];
 
         let timer = start_timer!(|| format!("compute eval {}", collection.len()));
@@ -1555,51 +1538,39 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let mut streams = vec![];
         let mut bufs = vec![];
-        let max = 6;
+        let max = 2;
         for _ in 0..max {
             bufs.push((
                 device.alloc_device_buffer::<C::Scalar>(size)?,
                 device.alloc_device_buffer::<C::Scalar>(size)?,
                 device.alloc_device_buffer::<C::Scalar>(size)?,
             ));
-            unsafe {
-                let mut stream = std::mem::zeroed();
-                let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-                assert_eq!(err, cuda_runtime_sys::cudaError::cudaSuccess);
-                streams.push(stream);
-            }
+            streams.push(CudaStreamWrapper::new_with_inner());
         }
 
         let mut collection = collection.into_iter().collect::<Vec<_>>();
         collection.sort_by(|a, b| a.1 .1.len().cmp(&b.1 .1.len()));
 
-        let mut l = 0;
-        let mut r = collection.len();
-        let mut inc = false;
-        let mut used_cache_idx = 0;
-        while l < r {
-            let i = if inc { l } else { r - 1 };
-            if inc {
-                l += 1;
-            } else {
-                r -= 1;
-            }
-            inc = !inc;
+        let mut poly_buf_cache = BTreeMap::new();
+        let cache_count = 80;
+
+        for i in 0..collection.len() {
             let (p, arr) = &collection[i].1;
             let p = *p;
-            unsafe {
-                let stream = streams[i % max];
-                let (poly_buf, eval_buf, tmp_buf) = &bufs[i % max];
-                let poly_buf = if used_cache_idx < cache_buffers.len() {
-                    let buf = &cache_buffers[used_cache_idx];
-                    poly_buf_cache.insert((*p).as_ptr() as usize, buf);
-                    used_cache_idx += 1;
-                    buf
-                } else {
-                    poly_buf
-                };
-                device.copy_from_host_to_device_async(poly_buf, p, stream)?;
-                for (idx, x) in arr {
+            let stream = streams[i % max].1;
+            let (poly_buf, eval_buf, tmp_buf) = &bufs[i % max];
+            let poly_buf = if poly_buf_cache.len() < cache_count {
+                let key = p.as_ptr() as usize;
+                let buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+                poly_buf_cache.insert(key, buf);
+                poly_buf_cache.get(&key).unwrap()
+            } else {
+                poly_buf
+            };
+
+            device.copy_from_host_to_device_async(poly_buf, p, stream)?;
+            for (idx, x) in arr {
+                unsafe {
                     let err = crate::cuda::bn254_c::poly_eval(
                         poly_buf.ptr(),
                         eval_buf.ptr(),
@@ -1619,13 +1590,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             }
         }
 
-        for stream in streams {
-            unsafe {
-                cuda_runtime_sys::cudaStreamSynchronize(stream);
-                cuda_runtime_sys::cudaStreamDestroy(stream);
-            }
-        }
-
+        drop(streams);
         drop(bufs);
 
         let eval_map = eval_map
@@ -1725,6 +1690,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         poly: &random_poly,
                     })),
             );
+
+        let s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        let t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         if use_gwc {
             gwc::multiopen(
                 &device,
