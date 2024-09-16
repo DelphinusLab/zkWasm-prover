@@ -9,6 +9,7 @@ use ark_std::start_timer;
 
 use ark_std::rand::rngs::OsRng;
 use cuda::ntt::ntt_raw;
+use halo2_proofs::arithmetic::gpu_multiexp;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
@@ -1217,6 +1218,44 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "shuffle z msm and intt");
+        let shuffle_commitments = if true {
+            shuffle_products
+                .iter()
+                .map(|shuffle_product| {
+                    use halo2_proofs::pairing::group::Curve;
+                    gpu_multiexp(&shuffle_product[..], &params.g_lagrange[..]).to_affine()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            batch_msm(
+                &device,
+                &g_lagrange_buf,
+                shuffle_products
+                    .iter_mut()
+                    .map(|x| &mut x[..])
+                    .collect::<Vec<_>>(),
+                None,
+                1 << k,
+            )?
+            .0
+        };
+
+        batch_ntt_raw(
+            &device,
+            shuffle_products
+                .iter_mut()
+                .map(|x| {
+                    let buffer = device.alloc_device_buffer_from_slice(&x[..]).unwrap();
+                    (&mut x[..], buffer)
+                })
+                .collect::<Vec<_>>(),
+            &intt_pq_buf,
+            &intt_omegas_buf,
+            k,
+            Some(&intt_divisor_buf),
+        )?;
+
+        /*
         let shuffle_commitments = batch_msm(
             &device,
             &g_lagrange_buf,
@@ -1235,6 +1274,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             1 << k,
         )?
         .0;
+        */
         drop(g_lagrange_buf);
         end_timer!(timer);
 
