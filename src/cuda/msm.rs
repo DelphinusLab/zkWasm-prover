@@ -273,3 +273,28 @@ pub(crate) fn batch_msm<'a, C: CurveAffine, T: CopyToCudaHost<'a> + 'a>(
 
     Ok((res_vec, buffer_map))
 }
+
+pub(crate) fn batch_msm_pure<'a, C: CurveAffine>(
+    points_buf: &'a [C],
+    scalars_buf: Vec<&'a [C::Scalar]>,
+    len: usize,
+) -> Result<Vec<C>, Error> {
+    let mut res_vec = vec![];
+
+    for (_, value) in scalars_buf.into_iter().enumerate() {
+        let stream = CudaStream::create().unwrap();
+        let mut msm_results = DeviceVec::<G1Projective>::cuda_malloc(1).unwrap();
+        let points = HostSlice::from_slice(unsafe { std::mem::transmute(&points_buf[..len]) });
+        let scalars = HostSlice::from_slice(unsafe { std::mem::transmute(&value[..len]) });
+        let mut cfg = msm::MSMConfig::default();
+        cfg.ctx.stream = &stream;
+        cfg.is_async = true;
+        cfg.are_scalars_montgomery_form = true;
+        cfg.are_points_montgomery_form = true;
+        msm::msm(scalars, points, &cfg, &mut msm_results[..]).unwrap();
+        stream.synchronize().unwrap();
+        res_vec.push(copy_and_to_affine(&msm_results).unwrap());
+    }
+
+    Ok(res_vec)
+}

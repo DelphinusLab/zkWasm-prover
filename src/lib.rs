@@ -8,6 +8,7 @@ use ark_std::end_timer;
 use ark_std::start_timer;
 
 use ark_std::rand::rngs::OsRng;
+use cuda::msm::batch_msm_pure;
 use cuda::ntt::ntt_raw;
 use halo2_proofs::arithmetic::gpu_multiexp;
 use halo2_proofs::arithmetic::CurveAffine;
@@ -1218,7 +1219,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "shuffle z msm and intt");
-        let shuffle_commitments = if true {
+        let shuffle_commitments = if false {
             shuffle_products
                 .iter()
                 .map(|shuffle_product| {
@@ -1227,6 +1228,12 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 })
                 .collect::<Vec<_>>()
         } else {
+            batch_msm_pure(
+                &params.g_lagrange[..],
+                shuffle_products.iter().map(|x| &x[..]).collect::<Vec<_>>(),
+                1 << k,
+            )?
+            /*
             batch_msm(
                 &device,
                 &g_lagrange_buf,
@@ -1238,6 +1245,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 1 << k,
             )?
             .0
+            */
         };
 
         batch_ntt_raw(
