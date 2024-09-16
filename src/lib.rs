@@ -1219,7 +1219,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "shuffle z msm and intt");
-        let shuffle_commitments = if false {
+        let shuffle_commitments = if true {
             shuffle_products
                 .iter()
                 .map(|shuffle_product| {
