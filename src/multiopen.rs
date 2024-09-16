@@ -192,6 +192,7 @@ pub mod shplonk {
     use crate::cuda::bn254::field_op;
     use crate::cuda::bn254::FieldOp;
     use crate::cuda::msm::batch_msm;
+    use crate::cuda::msm::batch_msm_v2;
     use crate::cuda::ntt::ntt_raw;
     use crate::device::cuda::CudaBuffer;
     use crate::device::cuda::CudaDevice;
@@ -454,7 +455,7 @@ pub mod shplonk {
             None,
         )?;
 
-        let commitment = batch_msm(device, &g_buf, vec![&hx_buf], None, size)?.0;
+        let commitment = batch_msm_v2(&g_buf, vec![&hx_buf], size)?;
         transcript.write_point(commitment[0]).unwrap();
 
         let u: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();

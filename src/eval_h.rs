@@ -29,7 +29,7 @@ use crate::cuda::bn254_c::field_op_batch_mul_sum;
 use crate::cuda::bn254_c::lookup_eval_h;
 use crate::cuda::bn254_c::shuffle_eval_h;
 use crate::cuda::bn254_c::shuffle_eval_h_v2;
-use crate::cuda::msm::batch_msm;
+use crate::cuda::msm::batch_msm_v2;
 use crate::cuda::ntt::extended_prepare;
 use crate::cuda::ntt::generate_ntt_buffers;
 use crate::cuda::ntt::ntt_raw;
@@ -443,17 +443,14 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
             buffers.push(s_buf);
         }
 
-        let commitments = batch_msm(
-            device,
+        let commitments = batch_msm_v2(
             &g_buf,
             buffers
                 .iter()
                 .map(|x| &x as &CudaDeviceBufRaw)
                 .collect::<Vec<_>>(),
-            None,
             size,
-        )?
-        .0;
+        )?;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }
