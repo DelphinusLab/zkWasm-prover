@@ -45,6 +45,7 @@ use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
 use crate::device::cuda::CudaDeviceBufRaw;
+use crate::device::cuda::CUDA_BUFFER_ALLOCATOR;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
 use crate::hugetlb::HugePageAllocator;
@@ -512,11 +513,17 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         assert!(false);
     }
 
-    println!("k is {}", pk.get_vk().domain.k());
+    let k = pk.get_vk().domain.k() as usize;
+    let size = 1 << pk.get_vk().domain.k();
+    println!("k is {}", k);
+
+    {
+        let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
+        let count = if k < 23 { 140 } else { 65 };
+        allocator.reset((1 << k) * core::mem::size_of::<C::Scalar>(), count);
+    }
 
     thread::scope(|s| {
-        let k = pk.get_vk().domain.k() as usize;
-        let size = 1 << pk.get_vk().domain.k();
         let meta = &pk.vk.cs;
         let unusable_rows_start = size - (meta.blinding_factors() + 1);
         let omega = pk.get_vk().domain.get_omega();
@@ -569,7 +576,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         // thread for part of lookups
-        let sub_pk = pk.clone();
+        let sub_pk = pk;
         let sub_advices = advices.clone();
         let sub_instances = instances.clone();
         let lookup_handler = s.spawn(move || {
@@ -705,7 +712,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         // After theta
-        let sub_pk = pk.clone();
+        let sub_pk = pk;
         let sub_advices = advices.clone();
         let sub_instance = instances.clone();
         let tuple_lookup_handler = s.spawn(move || {
@@ -844,7 +851,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 (&pk).vk.cs.permutation.columns.chunks(chunk_len).len()
             ));
 
-            let sub_pk = pk.clone();
+            let sub_pk = pk;
             let sub_advices = advices.clone();
             let sub_instance = instances.clone();
             let permutation_products_handler = s.spawn(move || {
@@ -980,7 +987,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 shuffle_groups.len()
             ));
 
-            let sub_pk = pk.clone();
+            let sub_pk = pk;
             let sub_advices = advices.clone();
             let sub_instance = instances.clone();
             let shuffle_products_handler = s.spawn(move || {
