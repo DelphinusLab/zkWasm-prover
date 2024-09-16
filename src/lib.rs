@@ -48,8 +48,8 @@ use crate::device::cuda::CudaStreamWrapper;
 use crate::device::cuda::CUDA_BUFFER_ALLOCATOR;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
+use crate::hugetlb::print_pinned_cache_info;
 use crate::hugetlb::HugePageAllocator;
-use crate::hugetlb::UnpinnedHugePageAllocator;
 use crate::multiopen::gwc;
 use crate::multiopen::lookup_open;
 use crate::multiopen::permutation_product_open;
@@ -187,7 +187,7 @@ fn handle_lookup_pair<F: FieldExt>(
     permuted_input[0..unusable_rows_start].sort_unstable_by(compare);
     sorted_table[0..unusable_rows_start].sort_unstable_by(compare);
 
-    let mut permuted_table_state = Vec::new_in(UnpinnedHugePageAllocator);
+    let mut permuted_table_state = Vec::new_in(HugePageAllocator);
     permuted_table_state.resize(input.len(), false);
 
     permuted_input
@@ -518,6 +518,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
     let k = pk.get_vk().domain.k() as usize;
     let size = 1 << pk.get_vk().domain.k();
     println!("k is {}", k);
+    print_pinned_cache_info();
 
     {
         let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
@@ -1026,7 +1027,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                 {
                                     None
                                 } else {
-                                    let mut buffer = Vec::new_in(UnpinnedHugePageAllocator);
+                                    let mut buffer = Vec::new_in(HugePageAllocator);
                                     buffer.resize(size, C::Scalar::zero());
                                     Some(buffer)
                                 };
@@ -1036,7 +1037,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                 {
                                     None
                                 } else {
-                                    let mut buffer = Vec::new_in(UnpinnedHugePageAllocator);
+                                    let mut buffer = Vec::new_in(HugePageAllocator);
                                     buffer.resize(size, C::Scalar::zero());
                                     Some(buffer)
                                 };
