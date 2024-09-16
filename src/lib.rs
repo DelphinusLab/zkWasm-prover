@@ -467,12 +467,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .collect::<Vec<_>>();
             end_timer!(timer);
 
+            let vanish_poly = generate_vanish_poly(size);
+
             (
                 single_unit_lookups,
                 single_comp_lookups,
                 tuple_lookups,
                 permutations,
                 shuffles,
+                vanish_poly,
             )
         });
 
@@ -530,6 +533,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             mut tuple_lookups,
             permutations,
             shuffles,
+            vanish_poly,
         ) = lookup_handler.join().unwrap();
         end_timer!(timer);
 
@@ -1111,15 +1115,12 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let mut lookups = lookups.into_iter().map(|(_, b)| b).collect::<Vec<_>>();
         end_timer!(timer);
 
-        let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
-        let lookup_z_commitments = batch_msm(
-            &device,
-            &g_buf,
-            lookups.iter().map(|x| &x.4[..]).collect::<Vec<_>>(),
-            None,
-            size,
-        )?
-        .0;
+        let timer = start_timer!(|| format!("random and lookup z msm {}", lookups.len()));
+        let mut scalars = lookups.iter().map(|x| &x.4[..]).collect::<Vec<_>>();
+        scalars.push(&vanish_poly[..]);
+        let mut commitments = batch_msm(&device, &g_buf, scalars, None, size)?.0;
+        let vanish_commitment = commitments.pop().unwrap();
+        let lookup_z_commitments = commitments;
         end_timer!(timer);
 
         let buffers = unsafe {
@@ -1238,10 +1239,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             transcript.write_point(commitment).unwrap();
         }
 
-        // TODO: move to sub-thread
-        let timer = start_timer!(|| "random_poly");
-        let random_poly = vanish_commit(&device, &s_buf, &g_buf, size, transcript).unwrap();
-        end_timer!(timer);
+        transcript.write_point(vanish_commitment).unwrap();
 
         let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
@@ -1338,7 +1336,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             inputs.push((&pk.fixed_polys[column.index()], domain.rotate_omega(x, at)))
         });
 
-        inputs.push((&random_poly, x));
+        inputs.push((&vanish_poly, x));
 
         for poly in pk.permutation.polys.iter() {
             inputs.push((&poly, x));
@@ -1563,7 +1561,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     .chain(Some(ProverQuery {
                         point: x,
                         rotation: Rotation::cur(),
-                        poly: &random_poly,
+                        poly: &vanish_poly,
                     })),
             );
 
@@ -1587,37 +1585,28 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
     })
 }
 
-fn vanish_commit<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
-    device: &CudaDevice,
-    s_buf: &CudaDeviceBufRaw,
-    g_buf: &CudaDeviceBufRaw,
-    size: usize,
-    transcript: &mut T,
-) -> Result<Vec<C::Scalar, PinnedPageAllocator>, Error> {
+fn generate_vanish_poly<F: FieldExt>(size: usize) -> Vec<F, PinnedPageAllocator> {
     use rand::thread_rng;
     use rand::RngCore;
 
     let random_nr = 32;
-    let mut random_poly = Vec::new_in(PinnedPageAllocator);
-    random_poly.resize(size, C::Scalar::zero());
+    let mut vanish_poly = Vec::new_in(PinnedPageAllocator);
+    vanish_poly.resize(size, F::zero());
 
     let random = vec![0; 32usize]
         .iter()
-        .map(|_| C::Scalar::random(&mut OsRng))
+        .map(|_| F::random(&mut OsRng))
         .collect::<Vec<_>>();
 
-    random_poly.par_iter_mut().for_each(|coeff| {
+    vanish_poly.par_chunks_mut(size >> 2).for_each(|coeffs| {
         if ADD_RANDOM {
             let mut rng = thread_rng();
-            *coeff = (C::Scalar::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
-                * (C::Scalar::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
+            for coeff in coeffs {
+                *coeff = (F::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
+                    * (F::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
+            }
         }
     });
 
-    // Commit
-    device.copy_from_host_to_device(s_buf, &random_poly[..])?;
-    let commitment = batch_msm(&device, &g_buf, vec![s_buf], None, size)?.0;
-    transcript.write_point(commitment[0]).unwrap();
-
-    Ok(random_poly)
+    vanish_poly
 }
