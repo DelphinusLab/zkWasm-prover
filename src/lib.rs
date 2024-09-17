@@ -83,37 +83,7 @@ pub fn prepare_advice_buffer<C: CurveAffine>(
             buf
         })
         .collect::<Vec<_>>();
-
-    let device = CudaDevice::get_device(0).unwrap();
-    if false {
-        for x in advices.iter() {
-            device.pin_memory(&x[..]).unwrap();
-        }
-        for x in pk.fixed_values.iter() {
-            device.pin_memory(&x[..]).unwrap();
-        }
-        for x in pk.permutation.polys.iter() {
-            device.pin_memory(&x[..]).unwrap();
-        }
-    }
-
     advices
-}
-
-pub fn unpin_advice_buffer<C: CurveAffine>(
-    pk: &ProvingKey<C>,
-    advices: &mut Vec<Vec<C::Scalar, HugePageAllocator>>,
-) {
-    let device = CudaDevice::get_device(0).unwrap();
-    for x in advices.iter() {
-        device.unpin_memory(&x[..]).unwrap();
-    }
-    for x in pk.fixed_values.iter() {
-        device.unpin_memory(&x[..]).unwrap();
-    }
-    for x in pk.permutation.polys.iter() {
-        device.unpin_memory(&x[..]).unwrap();
-    }
 }
 
 #[derive(Debug)]
@@ -247,7 +217,7 @@ fn handle_lookup_pair<F: FieldExt>(
 }
 
 /// Simple evaluation of an expression
-pub fn evaluate_expr<F: FieldExt>(
+pub(crate) fn evaluate_expr<F: FieldExt>(
     expression: &Expression<F>,
     size: usize,
     rot_scale: i32,
@@ -292,7 +262,7 @@ pub fn evaluate_expr<F: FieldExt>(
 }
 
 /// Simple evaluation of an expression
-pub fn evaluate_exprs<F: FieldExt>(
+pub(crate) fn evaluate_exprs<F: FieldExt>(
     expressions: &[Expression<F>],
     size: usize,
     rot_scale: i32,
@@ -396,7 +366,7 @@ pub fn create_proof_from_advices_with_shplonk<
     _create_proof_from_advices(params, pk, instances, advices, transcript, false)
 }
 
-pub fn prepare_lookup_buffer<C: CurveAffine>(
+pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
 ) -> Result<
     Vec<(
@@ -427,13 +397,6 @@ pub fn prepare_lookup_buffer<C: CurveAffine>(
             let mut z = Vec::new_in(HugePageAllocator);
             z.resize(size, C::Scalar::zero());
 
-            if false {
-                let device = CudaDevice::get_device(0).unwrap();
-                device.pin_memory(&permuted_input[..]).unwrap();
-                device.pin_memory(&permuted_table[..]).unwrap();
-                device.pin_memory(&z[..]).unwrap();
-            }
-
             (input, table, permuted_input, permuted_table, z)
         })
         .collect::<Vec<_>>();
@@ -459,12 +422,6 @@ pub fn prepare_permutation_buffers<C: CurveAffine>(
         .map(|_| {
             let mut z = Vec::new_in(HugePageAllocator);
             z.resize(size, C::Scalar::one());
-
-            if false {
-                let device = CudaDevice::get_device(0).unwrap();
-                device.pin_memory(&z[..]).unwrap();
-            }
-
             z
         })
         .collect::<Vec<_>>();
@@ -489,12 +446,6 @@ pub fn prepare_shuffle_buffers<C: CurveAffine>(
         .map(|_| {
             let mut z = Vec::new_in(HugePageAllocator);
             z.resize(size, C::Scalar::one());
-
-            if false {
-                let device = CudaDevice::get_device(0).unwrap();
-                device.pin_memory(&z[..]).unwrap();
-            }
-
             z
         })
         .collect::<Vec<_>>();
