@@ -16,7 +16,6 @@ use std::thread;
 use ark_std::end_timer;
 use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
-use cuda::bn254::batch_msm_v2;
 use cuda::bn254::intt_raw_async;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
@@ -404,7 +403,7 @@ pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
     Ok(lookups)
 }
 
-pub fn prepare_permutation_buffers<C: CurveAffine>(
+pub(crate) fn prepare_permutation_buffers<C: CurveAffine>(
     pk: &ProvingKey<C>,
 ) -> Result<Vec<Vec<C::Scalar, HugePageAllocator>>, Error> {
     let size = 1 << pk.get_vk().domain.k();
@@ -429,7 +428,7 @@ pub fn prepare_permutation_buffers<C: CurveAffine>(
     Ok(buffers)
 }
 
-pub fn prepare_shuffle_buffers<C: CurveAffine>(
+pub(crate) fn prepare_shuffle_buffers<C: CurveAffine>(
     pk: &ProvingKey<C>,
 ) -> Result<Vec<Vec<C::Scalar, HugePageAllocator>>, Error> {
     let size = 1 << pk.get_vk().domain.k();
@@ -545,6 +544,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let lookups = prepare_lookup_buffer(pk).unwrap();
             let permutations = prepare_permutation_buffers(pk).unwrap();
             let shuffles = prepare_shuffle_buffers(pk).unwrap();
+            let random_poly = generate_random_poly(size);
             end_timer!(timer);
 
             let pk = sub_pk;
@@ -631,6 +631,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 tuple_lookups,
                 permutations,
                 shuffles,
+                random_poly,
             )
         });
 
@@ -669,6 +670,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             mut tuple_lookups,
             permutations,
             shuffles,
+            random_poly,
         ) = lookup_handler.join().unwrap();
         end_timer!(timer);
 
@@ -1250,12 +1252,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
-        let lookup_z_commitments = crate::cuda::bn254::batch_msm::<C>(
+        let mut lookup_z_and_random_commitments = crate::cuda::bn254::batch_msm::<C>(
             &g_buf,
             [&s_buf, &t_buf],
-            lookups.iter().map(|x| &x.4[..]).collect::<Vec<_>>(),
+            lookups.iter().map(|x| &x.4[..])
+            .chain([&random_poly[..]]).collect::<Vec<_>>(),
             size,
         )?;
+        let random_commitment = lookup_z_and_random_commitments.pop().unwrap();
+        let lookup_z_commitments = lookup_z_and_random_commitments;
         end_timer!(timer);
 
         let timer = start_timer!(|| "wait permutation_products");
@@ -1294,7 +1299,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let shuffle_commitments = crate::cuda::bn254::batch_msm::<C>(
             &g_lagrange_buf,
             [&s_buf, &t_buf],
-            shuffle_products.iter().map(|x| &x[..]).collect::<Vec<_>>(),
+            shuffle_products
+                .iter()
+                .map(|x| &x[..])
+                .collect::<Vec<_>>(),
             size,
         )?;
         drop(g_lagrange_buf);
@@ -1324,10 +1332,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             transcript.write_point(commitment).unwrap();
         }
 
-        // TODO: move to sub-thread
-        let timer = start_timer!(|| "random_poly");
-        let random_poly = vanish_commit(&device, &s_buf, &g_buf, size, transcript).unwrap();
-        end_timer!(timer);
+        transcript.write_point(random_commitment).unwrap();
 
         let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
@@ -1674,37 +1679,26 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
     })
 }
 
-fn vanish_commit<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
-    device: &CudaDevice,
-    s_buf: &CudaDeviceBufRaw,
-    g_buf: &CudaDeviceBufRaw,
-    size: usize,
-    transcript: &mut T,
-) -> Result<Vec<C::Scalar, HugePageAllocator>, Error> {
+fn generate_random_poly<F: FieldExt>(size: usize) -> Vec<F, HugePageAllocator> {
     use rand::thread_rng;
     use rand::RngCore;
 
     let random_nr = 32;
     let mut random_poly = Vec::new_in(HugePageAllocator);
-    random_poly.resize(size, C::Scalar::zero());
+    random_poly.resize(size, F::zero());
 
     let random = vec![0; 32usize]
         .iter()
-        .map(|_| C::Scalar::random(&mut OsRng))
+        .map(|_| F::random(&mut OsRng))
         .collect::<Vec<_>>();
 
     random_poly.par_iter_mut().for_each(|coeff| {
         if ADD_RANDOM {
             let mut rng = thread_rng();
-            *coeff = (C::Scalar::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
-                * (C::Scalar::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
+            *coeff = (F::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
+                * (F::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
         }
     });
 
-    // Commit
-    device.copy_from_host_to_device(&s_buf, &random_poly[..])?;
-    let commitment = batch_msm_v2(&g_buf, vec![&s_buf], size)?;
-    transcript.write_point(commitment[0]).unwrap();
-
-    Ok(random_poly)
+    random_poly
 }
