@@ -72,6 +72,16 @@ mod multiopen;
 
 const ADD_RANDOM: bool = true;
 
+pub(crate) fn fill_random<F: FieldExt>(data: &mut [F]) {
+    for cell in data {
+        if ADD_RANDOM {
+            *cell = F::random(&mut OsRng);
+        } else {
+            *cell = F::zero();
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     DeviceError(device::Error),
@@ -149,21 +159,8 @@ fn handle_lookup_pair<F: FieldExt>(
         }
     }
 
-    if ADD_RANDOM {
-        for cell in &mut permuted_input[unusable_rows_start..] {
-            *cell = F::random(&mut OsRng);
-        }
-        for cell in &mut permuted_table[unusable_rows_start..] {
-            *cell = F::random(&mut OsRng);
-        }
-    } else {
-        for cell in &mut permuted_input[unusable_rows_start..] {
-            *cell = F::zero();
-        }
-        for cell in &mut permuted_table[unusable_rows_start..] {
-            *cell = F::zero();
-        }
-    }
+    fill_random(&mut permuted_input[unusable_rows_start..]);
+    fill_random(&mut permuted_table[unusable_rows_start..]);
 
     (permuted_input, permuted_table)
 }
@@ -370,20 +367,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         device.synchronize()?;
         device.print_memory_info()?;
 
-        // add random value
-        if ADD_RANDOM {
-            let named = &pk.vk.cs.named_advices;
-            unsafe { Arc::get_mut_unchecked(&mut advices) }
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(i, advice)| {
-                    if named.iter().find(|n| n.1 as usize == i).is_none() {
-                        for cell in &mut advice[unusable_rows_start..] {
-                            *cell = C::Scalar::random(&mut OsRng);
-                        }
-                    }
-                });
-        }
+        let named = &pk.vk.cs.named_advices;
+        unsafe { Arc::get_mut_unchecked(&mut advices) }
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, advice)| {
+                if named.iter().find(|n| n.1 as usize == i).is_none() {
+                    fill_random(&mut advice[unusable_rows_start..]);
+                }
+            });
 
         let timer = start_timer!(|| "prepare ntt");
         let (intt_omegas_buf, intt_pq_buf) =
@@ -778,16 +770,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             tmp = tmp * z[i];
                         }
 
-                        if ADD_RANDOM {
-                            for v in z[unusable_rows_start + 1..].iter_mut() {
-                                *v = C::Scalar::random(&mut OsRng);
-                            }
-                        } else {
-                            for v in z[unusable_rows_start + 1..].iter_mut() {
-                                *v = C::Scalar::zero();
-                            }
-                        }
-
+                        fill_random(&mut z[unusable_rows_start + 1..]);
                         z[unusable_rows_start]
                     })
                     .collect();
@@ -1013,15 +996,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             }
                         });
 
-                    if ADD_RANDOM {
-                        for v in z[unusable_rows_start + 1..].iter_mut() {
-                            *v = C::Scalar::random(&mut OsRng);
-                        }
-                    } else {
-                        for v in z[unusable_rows_start + 1..].iter_mut() {
-                            *v = C::Scalar::zero();
-                        }
-                    }
+                    fill_random(&mut z[unusable_rows_start + 1..]);
                 });
                 p_z
             });
