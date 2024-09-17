@@ -17,13 +17,11 @@ use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
-pub(crate) fn is_expr_unit<F: FieldExt>(expr: &Expression<F>) -> bool {
-    match expr {
-        Expression::Fixed { rotation, .. }
-        | Expression::Advice { rotation, .. }
-        | Expression::Instance { rotation, .. } => rotation.0 == 0,
-        _ => false,
-    }
+pub(crate) fn is_expression_pure_unit<F: FieldExt>(x: &Expression<F>) -> bool {
+    x.is_constant().is_some()
+        || x.is_pure_fixed().is_some()
+        || x.is_pure_advice().is_some()
+        || x.is_pure_instance().is_some()
 }
 
 fn flatten_prove_expression<F: FieldExt>(

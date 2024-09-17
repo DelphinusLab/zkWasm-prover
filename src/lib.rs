@@ -13,6 +13,7 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::thread;
 
+use analyze::lookup_classify;
 use ark_std::end_timer;
 use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
@@ -49,6 +50,7 @@ use crate::device::cuda::CudaStreamWrapper;
 use crate::device::cuda::CUDA_BUFFER_ALLOCATOR;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
+use crate::expr::is_expression_pure_unit;
 use crate::hugetlb::print_pinned_cache_info;
 use crate::hugetlb::HugePageAllocator;
 use crate::multiopen::gwc;
@@ -86,47 +88,6 @@ pub fn prepare_advice_buffer<C: CurveAffine>(
     _pin_memory: bool,
 ) -> Vec<Vec<C::Scalar, HugePageAllocator>> {
     crate::buffer::prepare_advice_buffer(pk)
-}
-
-fn is_expression_pure_unit<F: FieldExt>(x: &Expression<F>) -> bool {
-    x.is_constant().is_some()
-        || x.is_pure_fixed().is_some()
-        || x.is_pure_advice().is_some()
-        || x.is_pure_instance().is_some()
-}
-
-fn lookup_classify<'a, 'b, C: CurveAffine, T>(
-    pk: &'b ProvingKey<C>,
-    lookups_buf: Vec<T>,
-) -> [Vec<(usize, T)>; 3] {
-    let mut single_unit_lookups = vec![];
-    let mut single_comp_lookups = vec![];
-    let mut tuple_lookups = vec![];
-
-    pk.vk
-        .cs
-        .lookups
-        .iter()
-        .zip(lookups_buf.into_iter())
-        .enumerate()
-        .for_each(|(i, (lookup, buf))| {
-            let is_single =
-                lookup.input_expressions.len() == 1 && lookup.table_expressions.len() == 1;
-
-            if is_single {
-                let is_unit = is_expression_pure_unit(&lookup.input_expressions[0])
-                    && is_expression_pure_unit(&lookup.table_expressions[0]);
-                if is_unit {
-                    single_unit_lookups.push((i, buf));
-                } else {
-                    single_comp_lookups.push((i, buf));
-                }
-            } else {
-                tuple_lookups.push((i, buf))
-            }
-        });
-
-    return [single_unit_lookups, single_comp_lookups, tuple_lookups];
 }
 
 fn handle_lookup_pair<F: FieldExt>(

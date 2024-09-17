@@ -42,7 +42,7 @@ use crate::device::Device as _;
 use crate::device::DeviceResult;
 use crate::expr::flatten_lookup_expression;
 use crate::expr::flatten_shuffle_expression;
-use crate::expr::is_expr_unit;
+use crate::expr::is_expression_pure_unit;
 use crate::hugetlb::HugePageAllocator;
 
 struct EvalHContext<'a, F: FieldExt> {
@@ -923,9 +923,9 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
             .iter()
             .find(|x| {
                 x.input_expressions.len() > 1
-                    || !is_expr_unit(&x.input_expressions[0])
+                    || !is_expression_pure_unit(&x.input_expressions[0])
                     || x.shuffle_expressions.len() > 1
-                    || !is_expr_unit(&x.shuffle_expressions[0])
+                    || !is_expression_pure_unit(&x.shuffle_expressions[0])
             })
             .is_none()
         {
