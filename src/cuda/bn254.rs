@@ -4,7 +4,7 @@ use crate::device::Error;
 use crate::device::{Device, DeviceResult};
 
 use core::mem::ManuallyDrop;
-use cuda_runtime_sys::{cudaDeviceSynchronize, cudaStream_t, CUstream_st};
+use cuda_runtime_sys::{cudaDeviceSynchronize, cudaStream_t};
 use halo2_proofs::arithmetic::{CurveAffine, FieldExt};
 use icicle_bn254::curve::BaseField;
 use icicle_bn254::curve::CurveCfg;
@@ -154,9 +154,6 @@ fn batch_msm_core_v2<C: CurveAffine>(
         cfg.are_scalars_montgomery_form = true;
         cfg.are_points_montgomery_form = true;
         msm::msm(&scalars, &points, &cfg, &mut msm_results_buf[idx]).unwrap();
-    }
-
-    for stream in streams {
         stream.synchronize().unwrap();
     }
 
