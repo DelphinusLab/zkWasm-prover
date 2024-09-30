@@ -302,8 +302,8 @@ fn batch_msm_core_v2<C: CurveAffine>(
 
     let res_vec = msm_results_buf
         .into_iter()
-        .map(|x| copy_and_to_affine(&x).unwrap())
-        .collect();
+        .map(|x| copy_and_to_affine(&x))
+        .collect::<DeviceResult<_>>()?;
 
     Ok(res_vec)
 }
