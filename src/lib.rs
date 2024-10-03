@@ -501,9 +501,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             "instances and advices msm {}",
             instances.len() + advices.len()
         ));
-        let commitments = crate::cuda::bn254::batch_msm::<C>(
+        let commitments = crate::cuda::msm::batch_msm::<C>(
+            &device,
             &g_lagrange_buf,
-            [&s_buf, &t_buf],
             instances
                 .iter()
                 .chain(advices.iter())
@@ -603,12 +603,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 lookup_scalars.push(&permuted_input[..]);
                 lookup_scalars.push(&permuted_table[..])
             }
-            let commitments = crate::cuda::bn254::batch_msm::<C>(
-                &g_lagrange_buf,
-                [&s_buf, &t_buf],
-                lookup_scalars,
-                size,
-            )?;
+            let commitments =
+                crate::cuda::msm::batch_msm::<C>(&device, &g_lagrange_buf, lookup_scalars, size)?;
             let mut tidx = 0;
             for (i, _) in single_unit_lookups.iter() {
                 lookup_permuted_commitments[i * 2] = commitments[tidx];
@@ -634,12 +630,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 lookup_scalars.push(&permuted_input[..]);
                 lookup_scalars.push(&permuted_table[..])
             }
-            let commitments = crate::cuda::bn254::batch_msm::<C>(
-                &g_lagrange_buf,
-                [&s_buf, &t_buf],
-                lookup_scalars,
-                size,
-            )?;
+            let commitments =
+                crate::cuda::msm::batch_msm::<C>(&device, &g_lagrange_buf, lookup_scalars, size)?;
             let mut tidx = 0;
             for (i, _) in tuple_lookups.iter() {
                 lookup_permuted_commitments[i * 2] = commitments[tidx];
@@ -1093,9 +1085,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
-        let mut lookup_z_and_random_commitments = crate::cuda::bn254::batch_msm::<C>(
+        let mut lookup_z_and_random_commitments = crate::cuda::msm::batch_msm::<C>(
+            &device,
             &g_buf,
-            [&s_buf, &t_buf],
             lookups
                 .iter()
                 .map(|x| &x.4[..])
@@ -1112,9 +1104,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "permutation z msm and intt");
-        let permutation_commitments = crate::cuda::bn254::batch_msm::<C>(
+        let permutation_commitments = crate::cuda::msm::batch_msm::<C>(
+            &device,
             &g_lagrange_buf,
-            [&s_buf, &t_buf],
             permutation_products
                 .iter()
                 .map(|x| &x[..])
@@ -1140,9 +1132,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "shuffle z msm and intt");
-        let shuffle_commitments = crate::cuda::bn254::batch_msm::<C>(
+        let shuffle_commitments = crate::cuda::msm::batch_msm::<C>(
+            &device,
             &g_lagrange_buf,
-            [&s_buf, &t_buf],
             shuffle_products.iter().map(|x| &x[..]).collect::<Vec<_>>(),
             size,
         )?;

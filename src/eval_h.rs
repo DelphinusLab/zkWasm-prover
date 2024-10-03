@@ -17,7 +17,6 @@ use halo2_proofs::transcript::EncodedChallenge;
 use halo2_proofs::transcript::TranscriptWrite;
 
 use crate::analyze::analyze_expr_tree;
-use crate::cuda::bn254::batch_msm_v2;
 use crate::cuda::bn254::buffer_copy_with_shift;
 use crate::cuda::bn254::permutation_eval_h_l;
 use crate::cuda::bn254::permutation_eval_h_p1;
@@ -30,6 +29,7 @@ use crate::cuda::bn254_c::lookup_eval_h;
 use crate::cuda::bn254_c::shuffle_eval_h;
 use crate::cuda::bn254_c::shuffle_eval_h_v2;
 use crate::cuda::field_op::field_op;
+use crate::cuda::msm::batch_msm_v2;
 use crate::cuda::ntt::extended_prepare;
 use crate::cuda::ntt::generate_ntt_buffers;
 use crate::cuda::ntt::ntt_raw;
@@ -444,6 +444,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
         }
 
         let commitments = batch_msm_v2(
+            &device,
             &g_buf,
             buffers
                 .iter()

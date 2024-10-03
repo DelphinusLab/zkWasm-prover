@@ -3,14 +3,6 @@ use std::ffi::c_void;
 
 #[link(name = "zkwasm_prover_kernel", kind = "static")]
 extern "C" {
-    pub fn msm(
-        res: *mut c_void,
-        p: *mut c_void,
-        s: *mut c_void,
-        array_len: i32,
-        stream: *mut CUstream_st,
-    ) -> cudaError;
-
     pub fn ntt(
         buf: *mut c_void,
         tmp: *mut c_void,
@@ -181,4 +173,104 @@ extern "C" {
         n: i32,
         stream: *mut CUstream_st,
     ) -> cudaError;
+
+    pub fn batch_msm_collect(
+        remain_indices: *mut c_void,
+        remain_acc: *mut c_void,
+        next_remain_indices: *mut c_void,
+        next_remain_acc: *mut c_void,
+        buckets: *mut c_void,
+        workers: u32,
+        window_bits: u32,
+        windows: u32,
+        batch_size: u32,
+        stream: *mut CUstream_st,
+    ) -> cudaError;
+
+    pub fn msm(
+        res: *mut c_void,
+        p: *mut c_void,
+        s: *mut c_void,
+        sort_buf: *mut c_void,
+        indices_buf: *mut c_void,
+        array_len: i32,
+        window_bits: i32,
+        threads: i32,
+        max_worker: i32,
+        prepared_sort_indices_temp_storage_bytes: i32,
+        stream: *mut CUstream_st,
+    ) -> cudaError;
+}
+
+#[test]
+fn test_msm_v2() {
+    use crate::CudaDevice;
+    use ark_std::{end_timer, start_timer};
+    use halo2_proofs::pairing::group::Curve;
+    use halo2_proofs::{
+        arithmetic::{BaseExt, CurveAffine, Field},
+        pairing::bn256::{Fq, Fr, G1Affine, G1},
+    };
+    use rayon::iter::IntoParallelRefIterator;
+    use rayon::iter::ParallelIterator;
+    use std::{fs::File, path::Path};
+
+    use crate::{cuda::msm::batch_msm, device::Device};
+
+    {
+        let mut allocator = crate::device::cuda::CUDA_BUFFER_ALLOCATOR.lock().unwrap();
+        allocator.reset((1 << 22) * core::mem::size_of::<Fr>(), 100);
+    }
+
+    const L: usize = 1 << 22;
+
+    let timer = start_timer!(|| "gen points");
+    let f = format!("./random{}.bin", L);
+    let points = if !Path::new(&f).exists() {
+        let mut fd = File::create(&f).unwrap();
+        let points = vec![0; L]
+            .par_iter()
+            .map(|_| (G1::generator() * Fr::random(rand::thread_rng())).to_affine())
+            .collect::<Vec<_>>();
+        for p in points.iter() {
+            p.x.write(&mut fd).unwrap();
+            p.y.write(&mut fd).unwrap();
+        }
+        points
+    } else {
+        let mut fd = File::open(&f).unwrap();
+        let mut points = vec![];
+        for _ in 0..L {
+            let x = Fq::read(&mut fd).unwrap();
+            let y = Fq::read(&mut fd).unwrap();
+            let p = G1Affine::from_xy(x, y).unwrap();
+            points.push(p);
+        }
+        points
+    };
+    end_timer!(timer);
+
+    let timer = start_timer!(|| "gen scalars");
+    let scalars = vec![0; L]
+        .par_iter()
+        .map(|_| Fr::random(rand::thread_rng()))
+        .collect::<Vec<_>>();
+    end_timer!(timer);
+
+    let device = CudaDevice::get_device(0).unwrap();
+    let p_buf = device.alloc_device_buffer_from_slice(&points[..]).unwrap();
+    for _ in 0..5 {
+        let timer = start_timer!(|| "xxx");
+        let res = batch_msm::<G1Affine>(
+            &device,
+            &p_buf,
+            vec![
+                &scalars, &scalars, &scalars, &scalars, &scalars, &scalars, &scalars, &scalars,
+            ],
+            L,
+        )
+        .unwrap();
+        end_timer!(timer);
+        println!("res is {:?}", res);
+    }
 }

@@ -53,6 +53,16 @@ public:
         return FD::extract_bits(this->value, i * 8, 8);
     }
 
+    __device__ ulong get_nbits(uint start, uint size) const
+    {
+        return FD::extract_bits(this->value, start, size);
+    }
+
+    __device__ ulong get_32bits(uint i) const
+    {
+        return FD::extract_bits(this->value, i * 32, 32);
+    }
+
     __device__ Field sqr() const
     {
         return FD::sqr(this->value);
