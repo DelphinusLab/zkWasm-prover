@@ -272,5 +272,9 @@ fn test_msm_v2() {
         .unwrap();
         end_timer!(timer);
         println!("res is {:?}", res);
+        for r in res {
+            let succ: bool = r.is_on_curve().into();
+            assert!(succ);
+        }
     }
 }

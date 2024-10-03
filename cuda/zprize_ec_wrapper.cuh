@@ -62,4 +62,4 @@ public:
 };
 
 typedef CurveAffine<ec<fd_p>, fd_p, ec<fd_p>::point_affine> Bn254G1Affine;
-typedef Curve<ec<fd_p>, fd_p, ec<fd_p>::point_projective, Bn254G1Affine> Bn254G1;
+typedef Curve<ec<fd_p>, fd_p, ec<fd_p>::point_jacobian, Bn254G1Affine> Bn254G1;
