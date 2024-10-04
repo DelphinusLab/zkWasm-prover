@@ -76,7 +76,6 @@ pub(crate) mod gwc {
         g_buf: &CudaDeviceBufRaw,
         queries: I,
         size: usize,
-        s_buf: [&CudaDeviceBufRaw; 2],
         eval_map: BTreeMap<(usize, C::Scalar), C::Scalar>,
         transcript: &mut T,
     ) -> DeviceResult<()>
@@ -162,7 +161,7 @@ pub(crate) mod gwc {
         let timer = start_timer!(|| "msm");
 
         let commitments =
-            batch_msm::<C>(&device, &g_buf, ws.iter().map(|x| &x[..]).collect(), size)?;
+            batch_msm::<C, _>(&device, &g_buf, ws.iter().map(|x| &x[..]).collect(), size)?;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }
@@ -189,7 +188,6 @@ pub mod shplonk {
     use crate::cuda::bn254::FieldOp;
     use crate::cuda::field_op::field_op;
     use crate::cuda::msm::batch_msm;
-    use crate::cuda::msm::batch_msm_v2;
     use crate::cuda::ntt::generate_ntt_buffers;
     use crate::cuda::ntt::ntt_raw;
     use crate::device::cuda::CudaBuffer;
@@ -288,7 +286,6 @@ pub mod shplonk {
         g_buf: &CudaDeviceBufRaw,
         queries: I,
         size: usize,
-        s_buf: [&CudaDeviceBufRaw; 2],
         eval_map: BTreeMap<(usize, C::Scalar), C::Scalar>,
         mut poly_cache: BTreeMap<usize, CudaDeviceBufRaw>,
         transcript: &mut T,
@@ -453,7 +450,7 @@ pub mod shplonk {
             None,
         )?;
 
-        let commitment = batch_msm_v2(&device, &g_buf, vec![&hx_buf], size)?;
+        let commitment = batch_msm(&device, &g_buf, vec![&hx_buf], size)?;
         transcript.write_point(commitment[0]).unwrap();
 
         let u: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
@@ -549,7 +546,7 @@ pub mod shplonk {
             lx[0] = tmp;
         }
 
-        let commitments = batch_msm::<C>(&device, &g_buf, vec![&lx[..]], size)?;
+        let commitments = batch_msm::<C, _>(&device, &g_buf, vec![&lx[..]], size)?;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }

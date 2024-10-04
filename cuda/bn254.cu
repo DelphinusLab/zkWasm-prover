@@ -1164,7 +1164,7 @@ __global__ void split_scalars_kernel(
 
         unsigned idx = s.get_nbits(start_bit, bits);
         p_start[i] = gid;
-        b_start[i] = idx > 0 ? (i << 16) | s.get_nbits(i * start_bit, bits) : 0;
+        b_start[i] = idx > 0 ? (i << 16) | idx : 0;
     }
 }
 
@@ -1229,7 +1229,7 @@ __global__ void batch_collect_msm_remain(
     unsigned windows,
     unsigned n)
 {
-    unsigned tid = blockIdx.y;
+    unsigned msm_id = blockIdx.y;
     unsigned gid = (blockIdx.x * blockDim.x) + threadIdx.x;
     unsigned workers = gridDim.x * blockDim.x;
     unsigned tasks = n;
@@ -1243,21 +1243,23 @@ __global__ void batch_collect_msm_remain(
 
     for (unsigned i = start; i < end; i++)
     {
-        unsigned next_idx = remain_indices[tid][i];
+        unsigned next_idx = remain_indices[msm_id][i];
         if (next_idx != idx)
         {
             if (idx > 0)
             {
                 unsigned windex = idx >> 16;
                 unsigned offset = idx & offset_mask;
-                buckets[tid][(windex << window_bits) + offset] = buckets[tid][(windex << window_bits) + offset] + acc;
+                assert(windex < windows);
+                assert(offset < 1 << window_bits);
+                buckets[msm_id][(windex << window_bits) + offset] += acc;
             }
-            acc = Bn254G1::identity() + remain_acc[tid][i];
+            acc = Bn254G1::identity() + remain_acc[msm_id][i];
             idx = next_idx;
         }
         else if (idx > 0)
         {
-            acc = acc + remain_acc[tid][i];
+            acc = acc + remain_acc[msm_id][i];
         }
     }
 
@@ -1267,20 +1269,22 @@ __global__ void batch_collect_msm_remain(
         unsigned offset = idx & offset_mask;
         if (idx > 0)
         {
-            buckets[tid][(windex << window_bits) + offset] = buckets[tid][(windex << window_bits) + offset] + acc;
+            assert(windex < windows);
+            assert(offset < 1 << window_bits);
+            buckets[msm_id][(windex << window_bits) + offset] += acc;
         }
     }
     else
     {
-        next_remain_indices[tid][gid] = idx;
-        next_remain_acc[tid][gid] = acc;
+        next_remain_indices[msm_id][gid] = idx;
+        next_remain_acc[msm_id][gid] = acc;
     }
 }
 
 __global__ void batch_collect_bucktes(
     Bn254G1 **buckets,
-    unsigned window_bits,
-    unsigned windows)
+    unsigned windows,
+    unsigned window_bits)
 {
     unsigned msm_id = blockIdx.x;
     unsigned window_id = threadIdx.x;
@@ -1337,9 +1341,10 @@ extern "C"
         unsigned *sort_buf,
         unsigned *acc_indices_buf,
         int n,
+        int windows,
         int window_bits,
         int threads,
-        int max_worker,
+        int workers,
         int prepared_sort_indices_temp_storage_bytes,
         cudaStream_t stream)
     {
@@ -1352,9 +1357,6 @@ extern "C"
         }                       \
     }
 
-        unsigned bits = 254;
-
-        unsigned windows = (bits + window_bits - 1) / window_bits;
         unsigned *bucket_indices = sort_buf;
         unsigned *point_indices = bucket_indices + n * windows;
         unsigned *sorted_bucket_indices = point_indices + n * windows;
@@ -1370,15 +1372,15 @@ extern "C"
             sort_indices_temp_storage, sort_indices_temp_storage_bytes, bucket_indices, sorted_bucket_indices,
             point_indices, sorted_point_indices, n * windows, 0, sizeof(unsigned) * 8, stream));
 
-        bool alloc_for_sort = sort_indices_temp_storage_bytes > prepared_sort_indices_temp_storage_bytes;
+        bool alloc_for_sort = sort_indices_temp_storage_bytes > (unsigned)prepared_sort_indices_temp_storage_bytes;
         if (alloc_for_sort)
         {
-            printf("realloc for bytes %d\n", sort_indices_temp_storage_bytes);
+            printf("realloc for bytes %lu\n", sort_indices_temp_storage_bytes);
             CHECK_RETURN(cudaMallocAsync(&sort_indices_temp_storage, sort_indices_temp_storage_bytes, stream));
         }
         else
         {
-            sort_indices_temp_storage = sorted_point_indices + n * 32;
+            sort_indices_temp_storage = sorted_point_indices + n * windows;
         }
 
         CHECK_RETURN(cub::DeviceRadixSort::SortPairs(
@@ -1394,10 +1396,13 @@ extern "C"
         unsigned groups = (tasks + threads - 1) / threads;
         init_bucktes<<<groups, threads, 0, stream>>>(buckets, tasks);
 
-        blocks = max_worker / threads;
+        assert(workers % threads == 0);
+        blocks = workers / threads;
         Bn254G1 *remain_acc = &res[windows << window_bits];
-        unsigned *remain_indices = acc_indices_buf;
-        msm_core<<<blocks, threads, 0, stream>>>(sorted_bucket_indices, sorted_point_indices, remain_indices, remain_acc, buckets, points, window_bits, windows, n);
+        msm_core<<<blocks, threads, 0, stream>>>(
+            sorted_bucket_indices, sorted_point_indices,
+            acc_indices_buf, remain_acc,
+            buckets, points, window_bits, windows, n);
 
         return cudaGetLastError();
     }
@@ -1409,19 +1414,29 @@ extern "C"
         Bn254G1 **next_remain_acc,
         Bn254G1 **buckets,
         unsigned workers,
-        unsigned window_bits,
         unsigned windows,
+        unsigned window_bits,
         unsigned batch_size,
         cudaStream_t stream)
     {
-        batch_collect_msm_remain<<<dim3(2, batch_size), 64, 0, stream>>>(
-            remain_indices, remain_acc, next_remain_indices, next_remain_acc, buckets,
-            window_bits, windows, workers);
+        if (workers > 128)
+        {
+            batch_collect_msm_remain<<<dim3(2, batch_size), 64, 0, stream>>>(
+                remain_indices, remain_acc, next_remain_indices, next_remain_acc, buckets,
+                window_bits, windows, workers);
 
-        batch_collect_msm_remain<<<dim3(1, batch_size), 1, 0, stream>>>(
-            next_remain_indices, next_remain_acc, NULL, NULL, buckets, window_bits, windows, 2 * 64);
+            batch_collect_msm_remain<<<dim3(1, batch_size), 1, 0, stream>>>(
+                next_remain_indices, next_remain_acc, NULL, NULL, buckets,
+                window_bits, windows, 2 * 64);
+        }
+        else
+        {
+            batch_collect_msm_remain<<<dim3(1, batch_size), 1, 0, stream>>>(
+                remain_indices, remain_acc, NULL, NULL, buckets,
+                window_bits, windows, workers);
+        }
 
-        batch_collect_bucktes<<<batch_size, windows, 0, stream>>>(buckets, window_bits, windows);
+        batch_collect_bucktes<<<batch_size, windows, 0, stream>>>(buckets, windows, window_bits);
 
         return cudaGetLastError();
     }

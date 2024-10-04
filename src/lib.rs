@@ -501,7 +501,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             "instances and advices msm {}",
             instances.len() + advices.len()
         ));
-        let commitments = crate::cuda::msm::batch_msm::<C>(
+        let commitments = crate::cuda::msm::batch_msm::<C, _>(
             &device,
             &g_lagrange_buf,
             instances
@@ -603,8 +603,12 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 lookup_scalars.push(&permuted_input[..]);
                 lookup_scalars.push(&permuted_table[..])
             }
-            let commitments =
-                crate::cuda::msm::batch_msm::<C>(&device, &g_lagrange_buf, lookup_scalars, size)?;
+            let commitments = crate::cuda::msm::batch_msm::<C, _>(
+                &device,
+                &g_lagrange_buf,
+                lookup_scalars,
+                size,
+            )?;
             let mut tidx = 0;
             for (i, _) in single_unit_lookups.iter() {
                 lookup_permuted_commitments[i * 2] = commitments[tidx];
@@ -630,8 +634,12 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 lookup_scalars.push(&permuted_input[..]);
                 lookup_scalars.push(&permuted_table[..])
             }
-            let commitments =
-                crate::cuda::msm::batch_msm::<C>(&device, &g_lagrange_buf, lookup_scalars, size)?;
+            let commitments = crate::cuda::msm::batch_msm::<C, _>(
+                &device,
+                &g_lagrange_buf,
+                lookup_scalars,
+                size,
+            )?;
             let mut tidx = 0;
             for (i, _) in tuple_lookups.iter() {
                 lookup_permuted_commitments[i * 2] = commitments[tidx];
@@ -1085,7 +1093,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
-        let mut lookup_z_and_random_commitments = crate::cuda::msm::batch_msm::<C>(
+        let mut lookup_z_and_random_commitments = crate::cuda::msm::batch_msm::<C, _>(
             &device,
             &g_buf,
             lookups
@@ -1104,7 +1112,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "permutation z msm and intt");
-        let permutation_commitments = crate::cuda::msm::batch_msm::<C>(
+        let permutation_commitments = crate::cuda::msm::batch_msm::<C, _>(
             &device,
             &g_lagrange_buf,
             permutation_products
@@ -1132,7 +1140,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "shuffle z msm and intt");
-        let shuffle_commitments = crate::cuda::msm::batch_msm::<C>(
+        let shuffle_commitments = crate::cuda::msm::batch_msm::<C, _>(
             &device,
             &g_lagrange_buf,
             shuffle_products.iter().map(|x| &x[..]).collect::<Vec<_>>(),
@@ -1481,18 +1489,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     })),
             );
 
-        let s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-        let t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         if use_gwc {
-            gwc::multiopen(
-                &device,
-                &g_buf,
-                queries,
-                size,
-                [&s_buf, &t_buf],
-                eval_map,
-                transcript,
-            )?;
+            gwc::multiopen(&device, &g_buf, queries, size, eval_map, transcript)?;
         } else {
             shplonk::multiopen(
                 &pk,
@@ -1500,7 +1498,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 &g_buf,
                 queries,
                 size,
-                [&s_buf, &t_buf],
                 eval_map,
                 poly_buf_cache,
                 transcript,

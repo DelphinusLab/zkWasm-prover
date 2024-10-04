@@ -29,7 +29,7 @@ use crate::cuda::bn254_c::lookup_eval_h;
 use crate::cuda::bn254_c::shuffle_eval_h;
 use crate::cuda::bn254_c::shuffle_eval_h_v2;
 use crate::cuda::field_op::field_op;
-use crate::cuda::msm::batch_msm_v2;
+use crate::cuda::msm::batch_msm;
 use crate::cuda::ntt::extended_prepare;
 use crate::cuda::ntt::generate_ntt_buffers;
 use crate::cuda::ntt::ntt_raw;
@@ -443,7 +443,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
             buffers.push(s_buf);
         }
 
-        let commitments = batch_msm_v2(
+        let commitments = batch_msm(
             &device,
             &g_buf,
             buffers

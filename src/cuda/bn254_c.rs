@@ -181,8 +181,8 @@ extern "C" {
         next_remain_acc: *mut c_void,
         buckets: *mut c_void,
         workers: u32,
-        window_bits: u32,
         windows: u32,
+        window_bits: u32,
         batch_size: u32,
         stream: *mut CUstream_st,
     ) -> cudaError;
@@ -194,9 +194,10 @@ extern "C" {
         sort_buf: *mut c_void,
         indices_buf: *mut c_void,
         array_len: i32,
+        windows: i32,
         window_bits: i32,
         threads: i32,
-        max_worker: i32,
+        workers: i32,
         prepared_sort_indices_temp_storage_bytes: i32,
         stream: *mut CUstream_st,
     ) -> cudaError;
