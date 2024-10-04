@@ -74,12 +74,14 @@ pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
 
     let msm_count = scalar_buf.len();
     let window_bits = log2(msm_count).min(3) as usize + 10;
-    println!(
-        "msm_count is {}, log is {}, window_bits is {}",
-        msm_count,
-        log2(msm_count),
-        window_bits
-    );
+    if DEBUG {
+        println!(
+            "msm_count is {}, log is {}, window_bits is {}",
+            msm_count,
+            log2(msm_count),
+            window_bits
+        );
+    }
 
     let windows = (bits + window_bits - 1) / window_bits;
     let bucket_size = windows << window_bits;
@@ -372,148 +374,78 @@ pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
 }
 
 #[test]
-fn test_msm_v1() {
+fn test_msm() {
     use crate::CudaDevice;
+    use crate::{cuda::msm::batch_msm, device::Device};
     use ark_std::{end_timer, start_timer};
     use halo2_proofs::pairing::group::Curve;
     use halo2_proofs::{
-        arithmetic::CurveAffine,
+        arithmetic::BaseExt,
         pairing::bn256::{Fr, G1Affine, G1},
     };
-
-    use crate::{cuda::msm::batch_msm, device::Device};
 
     {
         let mut allocator = crate::device::cuda::CUDA_BUFFER_ALLOCATOR.lock().unwrap();
         allocator.reset((1 << 22) * core::mem::size_of::<Fr>(), 100);
     }
 
-    const L: usize = 1 << 1;
+    const CANDIDATES: usize = 1 << 8;
+    let mut candidate_scalars = vec![];
+    let mut candidate_points = vec![];
+    for i in 0..CANDIDATES {
+        candidate_scalars.push(Fr::rand());
+        candidate_points.push((G1::generator() * candidate_scalars[i]).to_affine());
+    }
 
-    let points = vec![G1::generator().to_affine(); L];
-    let scalars = vec![Fr::one(), Fr::one()];
+    let len_deg_start = 12;
+    let len_deg_end = 12;
+    let batch_deg_start = 0;
+    let batch_deg_end = 7;
+    let rounds = 4;
 
-    println!(
-        "res1 is {:?}",
-        (G1::generator() * Fr::from(1u64)).to_affine()
-    );
-    println!(
-        "res2 is {:?}",
-        (G1::generator() * Fr::from(2u64)).to_affine()
-    );
-
-    /*
-    let timer = start_timer!(|| "gen scalars");
-    let scalars = vec![0; L]
-        .par_iter()
-        .map(|_| Fr::random(rand::thread_rng()))
-        .collect::<Vec<_>>();
-    end_timer!(timer);
-    */
-
-    let device = CudaDevice::get_device(0).unwrap();
-    let p_buf = device.alloc_device_buffer_from_slice(&points[..]).unwrap();
-    for _ in 0..5 {
-        let timer = start_timer!(|| "xxx");
-        let res = batch_msm::<G1Affine, _>(&device, &p_buf, vec![&scalars], L).unwrap();
-        end_timer!(timer);
-        println!("res is {:?}", res);
-        for r in res {
-            let succ: bool = r.is_on_curve().into();
-            assert!(succ);
+    for deg in len_deg_start..=len_deg_end {
+        let len = 1 << deg;
+        let mut points = vec![];
+        let timer = start_timer!(|| "prepare point");
+        for i in 0..len {
+            points.push(candidate_points[i % CANDIDATES]);
         }
-    }
-
-    for _ in 0..5 {
-        let timer = start_timer!(|| "yyy");
-        let res = batch_msm::<G1Affine, _>(
-            &device,
-            &p_buf,
-            vec![
-                &scalars, &scalars, &scalars, &scalars, &scalars, &scalars, &scalars, &scalars,
-            ],
-            L,
-        )
-        .unwrap();
         end_timer!(timer);
-        println!("res is {:?}", res);
-        for r in res {
-            let succ: bool = r.is_on_curve().into();
-            assert!(succ);
-        }
-    }
-}
 
-#[test]
-fn test_msm_v2() {
-    use crate::CudaDevice;
-    use crate::{cuda::msm::batch_msm, device::Device};
-    use ark_std::{end_timer, start_timer};
-    use halo2_proofs::pairing::group::Curve;
-    use halo2_proofs::{
-        arithmetic::{BaseExt, CurveAffine},
-        pairing::bn256::{Fr, G1Affine, G1},
-    };
-
-    let run = 1;
-
-    {
-        let mut allocator = crate::device::cuda::CUDA_BUFFER_ALLOCATOR.lock().unwrap();
-        allocator.reset((1 << 22) * core::mem::size_of::<Fr>(), 100);
-    }
-
-    let len: usize = 1 << 12;
-
-    let timer = start_timer!(|| "prepare point");
-    let mut points = vec![G1::generator().to_affine()];
-    for _ in 0..len - 1 {
-        points.push((points.last().unwrap() + G1::generator()).to_affine());
-    }
-    end_timer!(timer);
-
-    let timer = start_timer!(|| "prepare scalars");
-    let scalars = vec![0; len]
-        .into_iter()
-        .map(|_| Fr::rand())
-        //.map(|_| Fr::from(1u64 << 26))
-        .collect::<Vec<_>>();
-    end_timer!(timer);
-
-    let timer = start_timer!(|| "calc expect");
-    let sum = scalars
-        .iter()
-        .enumerate()
-        .fold(Fr::zero(), |acc, (i, x)| acc + x * Fr::from(i as u64 + 1));
-    let expected_res = (G1::generator() * sum).to_affine();
-    end_timer!(timer);
-
-    println!("expected res is {:?}", expected_res);
-
-    let device = CudaDevice::get_device(0).unwrap();
-    let p_buf = device.alloc_device_buffer_from_slice(&points[..]).unwrap();
-    for _ in 0..run {
-        let timer = start_timer!(|| "xxx");
-        let res = batch_msm::<G1Affine, _>(&device, &p_buf, vec![&scalars], len).unwrap();
+        let timer = start_timer!(|| "prepare scalars");
+        let scalars = vec![0; len]
+            .into_iter()
+            .map(|_| Fr::rand())
+            .collect::<Vec<_>>();
         end_timer!(timer);
-        for c in res {
-            assert_eq!(c, expected_res);
-        }
-    }
 
-    for _ in 0..run {
-        let timer = start_timer!(|| "yyy");
-        let res = batch_msm::<G1Affine, _>(
-            &device,
-            &p_buf,
-            vec![
-                &scalars, &scalars, &scalars, &scalars, &scalars, &scalars, &scalars, &scalars,
-            ],
-            len,
-        )
-        .unwrap();
+        let timer = start_timer!(|| "calc expect");
+        let sum = scalars.iter().enumerate().fold(Fr::zero(), |acc, (i, x)| {
+            acc + x * candidate_scalars[i % CANDIDATES]
+        });
+        let expected_res = (G1::generator() * sum).to_affine();
         end_timer!(timer);
-        for c in res {
-            assert_eq!(c, expected_res);
+
+        let device = CudaDevice::get_device(0).unwrap();
+        let p_buf = device.alloc_device_buffer_from_slice(&points[..]).unwrap();
+        for msm_count_deg in batch_deg_start..=batch_deg_end {
+            for round in 0..rounds {
+                let timer = start_timer!(|| format!(
+                    "run msm, len_deg {}, msm_count_deg {}, round {}",
+                    deg, msm_count_deg, round
+                ));
+                let res = batch_msm::<G1Affine, _>(
+                    &device,
+                    &p_buf,
+                    vec![&scalars; 1 << msm_count_deg],
+                    len,
+                )
+                .unwrap();
+                end_timer!(timer);
+                for c in res {
+                    assert_eq!(c, expected_res);
+                }
+            }
         }
     }
 }
