@@ -1192,6 +1192,11 @@ __global__ void msm_core(
 
     for (unsigned i = start; i < end; i++)
     {
+        // if (i < n - 1)
+        // {
+        //     assert(buckets_indices[i] <= buckets_indices[i + 1]);
+        // }
+
         unsigned next_idx = buckets_indices[i];
         if (next_idx != idx)
         {
@@ -1277,10 +1282,10 @@ __global__ void batch_collect_bucktes(
     unsigned window_bits,
     unsigned windows)
 {
-    unsigned tid = blockIdx.x;
-    unsigned gid = threadIdx.x;
+    unsigned msm_id = blockIdx.x;
+    unsigned window_id = threadIdx.x;
 
-    Bn254G1 *buckets_start = &buckets[tid][gid << window_bits];
+    Bn254G1 *buckets_start = &buckets[msm_id][window_id << window_bits];
 
     Bn254G1 acc = buckets_start[(1 << window_bits) - 1];
     Bn254G1 total = acc;
@@ -1291,20 +1296,22 @@ __global__ void batch_collect_bucktes(
         total = total + acc;
     }
 
+    buckets_start[0] = total;
+
     __syncthreads();
 
-    if (gid == 0)
+    if (window_id == 0)
     {
-        acc = buckets[tid][(windows - 1) << window_bits];
+        acc = buckets[msm_id][(windows - 1) << window_bits];
         for (int i = windows - 2; i >= 0; i--)
         {
             for (int j = 0; j < window_bits; j++)
             {
                 acc = acc.ec_double();
             }
-            acc = acc + buckets[tid][i << window_bits];
+            acc = acc + buckets[msm_id][i << window_bits];
         }
-        buckets[tid][0] = acc;
+        buckets[msm_id][0] = acc;
     }
 }
 

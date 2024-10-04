@@ -14,28 +14,28 @@ pub(crate) enum FieldOp {
     Sub = 3,
 }
 
-pub(crate) fn pick_from_buf<F: FieldExt>(
+pub(crate) fn pick_from_buf<T>(
     device: &CudaDevice,
     buf: &CudaDeviceBufRaw,
     rot: isize,
     i: isize,
     size: usize,
-) -> Result<F, Error> {
-    let mut v = [F::zero()];
+) -> Result<T, Error> {
+    let mut v: [T; 1] = unsafe { std::mem::zeroed() };
     device.acitve_ctx()?;
     unsafe {
         let err = cuda_runtime_sys::cudaMemcpy(
             v.as_mut_ptr() as _,
             buf.ptr().offset(
                 ((rot + i + size as isize) & (size as isize - 1))
-                    * core::mem::size_of::<F>() as isize,
+                    * core::mem::size_of::<T>() as isize,
             ),
-            core::mem::size_of::<F>(),
+            core::mem::size_of::<T>(),
             cuda_runtime_sys::cudaMemcpyKind::cudaMemcpyDeviceToHost,
         );
         to_result((), err, "fail to pick_from_buf")?;
     }
-    Ok(v[0])
+    Ok(v.into_iter().next().unwrap())
 }
 
 pub(crate) fn field_op_v3(
