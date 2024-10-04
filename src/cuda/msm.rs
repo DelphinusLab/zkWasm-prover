@@ -14,6 +14,7 @@ use crate::device::Device;
 use crate::device::DeviceResult;
 
 const DEBUG: bool = false;
+const GPU_MEMORY_PROFILING: bool = DEBUG || false;
 
 pub(crate) trait ToDevBuffer {
     fn to_dev_buf<'a>(
@@ -73,8 +74,10 @@ pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
     let bits = 254;
 
     let msm_count = scalar_buf.len();
-    let window_bits = log2(msm_count).min(3) as usize + 10;
-    if DEBUG {
+
+    // k22, 8, 13bits is best for RTX4090
+    let window_bits = log2(msm_count).min(3) as usize + 10 + log2(len).max(22) as usize - 22;
+    if GPU_MEMORY_PROFILING {
         println!(
             "msm_count is {}, log is {}, window_bits is {}",
             msm_count,
@@ -92,11 +95,24 @@ pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
         max_worker
     };
 
+    if GPU_MEMORY_PROFILING {
+        println!(
+            "len {}, windows {}, window_bits{}, worker {}",
+            len, windows, window_bits, worker
+        );
+    }
+
     let streams = [
         CudaStreamWrapper::new_with_inner(),
         CudaStreamWrapper::new_with_inner(),
     ];
 
+    if GPU_MEMORY_PROFILING {
+        println!(
+            "scalar_dev_bufs size is {} MB",
+            (len * mem::size_of::<C::Scalar>() * 2) >> 20
+        );
+    }
     let scalar_dev_bufs = [
         device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
         device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
@@ -105,21 +121,28 @@ pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
     // About 30MB per MSM
     // layout: | bucktes | msm worker remain | collect worker remain |
     let curve_buf_size = bucket_size + worker * 2;
+    if GPU_MEMORY_PROFILING {
+        println!(
+            "curve_buf size is {} MB",
+            (msm_count * curve_buf_size * mem::size_of::<C::Curve>()) >> 20
+        );
+    }
     let curve_buf = device
         .alloc_device_buffer_non_zeroed::<C::Curve>(msm_count * curve_buf_size)
         .unwrap();
 
     let single_sort_indices_size = len * windows;
-    let sort_temp_storage_size = single_sort_indices_size * 2 * 2; // ~2N = 2 * windows * len, pick 32 as upper bound
+    let sort_temp_storage_size = single_sort_indices_size * 3; // ~2N = 2 * windows * len, pick 32 as upper bound
     let total_sort_indices_size = single_sort_indices_size * 4 + sort_temp_storage_size;
-    let sort_indices_buf = [
-        device
-            .alloc_device_buffer_non_zeroed::<u32>(total_sort_indices_size)
-            .unwrap(),
-        device
-            .alloc_device_buffer_non_zeroed::<u32>(total_sort_indices_size)
-            .unwrap(),
-    ];
+    if GPU_MEMORY_PROFILING {
+        println!(
+            "sort_indices_buf size is {} MB",
+            (total_sort_indices_size * mem::size_of::<u32>()) >> 20
+        );
+    }
+    let sort_indices_buf = device
+        .alloc_device_buffer_non_zeroed::<u32>(total_sort_indices_size)
+        .unwrap();
 
     // About 64KB per MSM
     let acc_indices_buf = (0..msm_count)
@@ -132,15 +155,17 @@ pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
         let idx = i & 1;
         let scalar_dev_buf = &scalar_dev_bufs[idx];
         let stream = &streams[idx];
+        let last_stream = &streams[1 - idx];
         stream.0.sync();
         let scalar_dev_buf = buf.to_dev_buf(device, scalar_dev_buf, &stream.0).unwrap();
+        last_stream.0.sync(); // sync to reuse sort_indices_buf
         unsafe {
             let err = msm(
                 (curve_buf.ptr() as usize + i * curve_buf_size * std::mem::size_of::<C::Curve>())
                     as _,
                 points_dev_buf.ptr(),
                 scalar_dev_buf.ptr(),
-                sort_indices_buf[idx].ptr(),
+                sort_indices_buf.ptr(),
                 acc_indices_buf[i].ptr(),
                 len as i32,
                 windows as i32,
@@ -185,7 +210,7 @@ pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
             device
                 .copy_from_device_to_host_async_v2(
                     &mut i_buf[..],
-                    &sort_indices_buf[0],
+                    &sort_indices_buf,
                     (2 * len * windows) as isize,
                     None,
                 )
@@ -193,7 +218,7 @@ pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
             device
                 .copy_from_device_to_host_async_v2(
                     &mut pi_buf[..],
-                    &sort_indices_buf[0],
+                    &sort_indices_buf,
                     (3 * len * windows) as isize,
                     None,
                 )
