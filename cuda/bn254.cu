@@ -1164,7 +1164,7 @@ __global__ void split_scalars_kernel(
 
         unsigned idx = s.get_nbits(start_bit, bits);
         p_start[i] = gid;
-        b_start[i] = idx > 0 ? (i << 16) | idx : 0;
+        b_start[i] = idx > 0 ? (i << window_bits) | idx : 0;
     }
 }
 
@@ -1202,7 +1202,7 @@ __global__ void msm_core(
         {
             if (idx > 0)
             {
-                unsigned windex = idx >> 16;
+                unsigned windex = idx >> window_bits;
                 unsigned offset = idx & offset_mask;
                 buckets[(windex << window_bits) + offset] = acc;
             }
@@ -1248,7 +1248,7 @@ __global__ void batch_collect_msm_remain(
         {
             if (idx > 0)
             {
-                unsigned windex = idx >> 16;
+                unsigned windex = idx >> window_bits;
                 unsigned offset = idx & offset_mask;
                 assert(windex < windows);
                 assert(offset < 1 << window_bits);
@@ -1265,7 +1265,7 @@ __global__ void batch_collect_msm_remain(
 
     if (workers == 1)
     {
-        unsigned windex = idx >> 16;
+        unsigned windex = idx >> window_bits;
         unsigned offset = idx & offset_mask;
         if (idx > 0)
         {
@@ -1368,9 +1368,12 @@ extern "C"
 
         unsigned *sort_indices_temp_storage{};
         size_t sort_indices_temp_storage_bytes;
+
+        int max_windows_deg = 5;
+        assert(windows <= 1 << max_windows_deg);
         CHECK_RETURN(cub::DeviceRadixSort::SortPairs(
             sort_indices_temp_storage, sort_indices_temp_storage_bytes, bucket_indices, sorted_bucket_indices,
-            point_indices, sorted_point_indices, n * windows, 0, sizeof(unsigned) * 8, stream));
+            point_indices, sorted_point_indices, n * windows, 0, window_bits + max_windows_deg, stream));
 
         bool alloc_for_sort = sort_indices_temp_storage_bytes > (unsigned)prepared_sort_indices_temp_storage_bytes;
         if (alloc_for_sort)
@@ -1385,7 +1388,7 @@ extern "C"
 
         CHECK_RETURN(cub::DeviceRadixSort::SortPairs(
             sort_indices_temp_storage, sort_indices_temp_storage_bytes, bucket_indices, sorted_bucket_indices,
-            point_indices, sorted_point_indices, n * windows, 0, sizeof(unsigned) * 8, stream));
+            point_indices, sorted_point_indices, n * windows, 0, window_bits + max_windows_deg, stream));
         if (alloc_for_sort)
         {
             CHECK_RETURN(cudaFreeAsync(sort_indices_temp_storage, stream));

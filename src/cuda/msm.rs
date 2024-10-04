@@ -403,11 +403,15 @@ fn test_msm() {
     use crate::CudaDevice;
     use crate::{cuda::msm::batch_msm, device::Device};
     use ark_std::{end_timer, start_timer};
+    use halo2_proofs::arithmetic::Field;
     use halo2_proofs::pairing::group::Curve;
     use halo2_proofs::{
         arithmetic::BaseExt,
         pairing::bn256::{Fr, G1Affine, G1},
     };
+    use rand::thread_rng;
+    use rayon::iter::IntoParallelIterator;
+    use rayon::iter::ParallelIterator;
 
     {
         let mut allocator = crate::device::cuda::CUDA_BUFFER_ALLOCATOR.lock().unwrap();
@@ -422,8 +426,8 @@ fn test_msm() {
         candidate_points.push((G1::generator() * candidate_scalars[i]).to_affine());
     }
 
-    let len_deg_start = 12;
-    let len_deg_end = 12;
+    let len_deg_start = 22;
+    let len_deg_end = 22;
     let batch_deg_start = 0;
     let batch_deg_end = 7;
     let rounds = 4;
@@ -439,8 +443,8 @@ fn test_msm() {
 
         let timer = start_timer!(|| "prepare scalars");
         let scalars = vec![0; len]
-            .into_iter()
-            .map(|_| Fr::rand())
+            .into_par_iter()
+            .map(|_| Fr::random(thread_rng()))
             .collect::<Vec<_>>();
         end_timer!(timer);
 
