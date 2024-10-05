@@ -5,11 +5,11 @@ use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
 use halo2_proofs::plonk::ProvingKey;
 use rand::rngs::OsRng;
-use rayon::iter::IndexedParallelIterator as _;
 use rayon::iter::IntoParallelIterator as _;
 use rayon::iter::IntoParallelRefIterator as _;
 use rayon::iter::IntoParallelRefMutIterator;
 use rayon::iter::ParallelIterator as _;
+use rayon::prelude::ParallelSliceMut as _;
 use rayon::slice::ParallelSlice as _;
 
 use crate::device::DeviceResult;
@@ -41,7 +41,6 @@ pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
         Vec<C::Scalar, HugePageAllocator>,
         Vec<C::Scalar, HugePageAllocator>,
         Vec<C::Scalar, HugePageAllocator>,
-        Vec<C::Scalar, HugePageAllocator>,
     )>,
 > {
     let size = 1 << pk.get_vk().domain.k();
@@ -53,17 +52,25 @@ pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
         .par_iter()
         .map(|_| {
             let mut input = Vec::new_in(HugePageAllocator);
-            input.resize(size, C::Scalar::zero());
             let mut table = Vec::new_in(HugePageAllocator);
-            table.resize(size, C::Scalar::zero());
             let mut permuted_input = Vec::new_in(HugePageAllocator);
-            permuted_input.resize(size, C::Scalar::zero());
             let mut permuted_table = Vec::new_in(HugePageAllocator);
-            permuted_table.resize(size, C::Scalar::zero());
             let mut z = Vec::new_in(HugePageAllocator);
-            z.resize(size, C::Scalar::zero());
 
-            (input, table, permuted_input, permuted_table, z)
+            for buf in [
+                &mut input,
+                &mut table,
+                &mut permuted_input,
+                &mut permuted_table,
+                &mut z,
+            ] {
+                buf.reserve(size);
+                unsafe {
+                    buf.set_len(size);
+                }
+            }
+
+            (input, table, permuted_table, z)
         })
         .collect::<Vec<_>>();
     end_timer!(timer);
@@ -77,7 +84,7 @@ pub(crate) fn prepare_permutation_buffers<C: CurveAffine>(
     let chunk_len = &pk.vk.cs.degree() - 2;
     let timer = start_timer!(|| format!(
         "prepare permutation buffer, count {}",
-        pk.vk.cs.permutation.columns.par_chunks(chunk_len).len()
+        pk.vk.cs.permutation.columns.chunks(chunk_len).len()
     ));
     let buffers = pk
         .vk
@@ -87,7 +94,12 @@ pub(crate) fn prepare_permutation_buffers<C: CurveAffine>(
         .par_chunks(chunk_len)
         .map(|_| {
             let mut z = Vec::new_in(HugePageAllocator);
-            z.resize(size, C::Scalar::one());
+            z.reserve(size);
+            unsafe {
+                z.set_len(size);
+            }
+            z.par_chunks_mut(size / 2)
+                .for_each(|c| c.fill(C::Scalar::one()));
             z
         })
         .collect::<Vec<_>>();
@@ -108,10 +120,15 @@ pub(crate) fn prepare_shuffle_buffers<C: CurveAffine>(
         .cs
         .shuffles
         .group(pk.vk.cs.degree())
-        .iter()
+        .par_iter()
         .map(|_| {
             let mut z = Vec::new_in(HugePageAllocator);
-            z.resize(size, C::Scalar::one());
+            z.reserve(size);
+            unsafe {
+                z.set_len(size);
+            }
+            z.par_chunks_mut(size / 2)
+                .for_each(|c| c.fill(C::Scalar::one()));
             z
         })
         .collect::<Vec<_>>();
