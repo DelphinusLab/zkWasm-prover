@@ -60,7 +60,6 @@ pub(crate) fn analyze_expr_tree<F: FieldExt>(
     expr_groups
 }
 
-
 pub(crate) fn lookup_classify<'a, 'b, C: CurveAffine, T>(
     pk: &'b ProvingKey<C>,
     lookups_buf: Vec<T>,
@@ -95,8 +94,7 @@ pub(crate) fn lookup_classify<'a, 'b, C: CurveAffine, T>(
     return [single_unit_lookups, single_comp_lookups, tuple_lookups];
 }
 
-
-fn _collect_involved_advices<F: FieldExt>(exprs: &[Expression<F>], units: &mut HashSet<usize>) {
+fn collect_involved_advices<F: FieldExt>(exprs: &[Expression<F>], units: &mut HashSet<usize>) {
     for expr in exprs {
         for (k, _) in ProveExpression::from_expr(expr).flatten() {
             for unit in k {
@@ -112,7 +110,7 @@ fn _collect_involved_advices<F: FieldExt>(exprs: &[Expression<F>], units: &mut H
     }
 }
 
-pub(crate) fn _analyze_involved_advices<C: CurveAffine>(
+pub(crate) fn analyze_involved_advices<C: CurveAffine>(
     pk: &ProvingKey<C>,
 ) -> (
     HashSet<usize>,
@@ -121,70 +119,85 @@ pub(crate) fn _analyze_involved_advices<C: CurveAffine>(
     HashSet<usize>,
     HashSet<usize>,
 ) {
-    let mut tuple_lookups_involved_units = HashSet::new();
-    let mut lookups_involved_units = HashSet::new();
-    let mut permutation_involved_units = HashSet::new();
-    let mut shuffle_involved_units = HashSet::new();
-
     let mut uninvolved_units = HashSet::new();
+    let mut uninvolved_units_after_single_lookup = HashSet::new();
+    let mut uninvolved_units_after_tuple_lookup = HashSet::new();
+    let mut uninvolved_units_after_permutation = HashSet::new();
+    let mut uninvolved_units_after_shuffle = HashSet::new();
+
     for i in 0..pk.vk.cs.num_advice_columns {
         uninvolved_units.insert(i);
     }
 
     for lookup in &pk.vk.cs.lookups {
         if lookup.input_expressions.len() > 1 {
-            _collect_involved_advices(
+            collect_involved_advices(
                 &lookup.input_expressions[..],
-                &mut tuple_lookups_involved_units,
+                &mut uninvolved_units_after_tuple_lookup,
             );
-            _collect_involved_advices(
+            collect_involved_advices(
                 &lookup.table_expressions[..],
-                &mut tuple_lookups_involved_units,
+                &mut uninvolved_units_after_tuple_lookup,
             );
         } else {
-            _collect_involved_advices(&lookup.input_expressions[..], &mut lookups_involved_units);
-            _collect_involved_advices(&lookup.table_expressions[..], &mut lookups_involved_units);
+            collect_involved_advices(
+                &lookup.input_expressions[..],
+                &mut uninvolved_units_after_single_lookup,
+            );
+            collect_involved_advices(
+                &lookup.table_expressions[..],
+                &mut uninvolved_units_after_single_lookup,
+            );
         }
     }
 
     for c in &pk.vk.cs.permutation.columns {
         match c.column_type() {
             Any::Advice => {
-                permutation_involved_units.insert(c.index());
+                uninvolved_units_after_permutation.insert(c.index());
             }
             _ => {}
         }
     }
 
     for shuffle in &pk.vk.cs.shuffles.0 {
-        _collect_involved_advices(&shuffle.input_expressions[..], &mut shuffle_involved_units);
-        _collect_involved_advices(
+        collect_involved_advices(
+            &shuffle.input_expressions[..],
+            &mut uninvolved_units_after_shuffle,
+        );
+        collect_involved_advices(
             &shuffle.shuffle_expressions[..],
-            &mut shuffle_involved_units,
+            &mut uninvolved_units_after_shuffle,
         );
     }
 
-    for i in tuple_lookups_involved_units.iter() {
-        lookups_involved_units.insert(*i);
-    }
-
-    for i in lookups_involved_units.iter() {
+    for i in uninvolved_units_after_shuffle.iter() {
         uninvolved_units.remove(i);
+        uninvolved_units_after_single_lookup.remove(i);
+        uninvolved_units_after_tuple_lookup.remove(i);
+        uninvolved_units_after_permutation.remove(i);
     }
 
-    for i in permutation_involved_units.iter() {
+    for i in uninvolved_units_after_permutation.iter() {
         uninvolved_units.remove(i);
+        uninvolved_units_after_single_lookup.remove(i);
+        uninvolved_units_after_tuple_lookup.remove(i);
     }
 
-    for i in shuffle_involved_units.iter() {
+    for i in uninvolved_units_after_tuple_lookup.iter() {
+        uninvolved_units.remove(i);
+        uninvolved_units_after_single_lookup.remove(i);
+    }
+
+    for i in uninvolved_units_after_single_lookup.iter() {
         uninvolved_units.remove(i);
     }
 
     return (
-        tuple_lookups_involved_units,
-        lookups_involved_units,
-        permutation_involved_units,
-        shuffle_involved_units,
         uninvolved_units,
+        uninvolved_units_after_single_lookup,
+        uninvolved_units_after_tuple_lookup,
+        uninvolved_units_after_permutation,
+        uninvolved_units_after_shuffle,
     );
 }

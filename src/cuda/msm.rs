@@ -13,6 +13,8 @@ use crate::device::cuda::{CudaDevice, CudaDeviceBufRaw, CudaStreamWrapper};
 use crate::device::Device;
 use crate::device::DeviceResult;
 
+use super::bn254::intt_raw_async;
+
 const DEBUG: bool = false;
 const GPU_MEMORY_PROFILING: bool = DEBUG || false;
 
@@ -62,6 +64,212 @@ impl<T> ToDevBuffer for &Vec<T> {
             .unwrap();
         Ok(buf)
     }
+}
+
+pub(crate) struct InttArgs<'a> {
+    pub(crate) pq_buf: &'a CudaDeviceBufRaw,
+    pub(crate) omegas_buf: &'a CudaDeviceBufRaw,
+    pub(crate) divisor_buf: &'a CudaDeviceBufRaw,
+    pub(crate) len_log: usize,
+    pub(crate) selector: &'a dyn Fn(usize) -> bool,
+}
+
+pub(crate) fn batch_msm_and_intt<'a, C: CurveAffine>(
+    device: &CudaDevice,
+    points_dev_buf: &CudaDeviceBufRaw,
+    mut scalar_buf: Vec<&mut [C::Scalar]>,
+    intt_args: InttArgs<'a>,
+    len: usize,
+) -> DeviceResult<Vec<C>> {
+    let threads = 64;
+    let bits = 254;
+
+    let msm_count = scalar_buf.len();
+
+    // k22, 8, 13bits is best for RTX4090
+    let window_bits = log2(msm_count).min(3) as usize + 10 + log2(len).max(22) as usize - 22;
+    let windows = (bits + window_bits - 1) / window_bits;
+    let bucket_size = windows << window_bits;
+    let max_worker = 128 * 512;
+    let worker = if len < max_worker {
+        (len + threads - 1) / threads * threads
+    } else {
+        max_worker
+    };
+
+    let streams = [
+        CudaStreamWrapper::new_with_inner(),
+        CudaStreamWrapper::new_with_inner(),
+    ];
+    let mut scalar_dev_bufs = [
+        device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
+        device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
+    ];
+
+    let mut intt_tmp_bufs = [
+        device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
+        device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
+    ];
+
+    // About 30MB per MSM
+    // layout: | bucktes | msm worker remain | collect worker remain |
+    let curve_buf_size = bucket_size + worker * 2;
+    let curve_buf = device
+        .alloc_device_buffer_non_zeroed::<C::Curve>(msm_count * curve_buf_size)
+        .unwrap();
+
+    let single_sort_indices_size = len * windows;
+    let sort_temp_storage_size = single_sort_indices_size * 3; // ~2N = 2 * windows * len, pick 32 as upper bound
+    let total_sort_indices_size = single_sort_indices_size * 4 + sort_temp_storage_size;
+
+    let sort_indices_buf = device
+        .alloc_device_buffer_non_zeroed::<u32>(total_sort_indices_size)
+        .unwrap();
+
+    let acc_indices_buf = (0..msm_count)
+        .into_iter()
+        .map(|_| device.alloc_device_buffer_non_zeroed::<u32>(worker * 2))
+        .collect::<DeviceResult<Vec<_>>>()
+        .unwrap();
+
+    for i in 0..msm_count {
+        let idx = i & 1;
+        let scalar_dev_buf = &scalar_dev_bufs[idx];
+        let stream = &streams[idx];
+        let last_stream = &streams[1 - idx];
+        stream.0.sync();
+
+        device
+            .copy_from_host_to_device_async(scalar_dev_buf, &scalar_buf[i][..], stream.1)
+            .unwrap();
+        last_stream.0.sync(); // sync to reuse sort_indices_buf
+
+        // copy the last buf
+        if i > 0 && (intt_args.selector)(i - 1) {
+            device
+                .copy_from_device_to_host_async(
+                    &mut scalar_buf[i - 1][..],
+                    &scalar_dev_bufs[1 - idx],
+                    streams[1 - idx].1,
+                )
+                .unwrap();
+        }
+
+        let scalar_dev_buf = &scalar_dev_bufs[idx];
+        unsafe {
+            let err = msm(
+                (curve_buf.ptr() as usize + i * curve_buf_size * std::mem::size_of::<C::Curve>())
+                    as _,
+                points_dev_buf.ptr(),
+                scalar_dev_buf.ptr(),
+                sort_indices_buf.ptr(),
+                acc_indices_buf[i].ptr(),
+                len as i32,
+                windows as i32,
+                window_bits as i32,
+                threads as i32,
+                worker as i32,
+                (sort_temp_storage_size * mem::size_of::<u32>()) as i32,
+                stream.1,
+            );
+            assert_eq!(err, cudaError::cudaSuccess);
+        }
+
+        if (intt_args.selector)(i) {
+            intt_raw_async(
+                device,
+                &mut scalar_dev_bufs[idx],
+                &mut intt_tmp_bufs[idx],
+                intt_args.pq_buf,
+                intt_args.omegas_buf,
+                intt_args.divisor_buf,
+                intt_args.len_log,
+                Some(stream.1),
+            )
+            .unwrap();
+        }
+    }
+
+    device
+        .copy_from_device_to_host_async(
+            *scalar_buf.last_mut().unwrap(),
+            &scalar_dev_bufs[1 - (msm_count & 1)],
+            streams[1 - (msm_count & 1)].1,
+        )
+        .unwrap();
+    drop(streams);
+
+    let mut remain_indices_ptr = vec![];
+    let mut remain_acc_ptr = vec![];
+    let mut next_remain_indices_ptr = vec![];
+    let mut next_remain_acc_ptr = vec![];
+    let mut buckets_ptr = vec![];
+
+    let bucket_base = curve_buf.ptr() as usize;
+    for i in 0..msm_count {
+        let indices_base = acc_indices_buf[i].ptr() as usize;
+        let curr_bucket_offset = curve_buf_size * i;
+        let curve_size = std::mem::size_of::<C::Curve>();
+
+        remain_indices_ptr.push(indices_base);
+        next_remain_indices_ptr.push(indices_base + worker * std::mem::size_of::<u32>());
+
+        let ptr = bucket_base + curr_bucket_offset * curve_size;
+        buckets_ptr.push(ptr);
+
+        let ptr = ptr + bucket_size * curve_size;
+        remain_acc_ptr.push(ptr);
+
+        let ptr = ptr + worker * curve_size;
+        next_remain_acc_ptr.push(ptr);
+    }
+
+    unsafe {
+        let err = batch_msm_collect(
+            device
+                .alloc_device_buffer_from_slice(&remain_indices_ptr[..])
+                .unwrap()
+                .ptr(),
+            device
+                .alloc_device_buffer_from_slice(&remain_acc_ptr[..])
+                .unwrap()
+                .ptr(),
+            device
+                .alloc_device_buffer_from_slice(&next_remain_indices_ptr[..])
+                .unwrap()
+                .ptr(),
+            device
+                .alloc_device_buffer_from_slice(&next_remain_acc_ptr[..])
+                .unwrap()
+                .ptr(),
+            device
+                .alloc_device_buffer_from_slice(&buckets_ptr[..])
+                .unwrap()
+                .ptr(),
+            worker as u32,
+            windows as u32,
+            window_bits as u32,
+            msm_count as u32,
+            0 as _,
+        );
+
+        assert_eq!(err, cudaError::cudaSuccess);
+    }
+
+    let mut res = vec![C::identity().to_curve(); msm_count];
+    for i in 0..msm_count {
+        device
+            .copy_from_device_to_host_async_v2(
+                &mut res[i..i + 1],
+                &curve_buf,
+                (curve_buf_size * i) as isize,
+                None,
+            )
+            .unwrap();
+    }
+    device.synchronize().unwrap();
+
+    Ok(res.into_iter().map(|c| c.to_affine()).collect())
 }
 
 pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(

@@ -13,12 +13,14 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::thread;
 
+use analyze::analyze_involved_advices;
 use analyze::lookup_classify;
 use ark_std::end_timer;
 use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
 use buffer::prepare_lookup_buffer;
 use cuda::bn254::intt_raw_async;
+use cuda::msm::InttArgs;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
@@ -386,6 +388,14 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
         let intt_divisor_buf = device
             .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
+
+        let (
+            uninvolved_units,
+            uninvolved_units_after_single_lookup,
+            uninvolved_units_after_tuple_lookup,
+            uninvolved_units_after_permutation,
+            uninvolved_units_after_shuffle,
+        ) = analyze_involved_advices(pk);
         end_timer!(timer);
 
         let timer = start_timer!(|| "copy g_lagrange buffer");
@@ -493,20 +503,30 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             "instances and advices msm {}",
             instances.len() + advices.len()
         ));
-        let commitments = crate::cuda::msm::batch_msm::<C, _>(
+
+        let commitments = crate::cuda::msm::batch_msm_and_intt::<C>(
             &device,
             &g_lagrange_buf,
-            instances
-                .iter()
-                .chain(advices.iter())
-                .map(|x| &x[..])
-                .collect(),
+            unsafe {
+                Arc::get_mut_unchecked(&mut advices)
+                    .iter_mut()
+                    .chain(Arc::get_mut_unchecked(&mut instances).iter_mut())
+                    .map(|x| &mut x[..])
+                    .collect()
+            },
+            InttArgs {
+                pq_buf: &intt_pq_buf,
+                omegas_buf: &intt_omegas_buf,
+                divisor_buf: &intt_divisor_buf,
+                len_log: k,
+                selector: &|x| uninvolved_units.contains(&x),
+            },
             size,
         )?;
-        for commitment in commitments.iter().take(instances.len()) {
+        for commitment in commitments.iter().skip(advices.len()) {
             transcript.common_point(*commitment).unwrap();
         }
-        for commitment in commitments.into_iter().skip(instances.len()) {
+        for commitment in commitments.into_iter().take(advices.len()) {
             transcript.write_point(commitment).unwrap();
         }
         end_timer!(timer);
@@ -612,6 +632,25 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         }
         end_timer!(timer);
 
+        let timer = start_timer!(|| format!("uninvolved instance after single lookup intt"));
+        let buffers = unsafe {
+            Arc::get_mut_unchecked(&mut advices)
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| uninvolved_units_after_single_lookup.contains(i))
+                .map(|(_, x)| &mut x[..])
+                .collect::<Vec<_>>()
+        };
+        batch_intt_raw(
+            &device,
+            buffers,
+            &intt_pq_buf,
+            &intt_omegas_buf,
+            &intt_divisor_buf,
+            k,
+        )?;
+        end_timer!(timer);
+
         let timer = start_timer!(|| "wait tuple lookup");
         let mut tuple_lookups = tuple_lookup_handler.join().unwrap();
         end_timer!(timer);
@@ -636,6 +675,25 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 tidx += 2;
             }
         }
+        end_timer!(timer);
+
+        let timer = start_timer!(|| format!("uninvolved instance after tuple lookup intt"));
+        let buffers = unsafe {
+            Arc::get_mut_unchecked(&mut advices)
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| uninvolved_units_after_tuple_lookup.contains(i))
+                .map(|(_, x)| &mut x[..])
+                .collect::<Vec<_>>()
+        };
+        batch_intt_raw(
+            &device,
+            buffers,
+            &intt_pq_buf,
+            &intt_omegas_buf,
+            &intt_divisor_buf,
+            k,
+        )?;
         end_timer!(timer);
 
         for commitment in lookup_permuted_commitments.into_iter() {
@@ -1101,22 +1159,36 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "permutation z msm and intt");
-        let permutation_commitments = crate::cuda::msm::batch_msm::<C, _>(
+        let permutation_commitments = crate::cuda::msm::batch_msm_and_intt::<C>(
             &device,
             &g_lagrange_buf,
-            permutation_products
-                .iter()
-                .map(|x| &x[..])
-                .collect::<Vec<_>>(),
-            size,
-        )?;
-
-        batch_intt_raw(
-            &device,
             permutation_products
                 .iter_mut()
                 .map(|x| &mut x[..])
                 .collect::<Vec<_>>(),
+            InttArgs {
+                pq_buf: &intt_pq_buf,
+                omegas_buf: &intt_omegas_buf,
+                divisor_buf: &intt_divisor_buf,
+                len_log: k,
+                selector: &|_| true,
+            },
+            size,
+        )?;
+        end_timer!(timer);
+
+        let timer = start_timer!(|| format!("uninvolved instance after permutation intt"));
+        let buffers = unsafe {
+            Arc::get_mut_unchecked(&mut advices)
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| uninvolved_units_after_permutation.contains(i))
+                .map(|(_, x)| &mut x[..])
+                .collect::<Vec<_>>()
+        };
+        batch_intt_raw(
+            &device,
+            buffers,
             &intt_pq_buf,
             &intt_omegas_buf,
             &intt_divisor_buf,
@@ -1129,25 +1201,23 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "shuffle z msm and intt");
-        let shuffle_commitments = crate::cuda::msm::batch_msm::<C, _>(
+        let shuffle_commitments = crate::cuda::msm::batch_msm_and_intt::<C>(
             &device,
             &g_lagrange_buf,
-            shuffle_products.iter().map(|x| &x[..]).collect::<Vec<_>>(),
-            size,
-        )?;
-        drop(g_lagrange_buf);
-
-        batch_intt_raw(
-            &device,
             shuffle_products
                 .iter_mut()
                 .map(|x| &mut x[..])
                 .collect::<Vec<_>>(),
-            &intt_pq_buf,
-            &intt_omegas_buf,
-            &intt_divisor_buf,
-            k,
+            InttArgs {
+                pq_buf: &intt_pq_buf,
+                omegas_buf: &intt_omegas_buf,
+                divisor_buf: &intt_divisor_buf,
+                len_log: k,
+                selector: &|_| true,
+            },
+            size,
         )?;
+        drop(g_lagrange_buf);
         end_timer!(timer);
 
         for commitment in permutation_commitments {
@@ -1180,7 +1250,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     .chain(
                         Arc::get_mut_unchecked(&mut advices)
                             .iter_mut()
-                            .map(|x| &mut x[..]),
+                            .enumerate()
+                            .filter(|(i, _)| uninvolved_units_after_shuffle.contains(i))
+                            .map(|(_, x)| &mut x[..]),
                     )
                     .collect::<Vec<_>>()
             };
