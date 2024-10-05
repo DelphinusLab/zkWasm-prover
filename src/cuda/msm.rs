@@ -97,7 +97,7 @@ pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
 
     if GPU_MEMORY_PROFILING {
         println!(
-            "len {}, windows {}, window_bits{}, worker {}",
+            "len {}, windows {}, window_bits {}, worker {}",
             len, windows, window_bits, worker
         );
     }

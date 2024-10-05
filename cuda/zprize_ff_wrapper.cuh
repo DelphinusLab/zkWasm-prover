@@ -28,7 +28,7 @@ public:
         this->value = {0};
     }
 
-    __device__ Field unmont_assign()
+    __device__ void unmont_assign()
     {
         this->value = FD::from_montgomery(this->value);
     }

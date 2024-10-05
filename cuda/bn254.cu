@@ -198,7 +198,7 @@ __global__ void _ntt_core(
         const Bn254FrField *x = _x + index;
         Bn254FrField *y = _y + ((index - k) << deg) + k;
 
-        __shared__ Bn254FrField u[512];
+        extern __shared__ Bn254FrField u[];
         uint base_exp = (n >> log_p >> deg) * k;
         for (uint i = counts; i < counte; i++)
         {
@@ -919,7 +919,7 @@ extern "C"
             int blocks = total >> (deg - 1);
             blocks = blocks > 65536 ? 65536 : blocks;
             int grids = (total / blocks) >> (deg - 1);
-            _ntt_core<<<blocks, threads, 0, stream>>>(src, dst, pq, omegas, len, p, deg, max_deg, grids);
+            _ntt_core<<<blocks, threads, 512 * sizeof(Bn254FrField), stream>>>(src, dst, pq, omegas, len, p, deg, max_deg, grids);
 
             Bn254FrField *t = src;
             src = dst;
@@ -1140,35 +1140,55 @@ extern "C"
 }
 
 __global__ void split_scalars_kernel(
-    unsigned *buckets_indices,
+    unsigned *zero_indices,
+    unsigned *bucket_indices,
     unsigned *point_indices,
     Bn254FrField *scalars,
-    unsigned window_bits,
     unsigned windows,
+    unsigned window_bits,
     unsigned n)
 {
+    unsigned tasks = n;
+
+    unsigned lid = threadIdx.x;
     unsigned gid = (blockIdx.x * blockDim.x) + threadIdx.x;
-    if (gid >= n)
-        return;
+    unsigned workers = gridDim.x * blockDim.x;
+    unsigned tpw = (tasks + workers - 1) / workers;
+    unsigned start = tpw * gid > tasks ? tasks : tpw * gid;
+    unsigned end = start + tpw > tasks ? tasks : start + tpw;
 
-    Bn254FrField s = scalars[gid];
-    s.unmont_assign();
-    unsigned *p_start = &point_indices[gid * windows];
-    unsigned *b_start = &buckets_indices[gid * windows];
+    unsigned local_zero_index = 0;
 
-    for (unsigned i = 0; i < windows; i++)
+    for (unsigned i = start; i < end; i++)
     {
-        unsigned start_bit = i * window_bits;
-        unsigned remain_bits = 254 - start_bit;
-        unsigned bits = remain_bits < window_bits ? remain_bits : window_bits;
+        Bn254FrField s = scalars[i];
+        s.unmont_assign();
 
-        unsigned idx = s.get_nbits(start_bit, bits);
-        p_start[i] = gid;
-        b_start[i] = idx > 0 ? (i << window_bits) | idx : 0;
+        for (unsigned widx = 0; widx < windows; widx++)
+        {
+            unsigned start_bit = widx * window_bits;
+            unsigned remain_bits = 254 - start_bit;
+            unsigned bits = remain_bits < window_bits ? remain_bits : window_bits;
+
+            unsigned idx = s.get_nbits(start_bit, bits);
+            if (idx > 0)
+            {
+                point_indices[i * windows + widx] = i;
+                bucket_indices[i * windows + widx] = (widx << window_bits) | idx;
+            }
+            else
+            {
+                bucket_indices[i * windows + widx] = 0;
+                local_zero_index++;
+            }
+        }
     }
+
+    atomicAdd(zero_indices, local_zero_index);
 }
 
 __global__ void msm_core(
+    unsigned *zero_indices,
     unsigned *buckets_indices,
     unsigned *point_indices,
     unsigned *remain_indices,
@@ -1179,11 +1199,12 @@ __global__ void msm_core(
     unsigned windows,
     unsigned n)
 {
+    unsigned skips = *zero_indices;
     unsigned gid = (blockIdx.x * blockDim.x) + threadIdx.x;
     unsigned workers = gridDim.x * blockDim.x;
-    unsigned tasks = n * windows;
+    unsigned tasks = n * windows - skips;
     unsigned tpw = (tasks + workers - 1) / workers;
-    unsigned start = tpw * gid;
+    unsigned start = tpw * gid > tasks ? tasks : tpw * gid;
     unsigned end = start + tpw > tasks ? tasks : start + tpw;
 
     unsigned offset_mask = (1 << window_bits) - 1;
@@ -1362,16 +1383,21 @@ extern "C"
         unsigned *sorted_bucket_indices = point_indices + n * windows;
         unsigned *sorted_point_indices = sorted_bucket_indices + n * windows;
 
-        unsigned blocks = (n + threads - 1) / threads;
+        assert(workers % threads == 0);
+        unsigned blocks = workers / threads;
+
+        unsigned *zero_buckets = acc_indices_buf + workers;
+        CHECK_RETURN(cudaMemsetAsync(zero_buckets, 0, sizeof(unsigned), stream));
         split_scalars_kernel<<<blocks, threads, 0, stream>>>(
-            bucket_indices, point_indices, scalars, window_bits, windows, n);
+            zero_buckets,
+            bucket_indices, point_indices, scalars, windows, window_bits, n);
 
         unsigned *sort_indices_temp_storage{};
         size_t sort_indices_temp_storage_bytes;
 
         int max_windows_deg = 5;
         assert(windows <= 1 << max_windows_deg);
-        CHECK_RETURN(cub::DeviceRadixSort::SortPairs(
+        CHECK_RETURN(cub::DeviceRadixSort::SortPairsDescending(
             sort_indices_temp_storage, sort_indices_temp_storage_bytes, bucket_indices, sorted_bucket_indices,
             point_indices, sorted_point_indices, n * windows, 0, window_bits + max_windows_deg, stream));
 
@@ -1386,7 +1412,7 @@ extern "C"
             sort_indices_temp_storage = sorted_point_indices + n * windows;
         }
 
-        CHECK_RETURN(cub::DeviceRadixSort::SortPairs(
+        CHECK_RETURN(cub::DeviceRadixSort::SortPairsDescending(
             sort_indices_temp_storage, sort_indices_temp_storage_bytes, bucket_indices, sorted_bucket_indices,
             point_indices, sorted_point_indices, n * windows, 0, window_bits + max_windows_deg, stream));
         if (alloc_for_sort)
@@ -1399,10 +1425,9 @@ extern "C"
         unsigned groups = (tasks + threads - 1) / threads;
         init_bucktes<<<groups, threads, 0, stream>>>(buckets, tasks);
 
-        assert(workers % threads == 0);
-        blocks = workers / threads;
         Bn254G1 *remain_acc = &res[windows << window_bits];
         msm_core<<<blocks, threads, 0, stream>>>(
+            zero_buckets,
             sorted_bucket_indices, sorted_point_indices,
             acc_indices_buf, remain_acc,
             buckets, points, window_bits, windows, n);
