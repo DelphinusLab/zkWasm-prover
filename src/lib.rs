@@ -341,8 +341,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         {
             let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
-            let count = if k < 23 { 140 } else { 67 };
-            allocator.reset((1 << k) * core::mem::size_of::<C::Scalar>(), count);
+            // reserve 21GB
+            allocator.reset((1 << 22) * core::mem::size_of::<C::Scalar>(), 168);
         }
 
         let meta = &pk.vk.cs;
@@ -1339,7 +1339,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         collection.sort_by(|a, b| a.1 .1.len().cmp(&b.1 .1.len()));
 
         let mut poly_buf_cache = BTreeMap::new();
-        let cache_count = 80;
+        let cache_count = 160 >> (k.max(22) - 22); // 160 for k22
 
         for i in 0..collection.len() {
             let (p, arr) = &collection[i].1;
