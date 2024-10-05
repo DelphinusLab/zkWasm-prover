@@ -1139,8 +1139,8 @@ extern "C"
     }
 }
 
-__global__ void split_scalars_kernel(
-    unsigned *zero_indices,
+__global__ void count_nonzero_buckets(
+    unsigned *non_zero_count,
     unsigned *bucket_indices,
     unsigned *point_indices,
     Bn254FrField *scalars,
@@ -1157,7 +1157,7 @@ __global__ void split_scalars_kernel(
     unsigned start = tpw * gid > tasks ? tasks : tpw * gid;
     unsigned end = start + tpw > tasks ? tasks : start + tpw;
 
-    unsigned local_zero_index = 0;
+    unsigned local_nonzero_index = 0;
 
     for (unsigned i = start; i < end; i++)
     {
@@ -1173,22 +1173,104 @@ __global__ void split_scalars_kernel(
             unsigned idx = s.get_nbits(start_bit, bits);
             if (idx > 0)
             {
-                point_indices[i * windows + widx] = i;
-                bucket_indices[i * windows + widx] = (widx << window_bits) | idx;
-            }
-            else
-            {
-                bucket_indices[i * windows + widx] = 0;
-                local_zero_index++;
+                local_nonzero_index++;
             }
         }
     }
 
-    atomicAdd(zero_indices, local_zero_index);
+    non_zero_count[gid] = local_nonzero_index;
+}
+
+__global__ void acc_nonzero_buckets(
+    unsigned *non_zero_count,
+    unsigned n)
+{
+    unsigned tasks = n;
+    unsigned gid = threadIdx.x;
+    unsigned workers = blockDim.x;
+    unsigned tpw = (tasks + workers - 1) / workers;
+    unsigned start = tpw * gid > tasks ? tasks : tpw * gid;
+    unsigned end = start + tpw > tasks ? tasks : start + tpw;
+
+    extern __shared__ unsigned acc[];
+
+    for (unsigned i = start + 1; i < end; i++)
+    {
+        non_zero_count[i] += non_zero_count[i - 1];
+    }
+
+    if (start < n)
+    {
+        acc[gid] = non_zero_count[end - 1];
+    }
+
+    __syncthreads();
+
+    if (gid == 0)
+    {
+        for (int i = 1; i < blockDim.x; i++)
+        {
+            acc[i] += acc[i - 1];
+        }
+    }
+
+    __syncthreads();
+
+    if (gid != 0)
+    {
+        for (unsigned i = start; i < end; i++)
+        {
+            non_zero_count[i] += acc[gid - 1];
+        }
+    }
+}
+
+__global__ void fill_buckte_indices(
+    unsigned *non_zero_count,
+    unsigned *total_bucket_indices,
+    unsigned *total_point_indices,
+    Bn254FrField *scalars,
+    unsigned windows,
+    unsigned window_bits,
+    unsigned n)
+{
+    unsigned tasks = n;
+
+    unsigned lid = threadIdx.x;
+    unsigned gid = (blockIdx.x * blockDim.x) + threadIdx.x;
+    unsigned workers = gridDim.x * blockDim.x;
+    unsigned tpw = (tasks + workers - 1) / workers;
+    unsigned start = tpw * gid > tasks ? tasks : tpw * gid;
+    unsigned end = start + tpw > tasks ? tasks : start + tpw;
+
+    unsigned offset = gid == 0 ? 0 : non_zero_count[gid - 1];
+    unsigned *point_indices = &total_point_indices[offset];
+    unsigned *bucket_indices = &total_bucket_indices[offset];
+    unsigned indices_idx = 0;
+
+    for (unsigned i = start; i < end; i++)
+    {
+        Bn254FrField s = scalars[i];
+        s.unmont_assign();
+
+        for (unsigned widx = 0; widx < windows; widx++)
+        {
+            unsigned start_bit = widx * window_bits;
+            unsigned remain_bits = 254 - start_bit;
+            unsigned bits = remain_bits < window_bits ? remain_bits : window_bits;
+
+            unsigned idx = s.get_nbits(start_bit, bits);
+            if (idx > 0)
+            {
+                point_indices[indices_idx] = i;
+                bucket_indices[indices_idx] = (widx << window_bits) | idx;
+                indices_idx++;
+            }
+        }
+    }
 }
 
 __global__ void msm_core(
-    unsigned *zero_indices,
     unsigned *buckets_indices,
     unsigned *point_indices,
     unsigned *remain_indices,
@@ -1199,10 +1281,9 @@ __global__ void msm_core(
     unsigned windows,
     unsigned n)
 {
-    unsigned skips = *zero_indices;
     unsigned gid = (blockIdx.x * blockDim.x) + threadIdx.x;
     unsigned workers = gridDim.x * blockDim.x;
-    unsigned tasks = n * windows - skips;
+    unsigned tasks = n;
     unsigned tpw = (tasks + workers - 1) / workers;
     unsigned start = tpw * gid > tasks ? tasks : tpw * gid;
     unsigned end = start + tpw > tasks ? tasks : start + tpw;
@@ -1386,11 +1467,22 @@ extern "C"
         assert(workers % threads == 0);
         unsigned blocks = workers / threads;
 
-        unsigned *zero_buckets = acc_indices_buf + workers;
-        CHECK_RETURN(cudaMemsetAsync(zero_buckets, 0, sizeof(unsigned), stream));
-        split_scalars_kernel<<<blocks, threads, 0, stream>>>(
-            zero_buckets,
+        unsigned *non_zero_buckets = acc_indices_buf + workers;
+        CHECK_RETURN(cudaMemsetAsync(non_zero_buckets, 0, workers * sizeof(unsigned), stream));
+        count_nonzero_buckets<<<blocks, threads, 0, stream>>>(
+            non_zero_buckets,
             bucket_indices, point_indices, scalars, windows, window_bits, n);
+
+        acc_nonzero_buckets<<<1, 64, 64 * sizeof(unsigned), stream>>>(
+            non_zero_buckets, workers);
+
+        fill_buckte_indices<<<blocks, threads, 0, stream>>>(
+            non_zero_buckets,
+            bucket_indices, point_indices, scalars, windows, window_bits, n);
+
+        unsigned non_zero_count = 0;
+        cudaMemcpyAsync(&non_zero_count, &non_zero_buckets[workers - 1], sizeof(unsigned), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
 
         unsigned *sort_indices_temp_storage{};
         size_t sort_indices_temp_storage_bytes;
@@ -1399,7 +1491,7 @@ extern "C"
         assert(windows <= 1 << max_windows_deg);
         CHECK_RETURN(cub::DeviceRadixSort::SortPairsDescending(
             sort_indices_temp_storage, sort_indices_temp_storage_bytes, bucket_indices, sorted_bucket_indices,
-            point_indices, sorted_point_indices, n * windows, 0, window_bits + max_windows_deg, stream));
+            point_indices, sorted_point_indices, non_zero_count, 0, window_bits + max_windows_deg, stream));
 
         bool alloc_for_sort = sort_indices_temp_storage_bytes > (unsigned)prepared_sort_indices_temp_storage_bytes;
         if (alloc_for_sort)
@@ -1414,7 +1506,7 @@ extern "C"
 
         CHECK_RETURN(cub::DeviceRadixSort::SortPairsDescending(
             sort_indices_temp_storage, sort_indices_temp_storage_bytes, bucket_indices, sorted_bucket_indices,
-            point_indices, sorted_point_indices, n * windows, 0, window_bits + max_windows_deg, stream));
+            point_indices, sorted_point_indices, non_zero_count, 0, window_bits + max_windows_deg, stream));
         if (alloc_for_sort)
         {
             CHECK_RETURN(cudaFreeAsync(sort_indices_temp_storage, stream));
@@ -1427,10 +1519,9 @@ extern "C"
 
         Bn254G1 *remain_acc = &res[windows << window_bits];
         msm_core<<<blocks, threads, 0, stream>>>(
-            zero_buckets,
             sorted_bucket_indices, sorted_point_indices,
             acc_indices_buf, remain_acc,
-            buckets, points, window_bits, windows, n);
+            buckets, points, window_bits, windows, non_zero_count);
 
         return cudaGetLastError();
     }

@@ -88,7 +88,7 @@ pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
 
     let windows = (bits + window_bits - 1) / window_bits;
     let bucket_size = windows << window_bits;
-    let max_worker = 64 * 512;
+    let max_worker = 128 * 512;
     let worker = if len < max_worker {
         (len + threads - 1) / threads * threads
     } else {
@@ -144,7 +144,6 @@ pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
         .alloc_device_buffer_non_zeroed::<u32>(total_sort_indices_size)
         .unwrap();
 
-    // About 64KB per MSM
     let acc_indices_buf = (0..msm_count)
         .into_iter()
         .map(|_| device.alloc_device_buffer_non_zeroed::<u32>(worker * 2))
