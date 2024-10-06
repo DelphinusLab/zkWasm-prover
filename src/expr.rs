@@ -187,7 +187,7 @@ pub fn _evaluate_exprs<F: FieldExt>(
         });
 }
 
-fn _pick_prove_unit_slice<'a, F: FieldExt>(
+fn pick_prove_unit_slice<'a, F: FieldExt>(
     unit: &ProveExpressionUnit,
     fixed: &'a [&'a [F]],
     advice: &'a [&'a [F]],
@@ -208,7 +208,6 @@ fn _pick_prove_unit_slice<'a, F: FieldExt>(
         } => (&instance[*column_index], rotation.0),
     }
 }
-
 
 /// Simple evaluation of an expression
 pub(crate) fn evaluate_exprs<F: FieldExt>(
@@ -286,11 +285,13 @@ pub(crate) fn evaluate_exprs_in_gpu<F: FieldExt>(
 ) -> DeviceResult<Vec<CudaDeviceBufRaw>> {
     let mut unit_buffers = BTreeMap::new();
     let mut handlers = vec![];
-    for (i, expr) in exprs.into_iter().enumerate() {
-        let expr = flatten_tuple_expressions(expr, None, theta);
 
-        let stream_wrapper = CudaStreamWrapper::new();
-        let stream = (&stream_wrapper).into();
+    let (copy_sw, copy_stream) = CudaStreamWrapper::new_with_inner();
+    let (calc_sw, calc_stream) = CudaStreamWrapper::new_with_inner();
+
+    for (i, raw_expr) in exprs.into_iter().enumerate() {
+        let expr = flatten_tuple_expressions(raw_expr, None, theta);
+
         let mut coeffs = vec![];
         for (_, y_map) in expr.iter() {
             assert_eq!(y_map.len(), 1);
@@ -300,15 +301,15 @@ pub(crate) fn evaluate_exprs_in_gpu<F: FieldExt>(
             }
         }
 
-        let coeffs_buf = device.alloc_device_buffer_from_slice_async(&coeffs[..], stream)?;
+        let coeffs_buf = device.alloc_device_buffer_from_slice_async(&coeffs[..], calc_stream)?;
 
         let mut terms = vec![]; // Array of polynomial terms [coeff0, x0, y0, ..., nil, coeff1, x1, y1, ...]
         let mut rots = vec![];
-        for (i, (units, _)) in expr.into_iter().enumerate() {
+        for (j, (units, _)) in expr.into_iter().enumerate() {
             terms.push(unsafe {
                 coeffs_buf
                     .ptr()
-                    .offset((i * core::mem::size_of::<F>()) as isize)
+                    .offset((j * core::mem::size_of::<F>()) as isize)
             });
 
             for (unit, exp) in units {
@@ -317,11 +318,18 @@ pub(crate) fn evaluate_exprs_in_gpu<F: FieldExt>(
                         column_index,
                         rotation,
                     } => (advice_buffer.get(&column_index).unwrap(), rotation.0),
+                    ProveExpressionUnit::Instance {
+                        column_index,
+                        rotation,
+                    } => (
+                        advice_buffer.get(&(column_index + advice.len())).unwrap(),
+                        rotation.0,
+                    ),
                     _ => {
-                        let (values, rot) = _pick_prove_unit_slice(&unit, fixed, advice, instance);
-                        let buf = unit_buffers.entry(unit).or_insert_with(|| {
+                        let (values, rot) = pick_prove_unit_slice(&unit, fixed, advice, instance);
+                        let buf = unit_buffers.entry(unit.clone()).or_insert_with(move || {
                             device
-                                .alloc_device_buffer_from_slice_async(values, stream)
+                                .alloc_device_buffer_from_slice_async(values, copy_stream)
                                 .unwrap()
                         });
                         (&*buf, rot)
@@ -336,10 +344,11 @@ pub(crate) fn evaluate_exprs_in_gpu<F: FieldExt>(
             terms.push(0usize as _);
         }
 
-        let terms_buf = device.alloc_device_buffer_from_slice_async(&terms[..], stream)?;
-        let rots_buf = device.alloc_device_buffer_from_slice_async(&rots[..], stream)?;
-        let res = device.alloc_device_buffer::<F>(size)?;
+        let terms_buf = device.alloc_device_buffer_from_slice_async(&terms[..], calc_stream)?;
+        let rots_buf = device.alloc_device_buffer_from_slice_async(&rots[..], calc_stream)?;
+        let res = device.alloc_device_buffer_async::<F>(size, &calc_sw)?;
 
+        copy_sw.sync();
         let err = unsafe {
             field_op_batch_mul_sum(
                 res.ptr(),
@@ -347,14 +356,14 @@ pub(crate) fn evaluate_exprs_in_gpu<F: FieldExt>(
                 rots_buf.ptr(),
                 terms.len() as i32,
                 size as i32,
-                stream,
+                calc_stream,
             )
         };
 
         to_result((), err, "fail to run field_op_batch_mul_sum")?;
 
-        device.copy_from_device_to_host_async(outputs[i], &res, stream)?;
-        handlers.push((res, terms_buf, rots_buf, stream_wrapper))
+        device.copy_from_device_to_host_async(outputs[i], &res, calc_stream)?;
+        handlers.push((res, coeffs_buf, terms_buf, rots_buf))
     }
 
     let mut res = vec![];

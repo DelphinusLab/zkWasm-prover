@@ -428,16 +428,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             )
         });
 
-        let s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-        let t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-
-        // Advice MSM
+        // GPU Task: MSM & INTT of advices & instances
         let timer = start_timer!(|| format!(
             "instances and advices msm {}",
             instances.len() + advices.len()
         ));
-
-        let advices_len = advices.len();
 
         let (commitments, advice_device_buffers) = crate::cuda::msm::batch_msm_and_intt::<C>(
             &device,
@@ -456,7 +451,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 len_log: k,
                 selector: &|x| uninvolved_units.contains(&x),
             },
-            &|x| !uninvolved_units.contains(&x) && x < advices_len,
+            &|x| !uninvolved_units.contains(&x),
             size,
         )?;
         for commitment in commitments.iter().skip(advices.len()) {
@@ -480,10 +475,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         ) = lookup_handler.join().unwrap();
         end_timer!(timer);
 
+        // GPU Task: Evaluate tuple lookup input/table buffer
         //let mut lookup_device_buffers = BTreeMap::new();
-        // tuple lookup prepare input/table buffer
-
-        /*
         {
             let timer = start_timer!(|| "eval tuple lookup buffer");
             let mut tuple_lookup_exprs = vec![];
@@ -500,18 +493,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
             let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
 
-            evaluate_exprs_in_gpu(
-                &device,
-                &advice_device_buffers,
-                &tuple_lookup_exprs[..],
-                fixed_ref,
-                advice_ref,
-                instance_ref,
-                theta,
-                &mut tuple_host_buffers[..],
-                size,
-            )?;
-
             let tuple_lookup_device_buffers = evaluate_exprs_in_gpu(
                 &device,
                 &advice_device_buffers,
@@ -525,18 +506,19 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             )?;
 
             let mut tuple_lookup_device_buffers_iter = tuple_lookup_device_buffers.into_iter();
-
+/*
             for (i, _) in tuple_lookups.iter() {
                 lookup_device_buffers
                     .insert((*i, 0), tuple_lookup_device_buffers_iter.next().unwrap());
                 lookup_device_buffers
                     .insert((*i, 1), tuple_lookup_device_buffers_iter.next().unwrap());
             }
-
-            assert_eq!(tuple_lookup_device_buffers_iter.count(), 0);
+*/
+//            assert_eq!(tuple_lookup_device_buffers_iter.count(), 0);
             end_timer!(timer);
         }
-        */
+        drop(advice_device_buffers);
+//        drop(lookup_device_buffers);
 
         // After theta
         let sub_pk = pk;
@@ -557,19 +539,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 buffers.push((&pk.vk.cs.lookups[*i].input_expressions[..], &mut input[..]));
                 buffers.push((&pk.vk.cs.lookups[*i].table_expressions[..], &mut table[..]));
             }
-
-            buffers.into_par_iter().for_each(|(expr, buffer)| {
-                evaluate_exprs(
-                    expr,
-                    size,
-                    1,
-                    fixed_ref,
-                    advice_ref,
-                    instance_ref,
-                    theta,
-                    buffer,
-                )
-            });
 
             let tuple_lookups = tuple_lookups
                 .into_par_iter()
@@ -965,9 +934,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
-        drop(s_buf);
-        drop(t_buf);
-        drop(advice_device_buffers);
         let timer = start_timer!(|| "h_poly");
         {
             let timer = start_timer!(|| "instances and advices intt");
