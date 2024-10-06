@@ -105,6 +105,7 @@ pub(crate) fn batch_msm_and_intt<'a, C: CurveAffine>(
         CudaStreamWrapper::new_with_inner(),
         CudaStreamWrapper::new_with_inner(),
     ];
+
     let mut scalar_dev_bufs = [
         device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
         device.alloc_device_buffer::<C::Scalar>(len).unwrap(),

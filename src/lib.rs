@@ -19,7 +19,6 @@ use ark_std::start_timer;
 use buffer::prepare_lookup_buffer;
 use cuda::bn254::intt_raw_async;
 use cuda::msm::InttArgs;
-use device::cuda::CudaStreamWrapper;
 use eval_poly::batch_poly_eval;
 use expr::evaluate_exprs;
 use halo2_proofs::arithmetic::CurveAffine;
@@ -273,6 +272,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let timer = start_timer!(|| "proof prepare");
         let k = pk.get_vk().domain.k() as usize;
         let size = 1 << pk.get_vk().domain.k();
+        let advices_len = advices.len();
+        let instances_len = instances.len();
         println!("k is {}", k);
         print_pinned_cache_info();
 
@@ -434,7 +435,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             instances.len() + advices.len()
         ));
 
-        let (commitments, advice_device_buffers) = crate::cuda::msm::batch_msm_and_intt::<C>(
+        let (commitments, mut advice_device_buffers) = crate::cuda::msm::batch_msm_and_intt::<C>(
             &device,
             &g_lagrange_buf,
             unsafe {
@@ -476,7 +477,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         // GPU Task: Evaluate tuple lookup input/table buffer
-        //let mut lookup_device_buffers = BTreeMap::new();
+        let mut lookup_device_buffers = BTreeMap::new();
         {
             let timer = start_timer!(|| "eval tuple lookup buffer");
             let mut tuple_lookup_exprs = vec![];
@@ -506,40 +507,21 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             )?;
 
             let mut tuple_lookup_device_buffers_iter = tuple_lookup_device_buffers.into_iter();
-/*
+
             for (i, _) in tuple_lookups.iter() {
                 lookup_device_buffers
                     .insert((*i, 0), tuple_lookup_device_buffers_iter.next().unwrap());
                 lookup_device_buffers
                     .insert((*i, 1), tuple_lookup_device_buffers_iter.next().unwrap());
             }
-*/
-//            assert_eq!(tuple_lookup_device_buffers_iter.count(), 0);
+
+            assert_eq!(tuple_lookup_device_buffers_iter.count(), 0);
             end_timer!(timer);
         }
-        drop(advice_device_buffers);
-//        drop(lookup_device_buffers);
 
         // After theta
-        let sub_pk = pk;
-        let sub_advices = advices.clone();
-        let sub_instance = instances.clone();
         let tuple_lookup_handler = s.spawn(move || {
-            let pk = sub_pk;
-            let advices = sub_advices;
-            let instances = sub_instance;
             let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
-
-            let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-
-            let mut buffers = vec![];
-            for (i, (input, table, _, _)) in tuple_lookups.iter_mut() {
-                buffers.push((&pk.vk.cs.lookups[*i].input_expressions[..], &mut input[..]));
-                buffers.push((&pk.vk.cs.lookups[*i].table_expressions[..], &mut table[..]));
-            }
-
             let tuple_lookups = tuple_lookups
                 .into_par_iter()
                 .map(|(i, (mut input, mut table, permuted_table, z))| {
@@ -604,8 +586,16 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .map(|(_, x)| &mut x[..])
                 .collect::<Vec<_>>()
         };
+
+        let s_bufs = (0..advices_len)
+            .into_iter()
+            .filter(|i| uninvolved_units_after_single_lookup.contains(i))
+            .map(|i| advice_device_buffers.remove(&i).unwrap())
+            .collect();
+
         batch_intt_raw(
             &device,
+            s_bufs,
             buffers,
             &intt_pq_buf,
             &intt_omegas_buf,
@@ -649,8 +639,16 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .map(|(_, x)| &mut x[..])
                 .collect::<Vec<_>>()
         };
+
+        let s_bufs = (0..advices_len)
+            .into_iter()
+            .filter(|i| uninvolved_units_after_tuple_lookup.contains(i))
+            .map(|i| advice_device_buffers.remove(&i).unwrap())
+            .collect();
+
         batch_intt_raw(
             &device,
+            s_bufs,
             buffers,
             &intt_pq_buf,
             &intt_omegas_buf,
@@ -771,13 +769,24 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
                     crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
 
-                    for (d_buf, h_buf) in [
-                        (&*input_buf, &mut input[..]),
-                        (&*table_buf, &mut table[..]),
-                        (&*permuted_input_buf, &mut permuted_input[..]),
-                        (&*permuted_table_buf, &mut permuted_table[..]),
-                    ] {
-                        device.copy_from_host_to_device_async(d_buf, h_buf, stream)?;
+                    for (j, (d_buf, h_buf)) in [
+                        (&mut *input_buf, &mut input[..]),
+                        (&mut *table_buf, &mut table[..]),
+                        (&mut *permuted_input_buf, &mut permuted_input[..]),
+                        (&mut *permuted_table_buf, &mut permuted_table[..]),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let buf = lookup_device_buffers.remove(&(*i, j));
+                        match buf {
+                            Some(buf) => {
+                                *d_buf = buf;
+                            }
+                            None => {
+                                device.copy_from_host_to_device_async(&*d_buf, h_buf, stream)?;
+                            }
+                        }
                     }
 
                     let err = eval_lookup_z(
@@ -883,8 +892,16 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .map(|(_, x)| &mut x[..])
                 .collect::<Vec<_>>()
         };
+
+        let s_bufs = (0..advices_len)
+            .into_iter()
+            .filter(|i| uninvolved_units_after_permutation.contains(i))
+            .map(|i| advice_device_buffers.remove(&i).unwrap())
+            .collect();
+
         batch_intt_raw(
             &device,
+            s_bufs,
             buffers,
             &intt_pq_buf,
             &intt_omegas_buf,
@@ -939,20 +956,26 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let timer = start_timer!(|| "instances and advices intt");
 
             let buffers = unsafe {
-                Arc::get_mut_unchecked(&mut instances)
+                Arc::get_mut_unchecked(&mut advices)
                     .iter_mut()
-                    .map(|x| &mut x[..])
+                    .enumerate()
+                    .filter(|(i, _)| uninvolved_units_after_shuffle.contains(i))
+                    .map(|(_, x)| &mut x[..])
                     .chain(
-                        Arc::get_mut_unchecked(&mut advices)
+                        Arc::get_mut_unchecked(&mut instances)
                             .iter_mut()
-                            .enumerate()
-                            .filter(|(i, _)| uninvolved_units_after_shuffle.contains(i))
-                            .map(|(_, x)| &mut x[..]),
+                            .map(|x| &mut x[..]),
                     )
                     .collect::<Vec<_>>()
             };
+
+            let s_bufs = (0..advices_len + instances_len)
+                .into_iter()
+                .filter_map(|i| advice_device_buffers.remove(&i))
+                .collect();
             batch_intt_raw(
                 &device,
+                s_bufs,
                 buffers,
                 &intt_pq_buf,
                 &intt_omegas_buf,

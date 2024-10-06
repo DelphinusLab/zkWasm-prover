@@ -148,6 +148,7 @@ pub fn intt_raw(
 
 pub fn batch_intt_raw<F: FieldExt>(
     device: &CudaDevice,
+    mut s_buf: Vec<CudaDeviceBufRaw>,
     value: Vec<&mut [F]>,
     pq_buf: &CudaDeviceBufRaw,
     omegas_buf: &CudaDeviceBufRaw,
@@ -159,11 +160,9 @@ pub fn batch_intt_raw<F: FieldExt>(
     let size = 1 << len_log;
     let mut streams = [None; MAX_CONCURRENCY];
     let mut t_buf = [0; MAX_CONCURRENCY].map(|_| device.alloc_device_buffer::<F>(size).unwrap());
-    let mut s_buf = [0; MAX_CONCURRENCY].map(|_| device.alloc_device_buffer::<F>(size).unwrap());
 
     for (i, col) in value.into_iter().enumerate() {
         let idx = i % MAX_CONCURRENCY;
-        let s_buf = &mut s_buf[idx];
         let t_buf = &mut t_buf[idx];
 
         unsafe {
@@ -175,10 +174,9 @@ pub fn batch_intt_raw<F: FieldExt>(
             let mut stream = std::mem::zeroed();
             let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
             crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
-            device.copy_from_host_to_device_async(&s_buf, &col[..], stream)?;
             intt_raw_async(
                 &device,
-                s_buf,
+                &mut s_buf[i],
                 t_buf,
                 &pq_buf,
                 &omegas_buf,
@@ -186,7 +184,7 @@ pub fn batch_intt_raw<F: FieldExt>(
                 len_log,
                 Some(stream),
             )?;
-            device.copy_from_device_to_host_async(&mut col[..], &s_buf, stream)?;
+            device.copy_from_device_to_host_async(&mut col[..], &s_buf[i], stream)?;
             streams[idx] = Some(stream);
         }
     }

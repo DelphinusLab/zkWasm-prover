@@ -1,7 +1,6 @@
 use crate::cuda::bn254_c::field_op_batch_mul_sum;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaStreamWrapper;
-use crate::device::Device;
 use crate::device::DeviceResult;
 use crate::to_result;
 use crate::CudaDevice;
