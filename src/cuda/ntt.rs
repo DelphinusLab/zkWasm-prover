@@ -132,7 +132,7 @@ pub(crate) fn _batch_ntt_raw<F: FieldExt>(
     const MAX_CONCURRENCY: usize = 3;
 
     let size = 1 << len_log;
-    let streams = [0; MAX_CONCURRENCY].map(|_| CudaStreamWrapper::_new());
+    let streams = [0; MAX_CONCURRENCY].map(|_| CudaStreamWrapper::new());
     let mut t_buf =
         [0; MAX_CONCURRENCY].map(|_| device.alloc_device_buffer_non_zeroed::<F>(size).unwrap());
 

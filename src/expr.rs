@@ -209,7 +209,71 @@ fn _pick_prove_unit_slice<'a, F: FieldExt>(
     }
 }
 
-pub(crate) fn _evaluate_exprs_in_gpu<F: FieldExt>(
+
+/// Simple evaluation of an expression
+pub(crate) fn evaluate_exprs<F: FieldExt>(
+    expressions: &[Expression<F>],
+    size: usize,
+    rot_scale: i32,
+    fixed: &[&[F]],
+    advice: &[&[F]],
+    instance: &[&[F]],
+    theta: F,
+    res: &mut [F],
+) {
+    let isize = size as i32;
+    let get_rotation_idx = |idx: usize, rot: i32, rot_scale: i32, isize: i32| -> usize {
+        (((idx as i32) + (rot * rot_scale)).rem_euclid(isize)) as usize
+    };
+
+    let chunks = 8;
+    let chunk_size = size / chunks;
+
+    res.par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(chunk_idx, res_chunck)| {
+            for (i, value) in res_chunck.into_iter().enumerate() {
+                let idx = chunk_idx * chunk_size + i;
+                for (i, expression) in expressions.iter().enumerate() {
+                    let v = expression.evaluate(
+                        &|scalar| scalar,
+                        &|_| panic!("virtual selectors are removed during optimization"),
+                        &|_, column_index, rotation| {
+                            fixed[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
+                        },
+                        &|_, column_index, rotation| {
+                            advice[column_index]
+                                [get_rotation_idx(idx, rotation.0, rot_scale, isize)]
+                        },
+                        &|_, column_index, rotation| {
+                            instance[column_index]
+                                [get_rotation_idx(idx, rotation.0, rot_scale, isize)]
+                        },
+                        &|a| -a,
+                        &|a, b| a + &b,
+                        &|a, b| {
+                            let a = a();
+                            if a == F::zero() {
+                                a
+                            } else {
+                                a * b()
+                            }
+                        },
+                        &|a, scalar| a * scalar,
+                    );
+
+                    if i > 0 && *value != F::zero() {
+                        *value = *value * theta;
+                        *value += v;
+                    } else {
+                        *value = v;
+                    }
+                }
+            }
+        });
+}
+
+pub(crate) fn evaluate_exprs_in_gpu<F: FieldExt>(
     device: &CudaDevice,
     advice_buffer: &HashMap<usize, CudaDeviceBufRaw>,
     exprs: &[&[Expression<F>]],
@@ -225,7 +289,7 @@ pub(crate) fn _evaluate_exprs_in_gpu<F: FieldExt>(
     for (i, expr) in exprs.into_iter().enumerate() {
         let expr = flatten_tuple_expressions(expr, None, theta);
 
-        let stream_wrapper = CudaStreamWrapper::_new();
+        let stream_wrapper = CudaStreamWrapper::new();
         let stream = (&stream_wrapper).into();
         let mut coeffs = vec![];
         for (_, y_map) in expr.iter() {

@@ -1147,7 +1147,6 @@ __global__ void count_nonzero_buckets(
 {
     unsigned tasks = n;
 
-    unsigned lid = threadIdx.x;
     unsigned gid = (blockIdx.x * blockDim.x) + threadIdx.x;
     unsigned workers = gridDim.x * blockDim.x;
     unsigned tpw = (tasks + workers - 1) / workers;
@@ -1233,7 +1232,6 @@ __global__ void fill_buckte_indices(
 {
     unsigned tasks = n;
 
-    unsigned lid = threadIdx.x;
     unsigned gid = (blockIdx.x * blockDim.x) + threadIdx.x;
     unsigned workers = gridDim.x * blockDim.x;
     unsigned tpw = (tasks + workers - 1) / workers;

@@ -4,8 +4,8 @@
 #[macro_use]
 extern crate lazy_static;
 
+use std::collections::BTreeMap;
 use std::iter;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -19,25 +19,21 @@ use ark_std::start_timer;
 use buffer::prepare_lookup_buffer;
 use cuda::bn254::intt_raw_async;
 use cuda::msm::InttArgs;
+use device::cuda::CudaStreamWrapper;
 use eval_poly::batch_poly_eval;
+use expr::evaluate_exprs;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
-use halo2_proofs::pairing::group::ff::BatchInvert as _;
-use halo2_proofs::plonk::Any;
 use halo2_proofs::plonk::Expression;
 use halo2_proofs::plonk::ProvingKey;
 use halo2_proofs::poly::commitment::Params;
 use halo2_proofs::poly::Rotation;
 use halo2_proofs::transcript::EncodedChallenge;
 use halo2_proofs::transcript::TranscriptWrite;
-use rayon::iter::IndexedParallelIterator as _;
-use rayon::iter::IntoParallelIterator as _;
-use rayon::iter::IntoParallelRefIterator as _;
-use rayon::iter::IntoParallelRefMutIterator as _;
-use rayon::iter::ParallelIterator as _;
-use rayon::prelude::ParallelSliceMut as _;
-use rayon::slice::ParallelSlice as _;
+use permutation::generate_permutation_product;
+use rayon::prelude::*;
+use shuffle::generate_shuffle_product;
 
 use crate::buffer::*;
 use crate::cuda::bn254::batch_intt_raw;
@@ -50,6 +46,7 @@ use crate::device::cuda::CudaDeviceBufRaw;
 use crate::device::cuda::CUDA_BUFFER_ALLOCATOR;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
+use crate::expr::evaluate_exprs_in_gpu;
 use crate::expr::is_expression_pure_unit;
 use crate::hugetlb::print_pinned_cache_info;
 use crate::hugetlb::HugePageAllocator;
@@ -70,6 +67,8 @@ mod eval_poly;
 mod expr;
 mod hugetlb;
 mod multiopen;
+mod permutation;
+mod shuffle;
 
 const ADD_RANDOM: bool = true;
 
@@ -215,69 +214,6 @@ pub(crate) fn evaluate_expr<F: FieldExt>(
     }
 }
 
-/// Simple evaluation of an expression
-pub(crate) fn evaluate_exprs<F: FieldExt>(
-    expressions: &[Expression<F>],
-    size: usize,
-    rot_scale: i32,
-    fixed: &[&[F]],
-    advice: &[&[F]],
-    instance: &[&[F]],
-    theta: F,
-    res: &mut [F],
-) {
-    let isize = size as i32;
-    let get_rotation_idx = |idx: usize, rot: i32, rot_scale: i32, isize: i32| -> usize {
-        (((idx as i32) + (rot * rot_scale)).rem_euclid(isize)) as usize
-    };
-
-    let chunks = 8;
-    let chunk_size = size / chunks;
-
-    res.par_chunks_mut(chunk_size)
-        .enumerate()
-        .for_each(|(chunk_idx, res_chunck)| {
-            for (i, value) in res_chunck.into_iter().enumerate() {
-                let idx = chunk_idx * chunk_size + i;
-                for (i, expression) in expressions.iter().enumerate() {
-                    let v = expression.evaluate(
-                        &|scalar| scalar,
-                        &|_| panic!("virtual selectors are removed during optimization"),
-                        &|_, column_index, rotation| {
-                            fixed[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                        },
-                        &|_, column_index, rotation| {
-                            advice[column_index]
-                                [get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                        },
-                        &|_, column_index, rotation| {
-                            instance[column_index]
-                                [get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                        },
-                        &|a| -a,
-                        &|a, b| a + &b,
-                        &|a, b| {
-                            let a = a();
-                            if a == F::zero() {
-                                a
-                            } else {
-                                a * b()
-                            }
-                        },
-                        &|a, scalar| a * scalar,
-                    );
-
-                    if i > 0 && *value != F::zero() {
-                        *value = *value * theta;
-                        *value += v;
-                    } else {
-                        *value = v;
-                    }
-                }
-            }
-        });
-}
-
 pub fn create_proof_from_advices<
     C: CurveAffine,
     E: EncodedChallenge<C>,
@@ -348,8 +284,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let meta = &pk.vk.cs;
         let unusable_rows_start = size - (meta.blinding_factors() + 1);
-        let omega = pk.get_vk().domain.get_omega();
-
         let domain = &pk.vk.domain;
 
         pk.vk.hash_into(transcript).unwrap();
@@ -503,7 +437,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             instances.len() + advices.len()
         ));
 
-        let commitments = crate::cuda::msm::batch_msm_and_intt::<C>(
+        let advices_len = advices.len();
+
+        let (commitments, advice_device_buffers) = crate::cuda::msm::batch_msm_and_intt::<C>(
             &device,
             &g_lagrange_buf,
             unsafe {
@@ -520,6 +456,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 len_log: k,
                 selector: &|x| uninvolved_units.contains(&x),
             },
+            &|x| !uninvolved_units.contains(&x) && x < advices_len,
             size,
         )?;
         for commitment in commitments.iter().skip(advices.len()) {
@@ -542,6 +479,64 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             random_poly,
         ) = lookup_handler.join().unwrap();
         end_timer!(timer);
+
+        //let mut lookup_device_buffers = BTreeMap::new();
+        // tuple lookup prepare input/table buffer
+
+        /*
+        {
+            let timer = start_timer!(|| "eval tuple lookup buffer");
+            let mut tuple_lookup_exprs = vec![];
+            let mut tuple_host_buffers = vec![];
+            for (i, (input, table, _, _)) in tuple_lookups.iter_mut() {
+                tuple_lookup_exprs.push(&pk.vk.cs.lookups[*i].input_expressions[..]);
+                tuple_lookup_exprs.push(&pk.vk.cs.lookups[*i].table_expressions[..]);
+
+                tuple_host_buffers.push(&mut input[..]);
+                tuple_host_buffers.push(&mut table[..]);
+            }
+
+            let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+            let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+            let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+
+            evaluate_exprs_in_gpu(
+                &device,
+                &advice_device_buffers,
+                &tuple_lookup_exprs[..],
+                fixed_ref,
+                advice_ref,
+                instance_ref,
+                theta,
+                &mut tuple_host_buffers[..],
+                size,
+            )?;
+
+            let tuple_lookup_device_buffers = evaluate_exprs_in_gpu(
+                &device,
+                &advice_device_buffers,
+                &tuple_lookup_exprs[..],
+                fixed_ref,
+                advice_ref,
+                instance_ref,
+                theta,
+                &mut tuple_host_buffers[..],
+                size,
+            )?;
+
+            let mut tuple_lookup_device_buffers_iter = tuple_lookup_device_buffers.into_iter();
+
+            for (i, _) in tuple_lookups.iter() {
+                lookup_device_buffers
+                    .insert((*i, 0), tuple_lookup_device_buffers_iter.next().unwrap());
+                lookup_device_buffers
+                    .insert((*i, 1), tuple_lookup_device_buffers_iter.next().unwrap());
+            }
+
+            assert_eq!(tuple_lookup_device_buffers_iter.count(), 0);
+            end_timer!(timer);
+        }
+        */
 
         // After theta
         let sub_pk = pk;
@@ -708,141 +703,52 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         lookups.append(&mut tuple_lookups);
         lookups.sort_by(|l, r| usize::cmp(&l.0, &r.0));
 
-        let chunk_len = &pk.vk.cs.degree() - 2;
-
+        // CPU Task: Generate Permutation product and Shuffle product
         let waker = Arc::new((Mutex::new(false), Condvar::new()));
         let waiter = Arc::clone(&waker);
         let permutation_products_handler = {
             let timer = start_timer!(|| format!(
                 "product permutation {}",
-                (&pk).vk.cs.permutation.columns.chunks(chunk_len).len()
+                (&pk)
+                    .vk
+                    .cs
+                    .permutation
+                    .columns
+                    .chunks(&pk.vk.cs.degree() - 2)
+                    .len()
             ));
 
             let sub_pk = pk;
             let sub_advices = advices.clone();
             let sub_instance = instances.clone();
             let permutation_products_handler = s.spawn(move || {
-                let pk = sub_pk;
-                let advices = sub_advices;
-                let instances = sub_instance;
-
-                let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-                let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-                let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-                let mut p_z = pk
-                    .vk
-                    .cs
-                    .permutation
-                    .columns
-                    .par_chunks(chunk_len)
-                    .zip((&pk).permutation.permutations.par_chunks(chunk_len))
-                    .zip(permutations)
-                    .enumerate()
-                    .map(|(i, ((columns, permutations), mut modified_values))| {
-                        let mut delta_omega =
-                            C::Scalar::DELTA.pow_vartime([i as u64 * chunk_len as u64]);
-
-                        let chunk_size = size >> 2;
-                        // Iterate over each column of the permutation
-                        for (j, (&column, permuted_column_values)) in
-                            columns.iter().zip(permutations.iter()).enumerate()
-                        {
-                            let values = match column.column_type() {
-                                Any::Advice => advice_ref,
-                                Any::Fixed => fixed_ref,
-                                Any::Instance => instance_ref,
-                            };
-                            modified_values
-                                .par_chunks_mut(chunk_size)
-                                .zip(permuted_column_values.par_chunks(chunk_size))
-                                .zip(values[column.index()].par_chunks(chunk_size))
-                                .for_each(|((res, p), v)| {
-                                    for i in 0..chunk_size {
-                                        if j == 0 {
-                                            res[i] = beta * p[i] + &gamma + v[i];
-                                        } else {
-                                            res[i] *= &(beta * p[i] + &gamma + v[i]);
-                                        }
-                                    }
-                                });
-                        }
-
-                        // Invert to obtain the denominator for the permutation product polynomial
-                        modified_values.par_chunks_mut(chunk_size).for_each(|x| {
-                            x.iter_mut().batch_invert();
-                        });
-
-                        // Iterate over each column again, this time finishing the computation
-                        // of the entire fraction by computing the numerators
-                        for &column in columns.iter() {
-                            let values = match column.column_type() {
-                                Any::Advice => advice_ref,
-                                Any::Fixed => fixed_ref,
-                                Any::Instance => instance_ref,
-                            };
-
-                            modified_values
-                                .par_chunks_mut(chunk_size)
-                                .zip(values[column.index()].par_chunks(chunk_size))
-                                .enumerate()
-                                .for_each(|(idx, (res, v))| {
-                                    let mut delta_omega = delta_omega
-                                        * omega.pow_vartime([(idx * chunk_size) as u64])
-                                        * &beta;
-                                    for i in 0..chunk_size {
-                                        res[i] *= &(delta_omega + &gamma + v[i]);
-                                        delta_omega *= &omega;
-                                    }
-                                });
-
-                            delta_omega *= &C::Scalar::DELTA;
-                        }
-
-                        modified_values
-                    })
-                    .collect::<Vec<_>>();
+                let z = generate_permutation_product(
+                    sub_pk,
+                    sub_instance,
+                    sub_advices,
+                    permutations,
+                    beta,
+                    gamma,
+                    size,
+                    unusable_rows_start,
+                );
 
                 let (lock, cvar) = &*waker;
                 let mut started = lock.lock().unwrap();
                 *started = true;
                 cvar.notify_one();
 
-                let mut tails: Vec<_> = p_z
-                    .par_iter_mut()
-                    .map(|z| {
-                        let mut tmp = C::Scalar::one();
-                        for i in 0..size {
-                            std::mem::swap(&mut tmp, &mut z[i]);
-                            tmp = tmp * z[i];
-                        }
-
-                        fill_random(&mut z[unusable_rows_start + 1..]);
-                        z[unusable_rows_start]
-                    })
-                    .collect();
-
-                for i in 1..tails.len() {
-                    tails[i] = tails[i] * tails[i - 1];
-                }
-
-                p_z.par_iter_mut().skip(1).enumerate().for_each(|(i, z)| {
-                    for row in 0..=unusable_rows_start {
-                        z[row] = z[row] * tails[i];
-                    }
-                });
-
-                p_z
+                z
             });
             end_timer!(timer);
             permutation_products_handler
         };
 
         let shuffle_products_handler = {
-            let shuffle_groups = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
             let timer = start_timer!(|| format!(
                 "product shuffles total={}, group={}",
                 (&pk).vk.cs.shuffles.0.len(),
-                shuffle_groups.len()
+                pk.vk.cs.shuffles.group(pk.vk.cs.degree()).len()
             ));
 
             let sub_pk = pk;
@@ -855,203 +761,25 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     started = cvar.wait(started).unwrap();
                 }
 
-                let pk = sub_pk;
-                let advices = sub_advices;
-                let instances = sub_instance;
-
-                let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-                let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-                let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-
-                let mut more_buffer_groups = shuffle_groups
-                    .par_iter()
-                    .map(|group| {
-                        group
-                            .0
-                            .iter()
-                            .map(|elements| {
-                                let input_buffer = if elements.input_expressions.len() == 1
-                                    && is_expression_pure_unit(&elements.input_expressions[0])
-                                {
-                                    None
-                                } else {
-                                    let mut buffer = Vec::new_in(HugePageAllocator);
-                                    buffer.resize(size, C::Scalar::zero());
-                                    Some(buffer)
-                                };
-
-                                let shuffle_buffer = if elements.shuffle_expressions.len() == 1
-                                    && is_expression_pure_unit(&elements.input_expressions[0])
-                                {
-                                    None
-                                } else {
-                                    let mut buffer = Vec::new_in(HugePageAllocator);
-                                    buffer.resize(size, C::Scalar::zero());
-                                    Some(buffer)
-                                };
-                                (input_buffer, shuffle_buffer)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-
-                let f = |expr: &Expression<_>| {
-                    if let Some(_) = expr.is_constant() {
-                        unreachable!()
-                    } else if let Some(idx) = expr.is_pure_fixed() {
-                        &fixed_ref[idx][..]
-                    } else if let Some(idx) = expr.is_pure_instance() {
-                        &instance_ref[idx][..]
-                    } else if let Some(idx) = expr.is_pure_advice() {
-                        &advice_ref[idx][..]
-                    } else {
-                        unreachable!()
-                    }
-                };
-
-                let buffer_groups = shuffle_groups
-                    .par_iter()
-                    .zip(more_buffer_groups.par_iter_mut())
-                    .map(|(group, buffers)| {
-                        group
-                            .0
-                            .par_iter()
-                            .zip(buffers.par_iter_mut())
-                            .map(|(elements, buffer)| {
-                                let mut tuple_expres = vec![];
-                                if !(elements.input_expressions.len() == 1
-                                    && is_expression_pure_unit(&elements.input_expressions[0]))
-                                {
-                                    tuple_expres.push((
-                                        &elements.input_expressions[..],
-                                        buffer.0.as_mut().unwrap(),
-                                    ));
-                                }
-                                if !(elements.shuffle_expressions.len() == 1
-                                    && is_expression_pure_unit(&elements.shuffle_expressions[0]))
-                                {
-                                    tuple_expres.push((
-                                        &elements.shuffle_expressions[..],
-                                        buffer.1.as_mut().unwrap(),
-                                    ))
-                                }
-                                tuple_expres.into_par_iter().for_each(|(expr, buffer)| {
-                                    evaluate_exprs(
-                                        expr,
-                                        size,
-                                        1,
-                                        fixed_ref,
-                                        advice_ref,
-                                        instance_ref,
-                                        theta,
-                                        buffer,
-                                    )
-                                });
-
-                                let input_buffer_ref = if elements.input_expressions.len() == 1
-                                    && is_expression_pure_unit(&elements.input_expressions[0])
-                                {
-                                    f(&elements.input_expressions[0])
-                                } else {
-                                    buffer.0.as_ref().unwrap()
-                                };
-                                let shuffle_buffer_ref = if elements.shuffle_expressions.len() == 1
-                                    && is_expression_pure_unit(&elements.shuffle_expressions[0])
-                                {
-                                    f(&elements.shuffle_expressions[0])
-                                } else {
-                                    buffer.1.as_ref().unwrap()
-                                };
-                                (input_buffer_ref, shuffle_buffer_ref)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-
-                let mut p_z = buffer_groups
-                    .par_iter()
-                    .zip(shuffles.into_par_iter())
-                    .map(|(group, mut modified_values)| {
-                        let beta_pows: Vec<C::Scalar> = (0..group.len())
-                            .map(|i| beta.pow_vartime([1 + i as u64, 0, 0, 0]))
-                            .collect();
-
-                        let chunk_size = size >> 2;
-                        group.iter().zip(beta_pows.iter()).enumerate().for_each(
-                            |(j, (e, beta_pow_i))| {
-                                modified_values
-                                    .par_chunks_mut(chunk_size)
-                                    .zip(e.1.par_chunks(chunk_size))
-                                    .for_each(|(values, shuffles)| {
-                                        for i in 0..chunk_size {
-                                            if j == 0 {
-                                                values[i] = shuffles[i] + beta_pow_i;
-                                            } else {
-                                                values[i] *= &(shuffles[i] + beta_pow_i);
-                                            }
-                                        }
-                                    })
-                            },
-                        );
-                        modified_values.par_chunks_mut(chunk_size).for_each(|x| {
-                            x.iter_mut().batch_invert();
-                        });
-                        group
-                            .iter()
-                            .zip(beta_pows.iter())
-                            .for_each(|(e, beta_pow_i)| {
-                                modified_values
-                                    .par_chunks_mut(chunk_size)
-                                    .zip(e.0.par_chunks(chunk_size))
-                                    .for_each(|(values, inputs)| {
-                                        for i in 0..chunk_size {
-                                            values[i] *= &(inputs[i] + beta_pow_i);
-                                        }
-                                    })
-                            });
-                        modified_values
-                    })
-                    .collect::<Vec<_>>();
-
-                p_z.par_iter_mut().for_each(|z| {
-                    let chunks = 4;
-                    let chunk_size = (size + chunks - 1) / chunks;
-
-                    let mut tails = z
-                        .par_chunks_mut(chunk_size)
-                        .map(|z| {
-                            let mut tmp = C::Scalar::one();
-                            for i in 0..z.len() {
-                                std::mem::swap(&mut tmp, &mut z[i]);
-                                tmp = tmp * z[i];
-                            }
-                            tmp
-                        })
-                        .collect::<Vec<_>>();
-
-                    for i in 1..tails.len() {
-                        tails[i] = tails[i] * tails[i - 1];
-                    }
-
-                    z.par_chunks_mut(chunk_size)
-                        .skip(1)
-                        .zip(tails.into_par_iter())
-                        .for_each(|(z, tail)| {
-                            for x in z.iter_mut() {
-                                *x = *x * tail;
-                            }
-                        });
-
-                    fill_random(&mut z[unusable_rows_start + 1..]);
-                });
-                p_z
+                generate_shuffle_product(
+                    sub_pk,
+                    sub_instance,
+                    sub_advices,
+                    shuffles,
+                    beta,
+                    theta,
+                    size,
+                    unusable_rows_start,
+                )
             });
             end_timer!(timer);
             shuffle_products_handler
         };
 
+        // GPU Task: Generate Lookup product
         let timer = start_timer!(|| "generate lookup z");
         {
+            use std::rc::Rc;
             const MAX_CONCURRENCY: usize = 3;
             let mut streams = [None; MAX_CONCURRENCY];
             let mut buffers = [0; MAX_CONCURRENCY].map(|_| {
@@ -1158,7 +886,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "permutation z msm and intt");
-        let permutation_commitments = crate::cuda::msm::batch_msm_and_intt::<C>(
+        let (permutation_commitments, _) = crate::cuda::msm::batch_msm_and_intt::<C>(
             &device,
             &g_lagrange_buf,
             permutation_products
@@ -1172,6 +900,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 len_log: k,
                 selector: &|_| true,
             },
+            &|_| false,
             size,
         )?;
         end_timer!(timer);
@@ -1200,7 +929,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "shuffle z msm and intt");
-        let shuffle_commitments = crate::cuda::msm::batch_msm_and_intt::<C>(
+        let (shuffle_commitments, _) = crate::cuda::msm::batch_msm_and_intt::<C>(
             &device,
             &g_lagrange_buf,
             shuffle_products
@@ -1214,6 +943,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 len_log: k,
                 selector: &|_| true,
             },
+            &|_| false,
             size,
         )?;
         drop(g_lagrange_buf);
@@ -1237,7 +967,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         drop(s_buf);
         drop(t_buf);
-
+        drop(advice_device_buffers);
         let timer = start_timer!(|| "h_poly");
         {
             let timer = start_timer!(|| "instances and advices intt");

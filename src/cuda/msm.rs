@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::mem;
 
 use ark_std::log2;
@@ -79,12 +80,15 @@ pub(crate) fn batch_msm_and_intt<'a, C: CurveAffine>(
     points_dev_buf: &CudaDeviceBufRaw,
     mut scalar_buf: Vec<&mut [C::Scalar]>,
     intt_args: InttArgs<'a>,
+    cache_buffer_selector: &'a dyn Fn(usize) -> bool,
     len: usize,
-) -> DeviceResult<Vec<C>> {
+) -> DeviceResult<(Vec<C>, HashMap<usize, CudaDeviceBufRaw>)> {
     let threads = 64;
     let bits = 254;
 
     let msm_count = scalar_buf.len();
+
+    let mut cached_buffer = HashMap::new();
 
     // k22, 8, 13bits is best for RTX4090
     let window_bits = log2(msm_count).min(3) as usize + 10 + log2(len).max(22) as usize - 22;
@@ -145,14 +149,22 @@ pub(crate) fn batch_msm_and_intt<'a, C: CurveAffine>(
         last_stream.0.sync(); // sync to reuse sort_indices_buf
 
         // copy the last buf
-        if i > 0 && (intt_args.selector)(i - 1) {
-            device
-                .copy_from_device_to_host_async(
-                    &mut scalar_buf[i - 1][..],
-                    &scalar_dev_bufs[1 - idx],
-                    streams[1 - idx].1,
-                )
-                .unwrap();
+        if i > 0 {
+            if (intt_args.selector)(i - 1) {
+                device
+                    .copy_from_device_to_host_async(
+                        &mut scalar_buf[i - 1][..],
+                        &scalar_dev_bufs[1 - idx],
+                        streams[1 - idx].1,
+                    )
+                    .unwrap();
+            }
+
+            if (cache_buffer_selector)(i - 1) {
+                let mut buf = device.alloc_device_buffer::<C::Scalar>(len).unwrap();
+                mem::swap(&mut scalar_dev_bufs[1 - idx], &mut buf);
+                cached_buffer.insert(i - 1, buf);
+            }
         }
 
         let scalar_dev_buf = &scalar_dev_bufs[idx];
@@ -190,13 +202,26 @@ pub(crate) fn batch_msm_and_intt<'a, C: CurveAffine>(
         }
     }
 
-    device
-        .copy_from_device_to_host_async(
-            *scalar_buf.last_mut().unwrap(),
-            &scalar_dev_bufs[1 - (msm_count & 1)],
-            streams[1 - (msm_count & 1)].1,
-        )
-        .unwrap();
+    {
+        let idx = 1 - (msm_count & 1);
+
+        if (intt_args.selector)(msm_count - 1) {
+            device
+                .copy_from_device_to_host_async(
+                    &mut scalar_buf[msm_count - 1][..],
+                    &scalar_dev_bufs[idx],
+                    streams[idx].1,
+                )
+                .unwrap();
+        }
+
+        if (cache_buffer_selector)(msm_count - 1) {
+            let mut buf = device.alloc_device_buffer::<C::Scalar>(len).unwrap();
+            mem::swap(&mut scalar_dev_bufs[idx], &mut buf);
+            cached_buffer.insert(msm_count - 1, buf);
+        }
+    }
+
     drop(streams);
 
     let mut remain_indices_ptr = vec![];
@@ -269,7 +294,10 @@ pub(crate) fn batch_msm_and_intt<'a, C: CurveAffine>(
     }
     device.synchronize().unwrap();
 
-    Ok(res.into_iter().map(|c| c.to_affine()).collect())
+    Ok((
+        res.into_iter().map(|c| c.to_affine()).collect(),
+        cached_buffer,
+    ))
 }
 
 pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
