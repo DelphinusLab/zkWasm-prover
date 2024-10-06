@@ -233,15 +233,17 @@ impl CudaDevice {
     pub fn copy_from_device_to_device_async<T>(
         &self,
         dst: &CudaDeviceBufRaw,
+        dst_offset: usize,
         src: &CudaDeviceBufRaw,
+        src_offset: usize,
         size: usize,
         stream: cudaStream_t,
     ) -> DeviceResult<()> {
         self.acitve_ctx()?;
         unsafe {
             let res = cuda_runtime_sys::cudaMemcpyAsync(
-                dst.ptr(),
-                src.ptr(),
+                (dst.ptr() as usize + dst_offset * size_of::<T>()) as _,
+                (src.ptr() as usize + src_offset * size_of::<T>()) as _,
                 size * mem::size_of::<T>(),
                 cuda_runtime_sys::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
                 stream,

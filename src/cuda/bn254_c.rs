@@ -139,7 +139,6 @@ extern "C" {
     pub fn poly_eval(
         p: *mut c_void,
         res: *mut c_void,
-        tmp: *mut c_void,
         x: *mut c_void,
         n: i32,
         stream: *mut CUstream_st,

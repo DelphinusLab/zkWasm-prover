@@ -133,12 +133,24 @@ __global__ void _eval_lookup_z_product_batch_spread_skip(
 
 __global__ void _poly_eval(
     Bn254FrField *p,
-    Bn254FrField *out,
-    const Bn254FrField *x,
-    int deg)
+    Bn254FrField *res,
+    const Bn254FrField *x_table,
+    int deg,
+    int count)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    out[i] = p[i * 2] + p[i * 2 + 1] * x[deg];
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int start = (gid * count) << deg;
+    int step = 1 << deg;
+    int end = start + ((count - 1) << deg);
+    Bn254FrField x = x_table[deg];
+
+    Bn254FrField acc = p[end];
+    for (int i = end - step; i > start; i -= step)
+    {
+        acc *= x;
+        acc += p[i];
+    }
+    res[start] = acc * x + p[start];
 }
 
 __device__ uint bit_reverse(uint n, uint bits)
@@ -1058,41 +1070,26 @@ extern "C"
     cudaError_t poly_eval(
         Bn254FrField *p,
         Bn254FrField *res,
-        Bn254FrField *tmp,
         const Bn254FrField *x,
         int n,
         CUstream_st *stream)
     {
-        Bn254FrField *in = p;
-        Bn254FrField *out = res;
         int deg = 0;
+        int max_round_deg = 4;
+        int remain_deg = __builtin_ctz(n);
+
         while (n > 1)
         {
-            int threads = n / 2 >= 64 ? 64 : 1;
-            int blocks = n / threads / 2;
-            _poly_eval<<<blocks, threads, 0, stream>>>(in, out, x, deg);
-            n >>= 1;
-
-            if (n > 1)
-            {
-                if (deg == 0)
-                {
-                    in = res;
-                    out = tmp;
-                }
-                else
-                {
-                    Bn254FrField *t = in;
-                    in = out;
-                    out = t;
-                }
-            }
-            deg++;
-        }
-
-        if (out != res)
-        {
-            cudaMemcpyAsync(res, out, sizeof(Bn254FrField), cudaMemcpyDeviceToDevice, stream);
+            int current_deg = remain_deg < max_round_deg ? remain_deg : max_round_deg;
+            int count = n >> current_deg;
+            int threads = count >= 64 ? 64 : count;
+            int blocks = count / threads;
+            assert(blocks * threads == count);
+            assert(current_deg > 0);
+            _poly_eval<<<blocks, threads, 0, stream>>>(deg == 0 ? p : res, res, x, deg, 1 << current_deg);
+            n >>= current_deg;
+            deg += current_deg;
+            remain_deg -= current_deg;
         }
 
         return cudaGetLastError();

@@ -4,9 +4,7 @@
 #[macro_use]
 extern crate lazy_static;
 
-use std::collections::BTreeMap;
 use std::iter;
-use std::mem::ManuallyDrop;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Condvar;
@@ -21,6 +19,7 @@ use ark_std::start_timer;
 use buffer::prepare_lookup_buffer;
 use cuda::bn254::intt_raw_async;
 use cuda::msm::InttArgs;
+use eval_poly::batch_poly_eval;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
@@ -48,7 +47,6 @@ use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
 use crate::device::cuda::CudaDeviceBufRaw;
-use crate::device::cuda::CudaStreamWrapper;
 use crate::device::cuda::CUDA_BUFFER_ALLOCATOR;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
@@ -68,6 +66,7 @@ pub mod device;
 
 mod analyze;
 mod eval_h;
+mod eval_poly;
 mod expr;
 mod hugetlb;
 mod multiopen;
@@ -1307,33 +1306,42 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         )?;
         end_timer!(timer);
 
-        let mut inputs = vec![(&h_pieces[..], x)];
+        let mut inputs = vec![(&h_pieces[..], 1, x)];
 
         meta.instance_queries.iter().for_each(|&(column, at)| {
-            inputs.push((&instances[column.index()][..], domain.rotate_omega(x, at)))
+            inputs.push((
+                &instances[column.index()][..],
+                1,
+                domain.rotate_omega(x, at),
+            ))
         });
 
         meta.advice_queries.iter().for_each(|&(column, at)| {
-            inputs.push((&advices[column.index()], domain.rotate_omega(x, at)))
+            inputs.push((&advices[column.index()], 1, domain.rotate_omega(x, at)))
         });
 
         meta.fixed_queries.iter().for_each(|&(column, at)| {
-            inputs.push((&pk.fixed_polys[column.index()], domain.rotate_omega(x, at)))
+            inputs.push((
+                &pk.fixed_polys[column.index()],
+                0,
+                domain.rotate_omega(x, at),
+            ))
         });
 
-        inputs.push((&random_poly, x));
+        inputs.push((&random_poly, 1, x));
 
         for poly in pk.permutation.polys.iter() {
-            inputs.push((&poly, x));
+            inputs.push((&poly, 0, x));
         }
 
         let permutation_products_len = permutation_products.len();
         for (i, poly) in permutation_products.iter().enumerate() {
-            inputs.push((&poly, x));
-            inputs.push((&poly, domain.rotate_omega(x, Rotation::next())));
+            inputs.push((&poly, 1, x));
+            inputs.push((&poly, 1, domain.rotate_omega(x, Rotation::next())));
             if i != permutation_products_len - 1 {
                 inputs.push((
                     &poly,
+                    1,
                     domain.rotate_omega(x, Rotation(-((meta.blinding_factors() + 1) as i32))),
                 ));
             }
@@ -1343,119 +1351,21 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let x_next = domain.rotate_omega(x, Rotation::next());
 
         for (permuted_input, permuted_table, _, _, z) in lookups.iter() {
-            inputs.push((&z, x));
-            inputs.push((&z, x_next));
-            inputs.push((&permuted_input, x));
-            inputs.push((&permuted_input, x_inv));
-            inputs.push((&permuted_table, x));
+            inputs.push((&z, 1, x));
+            inputs.push((&z, 1, x_next));
+            inputs.push((&permuted_input, 1, x));
+            inputs.push((&permuted_input, 1, x_inv));
+            inputs.push((&permuted_table, 1, x));
         }
         for z in shuffle_products.iter() {
-            inputs.push((&z, x));
-            inputs.push((&z, x_next));
+            inputs.push((&z, 1, x));
+            inputs.push((&z, 1, x_next));
         }
 
-        let mut collection = BTreeMap::new();
-        let mut x_sets = vec![];
-        for (idx, (p, x)) in inputs.iter().enumerate() {
-            collection
-                .entry(p.as_ptr() as usize)
-                .and_modify(|arr: &mut (_, Vec<_>)| arr.1.push((idx, x)))
-                .or_insert((p, vec![(idx, x)]));
-            x_sets.push(x);
-        }
-        x_sets.sort_unstable();
-        x_sets.dedup();
-        let mut x_extend_sets = vec![];
-        for x in x_sets.iter() {
-            x_extend_sets.push(**x);
-            for _ in 1..k {
-                x_extend_sets.push(x_extend_sets.last().unwrap().square());
-            }
-        }
+        let timer = start_timer!(|| "eval poly");
 
-        let x_buf = device.alloc_device_buffer_from_slice(&x_extend_sets)?;
-        let mut x_map = BTreeMap::new();
-        for (i, x) in x_sets.into_iter().enumerate() {
-            x_map.insert(
-                x,
-                ManuallyDrop::new(CudaDeviceBufRaw {
-                    ptr: unsafe {
-                        x_buf
-                            .ptr()
-                            .offset((i * k * core::mem::size_of::<C::Scalar>()) as isize)
-                    },
-                    device: device.clone(),
-                    size: core::mem::size_of::<C::Scalar>(),
-                }),
-            );
-        }
-
-        let mut evals = vec![C::Scalar::zero(); inputs.len()];
-
-        let timer = start_timer!(|| format!("compute eval {}", collection.len()));
-        let mut eval_map = BTreeMap::new();
-
-        let mut streams = vec![];
-        let mut bufs = vec![];
-        let max = 2;
-        for _ in 0..max {
-            bufs.push((
-                device.alloc_device_buffer::<C::Scalar>(size)?,
-                device.alloc_device_buffer::<C::Scalar>(size)?,
-                device.alloc_device_buffer::<C::Scalar>(size)?,
-            ));
-            streams.push(CudaStreamWrapper::new_with_inner());
-        }
-
-        let mut collection = collection.into_iter().collect::<Vec<_>>();
-        collection.sort_by(|a, b| a.1 .1.len().cmp(&b.1 .1.len()));
-
-        let mut poly_buf_cache = BTreeMap::new();
         let cache_count = 160 >> (k.max(22) - 22); // 160 for k22
-
-        for i in 0..collection.len() {
-            let (p, arr) = &collection[i].1;
-            let p = *p;
-            let stream = streams[i % max].1;
-            let (poly_buf, eval_buf, tmp_buf) = &bufs[i % max];
-            let poly_buf = if poly_buf_cache.len() < cache_count {
-                let key = p.as_ptr() as usize;
-                let buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-                poly_buf_cache.insert(key, buf);
-                poly_buf_cache.get(&key).unwrap()
-            } else {
-                poly_buf
-            };
-
-            device.copy_from_host_to_device_async(poly_buf, p, stream)?;
-            for (idx, x) in arr {
-                unsafe {
-                    let err = crate::cuda::bn254_c::poly_eval(
-                        poly_buf.ptr(),
-                        eval_buf.ptr(),
-                        tmp_buf.ptr(),
-                        x_map.get(x).unwrap().ptr(),
-                        size as i32,
-                        stream,
-                    );
-                    crate::device::cuda::to_result((), err, "fail to run poly_eval")?;
-                    device.copy_from_device_to_host_async(
-                        &mut evals[*idx..*idx + 1],
-                        eval_buf,
-                        stream,
-                    )?;
-                    eval_map.insert(((*p).as_ptr() as usize, **x), *idx);
-                }
-            }
-        }
-
-        drop(streams);
-        drop(bufs);
-
-        let eval_map = eval_map
-            .into_iter()
-            .map(|(k, v)| (k, evals[v]))
-            .collect::<BTreeMap<(usize, C::ScalarExt), C::ScalarExt>>();
+        let (poly_buf_cache, eval_map, evals) = batch_poly_eval(&device, inputs, k, cache_count)?;
 
         for (_i, eval) in evals.into_iter().skip(1).enumerate() {
             transcript.write_scalar(eval).unwrap();
