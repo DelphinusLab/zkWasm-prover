@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use ark_std::end_timer;
-use ark_std::start_timer;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
@@ -26,11 +24,6 @@ pub(crate) fn generate_permutation_product<C: CurveAffine>(
     unusable_rows_start: usize,
 ) -> Vec<Vec<<C as CurveAffine>::ScalarExt, HugePageAllocator>> {
     let chunk_len = &pk.vk.cs.degree() - 2;
-    let timer = start_timer!(|| format!(
-        "product permutation {}",
-        (&pk).vk.cs.permutation.columns.chunks(chunk_len).len()
-    ));
-
     let omega = pk.get_vk().domain.get_omega();
 
     let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
@@ -129,6 +122,5 @@ pub(crate) fn generate_permutation_product<C: CurveAffine>(
         }
     });
 
-    end_timer!(timer);
     p_z
 }

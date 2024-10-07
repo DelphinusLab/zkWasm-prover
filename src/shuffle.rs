@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use ark_std::end_timer;
-use ark_std::start_timer;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::pairing::group::ff::BatchInvert;
@@ -31,11 +29,6 @@ pub(crate) fn generate_shuffle_product<C: CurveAffine>(
 
     let shuffle_groups = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
 
-    let timer = start_timer!(|| format!(
-        "product shuffles total={}, group={}",
-        (&pk).vk.cs.shuffles.0.len(),
-        shuffle_groups.len()
-    ));
     let mut more_buffer_groups = shuffle_groups
         .par_iter()
         .map(|group| {
@@ -214,6 +207,5 @@ pub(crate) fn generate_shuffle_product<C: CurveAffine>(
         fill_random(&mut z[unusable_rows_start + 1..]);
     });
 
-    end_timer!(timer);
     p_z
 }

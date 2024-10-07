@@ -16,9 +16,6 @@ use crate::device::DeviceResult;
 
 use super::bn254::intt_raw_async;
 
-const DEBUG: bool = false;
-const GPU_MEMORY_PROFILING: bool = DEBUG || false;
-
 pub(crate) trait ToDevBuffer {
     fn to_dev_buf<'a>(
         &'a self,
@@ -78,9 +75,29 @@ pub(crate) struct InttArgs<'a> {
 pub(crate) fn batch_msm_and_intt<'a, C: CurveAffine>(
     device: &CudaDevice,
     points_dev_buf: &CudaDeviceBufRaw,
+    scalar_buf: Vec<&mut [C::Scalar]>,
+    intt_args: InttArgs<'a>,
+    cache_buffer_selector: &'a dyn Fn(usize) -> bool,
+    len: usize,
+) -> DeviceResult<(Vec<C>, HashMap<usize, CudaDeviceBufRaw>)> {
+    batch_msm_and_intt_ext(
+        device,
+        points_dev_buf,
+        scalar_buf,
+        intt_args,
+        &cache_buffer_selector,
+        &mut || {},
+        len,
+    )
+}
+
+pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
+    device: &CudaDevice,
+    points_dev_buf: &CudaDeviceBufRaw,
     mut scalar_buf: Vec<&mut [C::Scalar]>,
     intt_args: InttArgs<'a>,
     cache_buffer_selector: &'a dyn Fn(usize) -> bool,
+    before_final_round: &'a mut dyn FnMut() -> (),
     len: usize,
 ) -> DeviceResult<(Vec<C>, HashMap<usize, CudaDeviceBufRaw>)> {
     let threads = 64;
@@ -160,7 +177,6 @@ pub(crate) fn batch_msm_and_intt<'a, C: CurveAffine>(
                     )
                     .unwrap();
             }
-
             if (cache_buffer_selector)(i - 1) {
                 let mut buf = device.alloc_device_buffer::<C::Scalar>(len).unwrap();
                 mem::swap(&mut scalar_dev_bufs[1 - idx], &mut buf);
@@ -225,6 +241,143 @@ pub(crate) fn batch_msm_and_intt<'a, C: CurveAffine>(
 
     drop(streams);
 
+    (before_final_round)();
+
+    let res = batch_msm_acc(
+        device,
+        &curve_buf,
+        &acc_indices_buf,
+        windows,
+        window_bits,
+        worker,
+        bucket_size,
+        curve_buf_size,
+    )?;
+
+    Ok((res, cached_buffer))
+}
+
+pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
+    device: &CudaDevice,
+    points_dev_buf: &CudaDeviceBufRaw,
+    scalar_buf: Vec<B>,
+    len: usize,
+) -> DeviceResult<Vec<C>> {
+    batch_msm_ext(device, points_dev_buf, scalar_buf, &mut || {}, len)
+}
+
+pub(crate) fn batch_msm_ext<C: CurveAffine, B: ToDevBuffer>(
+    device: &CudaDevice,
+    points_dev_buf: &CudaDeviceBufRaw,
+    scalar_buf: Vec<B>,
+    before_final_round: &mut dyn FnMut() -> (),
+    len: usize,
+) -> DeviceResult<Vec<C>> {
+    let threads = 64;
+    let bits = 254;
+
+    let msm_count = scalar_buf.len();
+
+    // k22, 8, 13bits is best for RTX4090
+    let window_bits = log2(msm_count).min(3) as usize + 10 + log2(len).max(22) as usize - 22;
+    let windows = (bits + window_bits - 1) / window_bits;
+    let bucket_size = windows << window_bits;
+    let max_worker = 128 * 512;
+    let worker = if len < max_worker {
+        (len + threads - 1) / threads * threads
+    } else {
+        max_worker
+    };
+
+    let streams = [
+        CudaStreamWrapper::new_with_inner(),
+        CudaStreamWrapper::new_with_inner(),
+    ];
+
+    let scalar_dev_bufs = [
+        device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
+        device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
+    ];
+
+    // About 30MB per MSM
+    // layout: | bucktes | msm worker remain | collect worker remain |
+    let curve_buf_size = bucket_size + worker * 2;
+    let curve_buf = device
+        .alloc_device_buffer_non_zeroed::<C::Curve>(msm_count * curve_buf_size)
+        .unwrap();
+
+    let single_sort_indices_size = len * windows;
+    let sort_temp_storage_size = single_sort_indices_size * 3; // ~2N = 2 * windows * len, pick 32 as upper bound
+    let total_sort_indices_size = single_sort_indices_size * 4 + sort_temp_storage_size;
+
+    let sort_indices_buf = device
+        .alloc_device_buffer_non_zeroed::<u32>(total_sort_indices_size)
+        .unwrap();
+
+    let acc_indices_buf = (0..msm_count)
+        .into_iter()
+        .map(|_| device.alloc_device_buffer_non_zeroed::<u32>(worker * 2))
+        .collect::<DeviceResult<Vec<_>>>()
+        .unwrap();
+
+    for (i, buf) in scalar_buf.into_iter().enumerate() {
+        let idx = i & 1;
+        let scalar_dev_buf = &scalar_dev_bufs[idx];
+        let stream = &streams[idx];
+        let last_stream = &streams[1 - idx];
+        stream.0.sync();
+        let scalar_dev_buf = buf.to_dev_buf(device, scalar_dev_buf, &stream.0).unwrap();
+        last_stream.0.sync(); // sync to reuse sort_indices_buf
+        unsafe {
+            let err = msm(
+                (curve_buf.ptr() as usize + i * curve_buf_size * std::mem::size_of::<C::Curve>())
+                    as _,
+                points_dev_buf.ptr(),
+                scalar_dev_buf.ptr(),
+                sort_indices_buf.ptr(),
+                acc_indices_buf[i].ptr(),
+                len as i32,
+                windows as i32,
+                window_bits as i32,
+                threads as i32,
+                worker as i32,
+                (sort_temp_storage_size * mem::size_of::<u32>()) as i32,
+                stream.1,
+            );
+            assert_eq!(err, cudaError::cudaSuccess);
+        }
+    }
+    drop(streams);
+
+    (before_final_round)();
+
+    let res = batch_msm_acc(
+        device,
+        &curve_buf,
+        &acc_indices_buf,
+        windows,
+        window_bits,
+        worker,
+        bucket_size,
+        curve_buf_size,
+    )?;
+
+    Ok(res)
+}
+
+fn batch_msm_acc<C: CurveAffine>(
+    device: &CudaDevice,
+    curve_buf: &CudaDeviceBufRaw,
+    acc_indices_buf: &Vec<CudaDeviceBufRaw>,
+    windows: usize,
+    window_bits: usize,
+    worker: usize,
+    bucket_size: usize,
+    curve_buf_size: usize,
+) -> DeviceResult<Vec<C>> {
+    let msm_count = acc_indices_buf.len();
+    let (sw, stream) = CudaStreamWrapper::new_with_inner();
+
     let mut remain_indices_ptr = vec![];
     let mut remain_acc_ptr = vec![];
     let mut next_remain_indices_ptr = vec![];
@@ -253,34 +406,35 @@ pub(crate) fn batch_msm_and_intt<'a, C: CurveAffine>(
     unsafe {
         let err = batch_msm_collect(
             device
-                .alloc_device_buffer_from_slice(&remain_indices_ptr[..])
+                .alloc_device_buffer_from_slice_async(&remain_indices_ptr[..], stream)
                 .unwrap()
                 .ptr(),
             device
-                .alloc_device_buffer_from_slice(&remain_acc_ptr[..])
+                .alloc_device_buffer_from_slice_async(&remain_acc_ptr[..], stream)
                 .unwrap()
                 .ptr(),
             device
-                .alloc_device_buffer_from_slice(&next_remain_indices_ptr[..])
+                .alloc_device_buffer_from_slice_async(&next_remain_indices_ptr[..], stream)
                 .unwrap()
                 .ptr(),
             device
-                .alloc_device_buffer_from_slice(&next_remain_acc_ptr[..])
+                .alloc_device_buffer_from_slice_async(&next_remain_acc_ptr[..], stream)
                 .unwrap()
                 .ptr(),
             device
-                .alloc_device_buffer_from_slice(&buckets_ptr[..])
+                .alloc_device_buffer_from_slice_async(&buckets_ptr[..], stream)
                 .unwrap()
                 .ptr(),
             worker as u32,
             windows as u32,
             window_bits as u32,
             msm_count as u32,
-            0 as _,
+            stream,
         );
-
         assert_eq!(err, cudaError::cudaSuccess);
     }
+
+    sw.sync();
 
     let mut res = vec![C::identity().to_curve(); msm_count];
     for i in 0..msm_count {
@@ -295,18 +449,18 @@ pub(crate) fn batch_msm_and_intt<'a, C: CurveAffine>(
     }
     device.synchronize().unwrap();
 
-    Ok((
-        res.into_iter().map(|c| c.to_affine()).collect(),
-        cached_buffer,
-    ))
+    Ok(res.into_iter().map(|c| c.to_affine()).collect())
 }
 
-pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
+fn _batch_msm_for_debug<C: CurveAffine, B: ToDevBuffer>(
     device: &CudaDevice,
     points_dev_buf: &CudaDeviceBufRaw,
     scalar_buf: Vec<B>,
     len: usize,
 ) -> DeviceResult<Vec<C>> {
+    const DEBUG: bool = false;
+    const GPU_MEMORY_PROFILING: bool = DEBUG || false;
+
     let threads = 64;
     let bits = 254;
 
