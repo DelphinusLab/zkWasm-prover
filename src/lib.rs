@@ -295,7 +295,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         pk.vk.cs.shuffles.group(pk.vk.cs.degree()).len()
     );
 
-    let reserve_buffer = std::env::var("ZKWASM_PROVER_GPU_RESERVE_CHUNCKS")
+    let gpu_reserve_chuncks = std::env::var("ZKWASM_PROVER_GPU_RESERVE_CHUNCKS")
         .ok()
         .and_then(|s| usize::from_str_radix(&s, 10).ok())
         .unwrap_or(144);
@@ -313,7 +313,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
             allocator.reset(
                 (1 << 22) * core::mem::size_of::<C::Scalar>(),
-                reserve_buffer,
+                gpu_reserve_chuncks,
             );
         }
 
@@ -540,16 +540,19 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 size,
             )?;
 
-            let mut tuple_lookup_device_buffers_iter = tuple_lookup_device_buffers.into_iter();
+            // Disabled because of memory limitation
+            if false {
+                let mut tuple_lookup_device_buffers_iter = tuple_lookup_device_buffers.into_iter();
 
-            for (i, _) in tuple_lookups.iter() {
-                lookup_device_buffers
-                    .insert((*i, 0), tuple_lookup_device_buffers_iter.next().unwrap());
-                lookup_device_buffers
-                    .insert((*i, 1), tuple_lookup_device_buffers_iter.next().unwrap());
+                for (i, _) in tuple_lookups.iter() {
+                    lookup_device_buffers
+                        .insert((*i, 0), tuple_lookup_device_buffers_iter.next().unwrap());
+                    lookup_device_buffers
+                        .insert((*i, 1), tuple_lookup_device_buffers_iter.next().unwrap());
+                }
+
+                assert_eq!(tuple_lookup_device_buffers_iter.count(), 0);
             }
-
-            assert_eq!(tuple_lookup_device_buffers_iter.count(), 0);
             end_timer!(timer);
         }
 
@@ -1151,7 +1154,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         }
 
         let timer = start_timer!(|| "eval poly");
-        let cache_count = (reserve_buffer - 8) >> (k.max(22) - 22);
+        let cache_count = (gpu_reserve_chuncks - 8) >> (k.max(22) - 22);
         let (poly_buf_cache, eval_map, evals) = batch_poly_eval(&device, inputs, k, cache_count)?;
 
         for (_i, eval) in evals.into_iter().skip(1).enumerate() {
