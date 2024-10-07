@@ -105,6 +105,17 @@ fn handle_lookup_pair<F: FieldExt>(
     mut permuted_table: Vec<F, HugePageAllocator>,
     unusable_rows_start: usize,
 ) -> (Vec<F, HugePageAllocator>, Vec<F, HugePageAllocator>) {
+    let input_len = input.len();
+    let permuted_table_state_handler = thread::spawn(move || {
+        let mut permuted_table_state = Vec::new_in(HugePageAllocator);
+        unsafe {
+            permuted_table_state.reserve(input_len);
+            permuted_table_state.set_len(input_len);
+            permuted_table_state.fill(false);
+        }
+        permuted_table_state
+    });
+
     let compare = |a: &_, b: &_| unsafe {
         let a: &[u64; 4] = std::mem::transmute(a);
         let b: &[u64; 4] = std::mem::transmute(b);
@@ -122,8 +133,7 @@ fn handle_lookup_pair<F: FieldExt>(
         .try_into()
         .unwrap();
 
-    let mut permuted_table_state = Vec::new_in(HugePageAllocator);
-    permuted_table_state.resize(input.len(), false);
+    let mut permuted_table_state = permuted_table_state_handler.join().unwrap();
 
     permuted_input
         .iter()
@@ -537,8 +547,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         }
 
         // After theta
+        let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
         let tuple_lookup_handler = s.spawn(move || {
-            let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
             let tuple_lookups = tuple_lookups
                 .into_par_iter()
                 .map(|(i, (mut input, mut table, permuted_table, z))| {
@@ -551,10 +561,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     (i, (permuted_input, permuted_table, input, table, z))
                 })
                 .collect::<Vec<_>>();
-            end_timer!(timer);
 
             tuple_lookups
         });
+        end_timer!(timer);
 
         let mut lookup_permuted_commitments = vec![C::identity(); pk.vk.cs.lookups.len() * 2];
 
