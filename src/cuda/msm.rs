@@ -403,28 +403,29 @@ fn batch_msm_acc<C: CurveAffine>(
         next_remain_acc_ptr.push(ptr);
     }
 
+    let remain_indices_buf = device
+        .alloc_device_buffer_from_slice_async(&remain_indices_ptr[..], stream)
+        .unwrap();
+    let remain_acc_ptr_buf = device
+        .alloc_device_buffer_from_slice_async(&remain_acc_ptr[..], stream)
+        .unwrap();
+    let next_remain_indices_ptr_buf = device
+        .alloc_device_buffer_from_slice_async(&next_remain_indices_ptr[..], stream)
+        .unwrap();
+    let next_remain_acc_ptr_buf = device
+        .alloc_device_buffer_from_slice_async(&next_remain_acc_ptr[..], stream)
+        .unwrap();
+    let buckets_ptr_buf = device
+        .alloc_device_buffer_from_slice_async(&buckets_ptr[..], stream)
+        .unwrap();
+
     unsafe {
         let err = batch_msm_collect(
-            device
-                .alloc_device_buffer_from_slice_async(&remain_indices_ptr[..], stream)
-                .unwrap()
-                .ptr(),
-            device
-                .alloc_device_buffer_from_slice_async(&remain_acc_ptr[..], stream)
-                .unwrap()
-                .ptr(),
-            device
-                .alloc_device_buffer_from_slice_async(&next_remain_indices_ptr[..], stream)
-                .unwrap()
-                .ptr(),
-            device
-                .alloc_device_buffer_from_slice_async(&next_remain_acc_ptr[..], stream)
-                .unwrap()
-                .ptr(),
-            device
-                .alloc_device_buffer_from_slice_async(&buckets_ptr[..], stream)
-                .unwrap()
-                .ptr(),
+            remain_indices_buf.ptr(),
+            remain_acc_ptr_buf.ptr(),
+            next_remain_indices_ptr_buf.ptr(),
+            next_remain_acc_ptr_buf.ptr(),
+            buckets_ptr_buf.ptr(),
             worker as u32,
             windows as u32,
             window_bits as u32,
