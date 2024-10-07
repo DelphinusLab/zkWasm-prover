@@ -295,6 +295,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         pk.vk.cs.shuffles.group(pk.vk.cs.degree()).len()
     );
 
+    let reserve_buffer = std::env::var("ZKWASM_PROVER_GPU_RESERVE_CHUNCKS")
+        .ok()
+        .and_then(|s| usize::from_str_radix(&s, 10).ok())
+        .unwrap_or(144);
+
     thread::scope(|s| {
         let timer = start_timer!(|| "proof prepare");
         let k = pk.get_vk().domain.k() as usize;
@@ -306,8 +311,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         {
             let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
-            // reserve 21GB
-            allocator.reset((1 << 22) * core::mem::size_of::<C::Scalar>(), 168);
+            allocator.reset(
+                (1 << 22) * core::mem::size_of::<C::Scalar>(),
+                reserve_buffer,
+            );
         }
 
         let meta = &pk.vk.cs;
@@ -1144,7 +1151,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         }
 
         let timer = start_timer!(|| "eval poly");
-        let cache_count = 160 >> (k.max(22) - 22); // 160 for k22
+        let cache_count = (reserve_buffer - 8) >> (k.max(22) - 22);
         let (poly_buf_cache, eval_map, evals) = batch_poly_eval(&device, inputs, k, cache_count)?;
 
         for (_i, eval) in evals.into_iter().skip(1).enumerate() {

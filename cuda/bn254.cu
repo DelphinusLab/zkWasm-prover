@@ -1435,7 +1435,11 @@ extern "C"
         Bn254G1 *res,
         Bn254G1Affine *points,
         Bn254FrField *scalars,
-        unsigned *sort_buf,
+        unsigned *bucket_indices,
+        unsigned *point_indices,
+        unsigned *sorted_bucket_indices,
+        unsigned *sorted_point_indices,
+        unsigned *candidate_sort_indices_temp_storage_bytes,
         unsigned *acc_indices_buf,
         int n,
         int windows,
@@ -1453,11 +1457,6 @@ extern "C"
             return err;         \
         }                       \
     }
-
-        unsigned *bucket_indices = sort_buf;
-        unsigned *point_indices = bucket_indices + n * windows;
-        unsigned *sorted_bucket_indices = point_indices + n * windows;
-        unsigned *sorted_point_indices = sorted_bucket_indices + n * windows;
 
         assert(workers % threads == 0);
         unsigned blocks = workers / threads;
@@ -1496,7 +1495,7 @@ extern "C"
         }
         else
         {
-            sort_indices_temp_storage = sorted_point_indices + n * windows;
+            sort_indices_temp_storage = candidate_sort_indices_temp_storage_bytes;
         }
 
         CHECK_RETURN(cub::DeviceRadixSort::SortPairsDescending(
