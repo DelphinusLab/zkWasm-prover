@@ -100,6 +100,11 @@ pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
     before_final_round: &'a mut dyn FnMut() -> (),
     len: usize,
 ) -> DeviceResult<(Vec<C>, HashMap<usize, CudaDeviceBufRaw>)> {
+    if scalar_buf.len() == 0 {
+        before_final_round();
+        return Ok((vec![], HashMap::new()));
+    }
+
     let threads = 64;
     let bits = 254;
 
@@ -273,6 +278,11 @@ pub(crate) fn batch_msm_ext<C: CurveAffine, B: ToDevBuffer>(
     before_final_round: &mut dyn FnMut() -> (),
     len: usize,
 ) -> DeviceResult<Vec<C>> {
+    if scalar_buf.len() == 0 {
+        before_final_round();
+        return Ok(vec![]);
+    }
+
     let threads = 64;
     let bits = 254;
 
