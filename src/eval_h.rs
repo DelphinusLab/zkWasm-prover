@@ -15,6 +15,7 @@ use halo2_proofs::plonk::circuit::Expression;
 use halo2_proofs::plonk::evaluation_gpu::Bop;
 use halo2_proofs::plonk::evaluation_gpu::ProveExpression;
 use halo2_proofs::plonk::evaluation_gpu::ProveExpressionUnit;
+use halo2_proofs::plonk::logup::InputExpressionSet as LookupInputExpressionSet;
 use halo2_proofs::plonk::Any;
 use halo2_proofs::plonk::ProvingKey;
 use halo2_proofs::transcript::EncodedChallenge;
@@ -29,6 +30,7 @@ use crate::cuda::bn254::field_op_v3;
 use crate::cuda::bn254::field_sub;
 use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::intt_raw_async;
+use crate::cuda::bn254::logup_eval_h_z_set;
 use crate::cuda::bn254::ntt_prepare;
 use crate::cuda::bn254::ntt_raw;
 use crate::cuda::bn254::permutation_eval_h_l;
@@ -38,7 +40,8 @@ use crate::cuda::bn254::pick_from_buf;
 use crate::cuda::bn254::FieldOp;
 use crate::cuda::bn254_c;
 use crate::cuda::bn254_c::field_op_batch_mul_sum;
-use crate::cuda::bn254_c::lookup_eval_h;
+use crate::cuda::bn254_c::logup_eval_h;
+use crate::cuda::bn254_c::logup_eval_h_extra_inputs;
 use crate::cuda::bn254_c::shuffle_eval_h;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
@@ -186,11 +189,10 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
     lookup_products: &mut [(
+        &mut [&[&[C::Scalar]]],
         &mut [C::Scalar],
         &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
+        &mut [&[C::Scalar]],
     )],
     shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
@@ -366,11 +368,10 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
     lookup_products: &mut [(
+        &mut [&[&[C::Scalar]]],
         &mut [C::Scalar],
         &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
+        &mut [&[C::Scalar]],
     )],
     shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
@@ -429,12 +430,12 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     let l0_buf = do_extended_ntt_v2(device, &mut ctx, &l0.values[..])?;
     let l_last_buf = do_extended_ntt_v2(device, &mut ctx, &l_last.values[..])?;
     let l_active_buf = device.alloc_device_buffer_from_slice(&l_active_row.values[..])?;
+    let blinding_factors = pk.vk.cs.blinding_factors();
+    let last_rotation = (ctx.size - (blinding_factors + 1)) << (extended_k - k);
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h permutation");
     if permutation_products.len() > 0 {
-        let blinding_factors = pk.vk.cs.blinding_factors();
-        let last_rotation = (ctx.size - (blinding_factors + 1)) << (extended_k - k);
         let chunk_len = pk.vk.cs.degree() - 2;
 
         let extended_p_buf = permutation_products
@@ -546,10 +547,9 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h lookup");
-    let gamma_buf = device.alloc_device_buffer_from_slice(&[gamma][..])?;
     let beta_buf = device.alloc_device_buffer_from_slice(&[beta][..])?;
-    let mut last_stream = (None, vec![]);
-    for (_i, (lookup, (permuted_input, permuted_table, input, table, z))) in pk
+    // let mut last_stream = (None, vec![]);
+    for (_i, (lookup, (inputs_sets, table, multiplicity, zs))) in pk
         .vk
         .cs
         .lookups
@@ -557,20 +557,31 @@ fn evaluate_h_gates_core<C: CurveAffine>(
         .zip(lookup_products.into_iter())
         .enumerate()
     {
-        let input_deg = get_expr_degree(&lookup.input_expressions);
+        let sets_len = lookup.input_expressions_sets.len();
+        //todo check degree case if degree=1 needed special process?
+        // let input_deg = get_expr_degree(&lookup.input_expressions);
         let table_deg = get_expr_degree(&lookup.table_expressions);
 
-        let [e1, e2] = flatten_lookup_expression(
-            &lookup.input_expressions,
+        let (input_product, input_product_sum, table) = flatten_lookup_expression(
+            &lookup.input_expressions_sets,
             &lookup.table_expressions,
             beta,
-            gamma,
             theta,
         );
 
-        let (input_buf, stream_input) = if input_deg > 1 {
+        let input_product_buffs = input_product
+            .into_iter()
+            .map(|e1| evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let input_product_sum_buffs = input_product_sum
+            .into_iter()
+            .map(|e1| evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let (table_buf, stream_table) = if table_deg > 1 {
             (
-                evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx)?,
+                evaluate_prove_expr(device, &vec![table], fixed, advice, instance, &mut ctx)?,
                 None,
             )
         } else {
@@ -578,7 +589,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                 let mut stream = std::mem::zeroed();
                 let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
                 let mut buf = ctx.alloc(device)?;
-                device.copy_from_host_to_device_async(&buf, &input, stream)?;
+                device.copy_from_host_to_device_async(&buf, &table, stream)?;
 
                 let mut tmp_buf = ctx.alloc(device)?;
                 field_op_v3(
@@ -617,77 +628,13 @@ fn evaluate_h_gates_core<C: CurveAffine>(
             }
         };
 
-        let (table_buf, stream_table) = if table_deg > 1 {
-            (
-                evaluate_prove_expr(device, &vec![e2], fixed, advice, instance, &mut ctx)?,
-                None,
-            )
-        } else {
-            unsafe {
-                let mut stream = std::mem::zeroed();
-                let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-                let mut buf = ctx.alloc(device)?;
-                device.copy_from_host_to_device_async(&buf, &table, stream)?;
-
-                let mut tmp_buf = ctx.alloc(device)?;
-                field_op_v3(
-                    device,
-                    &buf,
-                    Some(&buf),
-                    None,
-                    None,
-                    Some(&gamma_buf),
-                    size,
-                    FieldOp::Add,
-                    Some(stream),
-                )?;
-                intt_raw_async(
-                    &device,
-                    &mut buf,
-                    &mut tmp_buf,
-                    &intt_pq_buf,
-                    &intt_omegas_buf,
-                    &intt_divisor_buf,
-                    k,
-                    Some(stream),
-                )?;
-                do_extended_prepare(device, &mut ctx, &mut buf, Some(stream))?;
-                ntt_raw(
-                    device,
-                    &mut buf,
-                    &mut tmp_buf,
-                    &ctx.extended_ntt_pq_buf,
-                    &ctx.extended_ntt_omegas_buf,
-                    ctx.extended_k,
-                    Some(stream),
-                )?;
-
-                (buf, Some((stream, tmp_buf)))
-            }
-        };
-
-        let (z_buf, tmp2, stream0) = do_extended_ntt_v2_async(device, &mut ctx, *z)?;
-        let (permuted_input_buf, tmp0, stream1) =
-            do_extended_ntt_v2_async(device, &mut ctx, permuted_input)?;
-        let (permuted_table_buf, tmp1, stream2) =
-            do_extended_ntt_v2_async(device, &mut ctx, permuted_table)?;
+        let (multiplicity_buf, tmp0, stream0) =
+            do_extended_ntt_v2_async(device, &mut ctx, multiplicity)?;
 
         unsafe {
             cuda_runtime_sys::cudaStreamSynchronize(stream0);
             cuda_runtime_sys::cudaStreamDestroy(stream0);
             ctx.extended_allocator.push(tmp0);
-            cuda_runtime_sys::cudaStreamSynchronize(stream1);
-            cuda_runtime_sys::cudaStreamDestroy(stream1);
-            ctx.extended_allocator.push(tmp1);
-            cuda_runtime_sys::cudaStreamSynchronize(stream2);
-            cuda_runtime_sys::cudaStreamDestroy(stream2);
-            ctx.extended_allocator.push(tmp2);
-
-            if let Some((stream, buf)) = stream_input {
-                cuda_runtime_sys::cudaStreamSynchronize(stream);
-                cuda_runtime_sys::cudaStreamDestroy(stream);
-                ctx.extended_allocator.push(buf);
-            }
 
             if let Some((stream, buf)) = stream_table {
                 cuda_runtime_sys::cudaStreamSynchronize(stream);
@@ -695,56 +642,89 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                 ctx.extended_allocator.push(buf);
             }
         }
+        // todo multi stream async
+        let mut extended_zs_buf = zs
+            .iter()
+            .map(|x| do_extended_ntt_v2(device, &mut ctx, x))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut input_product_buf_iter = input_product_buffs.into_iter();
+        let mut input_product_sum_buf_iter = input_product_sum_buffs.into_iter();
+        let input_product_buf_first = input_product_buf_iter.next().unwrap();
+        let input_product_sum_buf_first = input_product_sum_buf_iter.next().unwrap();
 
+        //todo async
         unsafe {
             let mut stream = std::mem::zeroed();
             let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-            let err = lookup_eval_h(
+            let err = logup_eval_h(
                 h_buf.ptr(),
-                input_buf.ptr(),
+                input_product_buf_first.ptr(),
+                input_product_sum_buf_first.ptr(),
                 table_buf.ptr(),
-                permuted_input_buf.ptr(),
-                permuted_table_buf.ptr(),
-                z_buf.ptr(),
+                multiplicity_buf.ptr(),
+                extended_zs_buf.first().unwrap().ptr(),
+                extended_zs_buf.last().unwrap().ptr(),
                 l0_buf.ptr(),
                 l_last_buf.ptr(),
                 l_active_buf.ptr(),
                 y_buf.ptr(),
-                beta_buf.ptr(),
-                gamma_buf.ptr(),
                 1 << (extended_k - k),
                 ctx.extended_size as i32,
                 stream,
             );
 
             to_result((), err, "fail to run field_op_batch_mul_sum")?;
-
-            if let Some(stream) = last_stream.0 {
+            unsafe {
                 cuda_runtime_sys::cudaStreamSynchronize(stream);
                 cuda_runtime_sys::cudaStreamDestroy(stream);
-                ctx.extended_allocator.append(&mut last_stream.1)
-            }
-
-            last_stream = (
-                Some(stream),
-                vec![
-                    input_buf,
+                ctx.extended_allocator.append(&mut vec![
+                    input_product_buf_first,
+                    input_product_sum_buf_first,
                     table_buf,
-                    permuted_input_buf,
-                    permuted_table_buf,
-                    z_buf,
-                ],
-            );
+                    multiplicity_buf,
+                ]);
+            }
+        }
+        unsafe {
+            if sets_len > 1 {
+                logup_eval_h_z_set(
+                    device,
+                    &h_buf,
+                    &extended_zs_buf[..],
+                    &l0_buf,
+                    &l_last_buf,
+                    &y_buf,
+                    last_rotation,
+                    ctx.extended_size,
+                )?;
+
+                let mut extended_zs_buf_iter = extended_zs_buf.into_iter();
+                let zs_first_buf = extended_zs_buf_iter.next().unwrap();
+                ctx.extended_allocator.push(zs_first_buf);
+                while let Some(((input_product, input_product_sum), extend_z)) =
+                    input_product_buf_iter
+                        .next()
+                        .zip(input_product_sum_buf_iter.next())
+                        .zip(extended_zs_buf_iter.next())
+                {
+                    logup_eval_h_extra_inputs(
+                        h_buf.ptr(),
+                        input_product.ptr(),
+                        input_product_sum.ptr(),
+                        extend_z.ptr(),
+                        l_active_buf.ptr(),
+                        y_buf.ptr(),
+                        1 << (extended_k - k),
+                        ctx.extended_size as i32,
+                    )?;
+                    ctx.extended_allocator.push(input_product);
+                    ctx.extended_allocator.push(input_product_sum);
+                    ctx.extended_allocator.push(extend_z);
+                }
+            }
         }
     }
 
-    if let Some(stream) = last_stream.0 {
-        unsafe {
-            cuda_runtime_sys::cudaStreamSynchronize(stream);
-            cuda_runtime_sys::cudaStreamDestroy(stream);
-            ctx.extended_allocator.append(&mut last_stream.1)
-        }
-    }
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h shuffle");
@@ -812,87 +792,105 @@ fn get_expr_degree<F: FieldExt>(expr: &Vec<Expression<F>>) -> usize {
 }
 
 fn flatten_lookup_expression<F: FieldExt>(
-    input: &Vec<Expression<F>>,
+    inputs_sets: &Vec<LookupInputExpressionSet<F>>,
     table: &Vec<Expression<F>>,
     beta: F,
-    gamma: F,
     theta: F,
-) -> [Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>; 2] {
-    let mut expr_input = ProveExpression::<F>::from_expr(&input[0]);
-    for input in input.iter().skip(1) {
-        expr_input = ProveExpression::Scale(
+) -> (
+    Vec<Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>>,
+    Vec<Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>>,
+    Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>,
+) {
+    let construct_expr = |input: &Vec<Expression<F>>| {
+        let mut expr_input = ProveExpression::<F>::from_expr(&input[0]);
+        for input in input.iter().skip(1) {
+            expr_input = ProveExpression::Scale(
+                Box::new(expr_input),
+                BTreeMap::from_iter([(0, theta)].into_iter()),
+            );
+            expr_input = ProveExpression::Op(
+                Box::new(expr_input),
+                Box::new(ProveExpression::<F>::from_expr(input)),
+                Bop::Sum,
+            );
+        }
+
+        ProveExpression::Op(
             Box::new(expr_input),
-            BTreeMap::from_iter([(0, theta)].into_iter()),
-        );
-        expr_input = ProveExpression::Op(
-            Box::new(expr_input),
-            Box::new(ProveExpression::<F>::from_expr(input)),
+            Box::new(ProveExpression::Y(BTreeMap::from_iter(
+                [(0, beta)].into_iter(),
+            ))),
             Bop::Sum,
-        );
-    }
+        )
+    };
 
-    expr_input = ProveExpression::Op(
-        Box::new(expr_input),
-        Box::new(ProveExpression::Y(BTreeMap::from_iter(
-            [(0, beta)].into_iter(),
-        ))),
-        Bop::Sum,
-    );
-
-    let expr_input = expr_input
-        .flatten()
-        .into_iter()
-        .map(|(us, v)| {
-            let mut map = BTreeMap::new();
-            for mut u in us {
-                if let Some(c) = map.get_mut(&mut u) {
-                    *c = *c + 1;
-                } else {
-                    map.insert(u.clone(), 1);
+    let flatten_expr = |expr_input: ProveExpression<F>| {
+        expr_input
+            .flatten()
+            .into_iter()
+            .map(|(us, v)| {
+                let mut map = BTreeMap::new();
+                for mut u in us {
+                    if let Some(c) = map.get_mut(&mut u) {
+                        *c = *c + 1;
+                    } else {
+                        map.insert(u.clone(), 1);
+                    }
                 }
-            }
-            (map, v.clone())
+                (map, v.clone())
+            })
+            .collect::<Vec<_, _>>()
+    };
+
+    let expr_table = flatten_expr(construct_expr(&table));
+
+    let input_sets_expr = inputs_sets
+        .iter()
+        .map(|set| set.0.iter().map(construct_expr).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+
+    let expr_input_product = input_sets_expr
+        .iter()
+        .map(|set| {
+            let product = set.iter().skip(1).fold(set[0].clone(), |acc, v| {
+                ProveExpression::Op(Box::new(acc.clone()), Box::new(v.clone()), Bop::Product)
+            });
+            flatten_expr(product)
         })
-        .collect::<Vec<_, _>>();
+        .collect::<Vec<_>>();
 
-    let mut expr_table = ProveExpression::<F>::from_expr(&table[0]);
-    for table in table.iter().skip(1) {
-        expr_table = ProveExpression::Scale(
-            Box::new(expr_table),
-            BTreeMap::from_iter([(0, theta)].into_iter()),
-        );
-        expr_table = ProveExpression::Op(
-            Box::new(expr_table),
-            Box::new(ProveExpression::<F>::from_expr(table)),
-            Bop::Sum,
-        );
-    }
+    let expr_input_product_sum = input_sets_expr
+        .iter()
+        .map(|set| {
+            let product_sum = if set.len() > 1 {
+                (0..set.len())
+                    .map(|i| {
+                        set.iter()
+                            .enumerate()
+                            .filter(|(j, _)| *j != i)
+                            .map(|(_, v)| v.clone())
+                            .reduce(|acc, v| {
+                                ProveExpression::Op(
+                                    Box::new(acc.clone()),
+                                    Box::new(v.clone()),
+                                    Bop::Product,
+                                )
+                            })
+                            .unwrap()
+                    })
+                    .reduce(|acc, v| {
+                        ProveExpression::Op(Box::new(acc.clone()), Box::new(v.clone()), Bop::Sum)
+                    })
+                    .unwrap()
+            } else {
+                ProveExpression::Y(BTreeMap::from_iter([(0, F::one())].into_iter()))
+            };
 
-    expr_table = ProveExpression::Op(
-        Box::new(expr_table),
-        Box::new(ProveExpression::Y(BTreeMap::from_iter(
-            [(0, gamma)].into_iter(),
-        ))),
-        Bop::Sum,
-    );
-
-    let expr_table = expr_table
-        .flatten()
-        .into_iter()
-        .map(|(us, v)| {
-            let mut map = BTreeMap::new();
-            for mut u in us {
-                if let Some(c) = map.get_mut(&mut u) {
-                    *c = *c + 1;
-                } else {
-                    map.insert(u.clone(), 1);
-                }
-            }
-            (map, v.clone())
+            flatten_expr(product_sum)
         })
-        .collect::<Vec<_, _>>();
+        .collect::<Vec<_>>();
 
-    [expr_input, expr_table]
+    (expr_input_product, expr_input_product_sum, expr_table)
 }
 
 fn flatten_shuffle_expression<F: FieldExt>(

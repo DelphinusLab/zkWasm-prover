@@ -849,3 +849,87 @@ pub fn buffer_copy_with_shift<F: FieldExt>(
     }
     Ok(())
 }
+
+pub fn logup_eval_h_z_set(
+    device: &CudaDevice,
+    res: &CudaDeviceBufRaw,
+    set: &[CudaDeviceBufRaw],
+    l0: &CudaDeviceBufRaw,
+    l_last: &CudaDeviceBufRaw,
+    y: &CudaDeviceBufRaw,
+    rot: usize,
+    n: usize,
+) -> Result<(), Error> {
+    unsafe {
+        device.acitve_ctx()?;
+        let sets = device
+            .alloc_device_buffer_from_slice(&set.iter().map(|x| x.ptr()).collect::<Vec<_>>()[..])?;
+        let err = bn254_c::logup_eval_h_z(
+            res.ptr(),
+            sets.ptr(),
+            l0.ptr(),
+            l_last.ptr(),
+            y.ptr(),
+            set.len() as i32,
+            rot as i32,
+            n as i32,
+        );
+        to_result((), err, "fail to run permutation_eval_h_p2")?;
+        device.synchronize()?;
+    }
+    Ok(())
+}
+
+// pub fn logup_eval_h_extra_inputs(
+//     device: &CudaDevice,
+//     res: &CudaDeviceBufRaw,
+//     input_product: &CudaDeviceBufRaw,
+//     input_product_sum: &CudaDeviceBufRaw,
+//     z: &CudaDeviceBufRaw,
+//     l_active_row: &CudaDeviceBufRaw,
+//     y: &CudaDeviceBufRaw,
+//     rot: usize,
+//     n: usize,
+// ) -> Result<(), Error> {
+//     unsafe {
+//         device.acitve_ctx()?;
+//         let err = bn254_c::logup_eval_h_extra_inputs(
+//             res.ptr(),
+//             input_product.ptr(),
+//             input_product_sum.ptr(),
+//             z.ptr(),
+//             l_active_row.ptr(),
+//             y.ptr(),
+//             rot as i32,
+//             n as i32,
+//         );
+//         to_result((), err, "fail to run permutation_eval_h_p2")?;
+//         device.synchronize()?;
+//     }
+//     Ok(())
+// }
+
+pub fn logup_accu_input_inv(
+    device: &CudaDevice,
+    accu: &CudaDeviceBufRaw,
+    input: &CudaDeviceBufRaw,
+    temp: &CudaDeviceBufRaw,
+    beta: &CudaDeviceBufRaw,
+    n: usize,
+    stream: Option<cudaStream_t>,
+) -> Result<(), Error> {
+    unsafe {
+        device.acitve_ctx()?;
+
+        let err = bn254_c::logup_accu_input_inv(
+            accu.ptr(),
+            input.ptr(),
+            temp.ptr(),
+            beta.ptr(),
+            n,
+            stream.unwrap_or(0usize as _),
+        );
+        to_result((), err, "fail to run field_op")?;
+    }
+    Ok(())
+}

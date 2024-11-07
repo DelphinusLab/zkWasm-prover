@@ -611,43 +611,42 @@ pub(crate) fn permutation_product_open<'a, C: CurveAffine>(
 
 pub(crate) fn lookup_open<'a, C: CurveAffine>(
     pk: &'a ProvingKey<C>,
-    lookup: (&'a [C::Scalar], &'a [C::Scalar], &'a [C::Scalar]),
+    lookup: (&'a [C::Scalar], &'a [[C::Scalar]]),
     x: C::Scalar,
 ) -> impl Iterator<Item = ProverQuery<'a, C::Scalar>> + Clone {
     let x_inv = pk.vk.domain.rotate_omega(x, Rotation::prev());
     let x_next = pk.vk.domain.rotate_omega(x, Rotation::next());
+    let blinding_factors = pk.vk.cs.blinding_factors();
+    let x_last = pk
+        .vk
+        .domain
+        .rotate_omega(*x, Rotation(-((blinding_factors + 1) as i32)));
 
-    let (permuted_input, permuted_table, z) = lookup;
+    let (multiplicity, zs) = lookup;
 
     iter::empty()
         // Open lookup product commitments at x
         .chain(Some(ProverQuery {
             point: x,
             rotation: Rotation::cur(),
-            poly: z,
+            poly: multiplicity,
         }))
-        // Open lookup input commitments at x
-        .chain(Some(ProverQuery {
-            point: x,
-            rotation: Rotation::cur(),
-            poly: permuted_input,
+        .chain(zs.iter().flat_map(|z| {
+            iter::empty()
+                .chain(Some(ProverQuery {
+                    point: x,
+                    rotation: Rotation::cur(),
+                    poly: z,
+                }))
+                .chain(Some(ProverQuery {
+                    point: x_next,
+                    rotation: Rotation::next(),
+                    poly: z,
+                }))
         }))
-        // Open lookup table commitments at x
-        .chain(Some(ProverQuery {
-            point: x,
-            rotation: Rotation::cur(),
-            poly: permuted_table,
-        }))
-        // Open lookup input commitments at x_inv
-        .chain(Some(ProverQuery {
-            point: x_inv,
-            rotation: Rotation::prev(),
-            poly: permuted_input,
-        }))
-        // Open lookup product commitments at x_next
-        .chain(Some(ProverQuery {
-            point: x_next,
-            rotation: Rotation::next(),
+        .chain(zs.iter().rev().skip(1).map(|z| ProverQuery {
+            point: x_last,
+            rotation: Rotation(-((blinding_factors + 1) as i32)),
             poly: z,
         }))
 }

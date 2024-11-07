@@ -1,7 +1,6 @@
 use core::slice;
 use libc::{
-    c_void, mmap, MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_PRIVATE, PROT_READ,
-    PROT_WRITE,
+    c_void, mmap, MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_PRIVATE, PROT_READ, PROT_WRITE,
 };
 use std::{
     alloc::{AllocError, Allocator, Layout},

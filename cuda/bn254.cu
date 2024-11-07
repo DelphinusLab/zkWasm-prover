@@ -130,6 +130,33 @@ __global__ void _eval_lookup_z_product_batch_spread_skip(
     }
 }
 
+__global__ void _eval_logup_add_c(
+    Bn254FrField *input,
+    Bn254FrField *beta)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    input[i] = input[i] + beta[0];
+}
+
+__global__ void _eval_logup_z_step2(
+    Bn254FrField *z,
+    Bn254FrField *input,
+    Bn254FrField *table,
+    Bn254FrField *multiplicity)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    z[i] = input[i] + table[i] * multiplicity[i];
+}
+
+
+__global__ void _eval_logup_accu_input(
+    Bn254FrField *accu,
+    Bn254FrField *input)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    accu[i] = accu[i] + input[i];
+}
+
 __global__ void _poly_eval(
     Bn254FrField *p,
     Bn254FrField *out,
@@ -778,6 +805,117 @@ __global__ void _lookup_eval_h(
     res[i] = t;
 }
 
+//logarithmic derivative lookup
+__global__ void _logup_eval_h(
+    Bn254FrField *res,
+    const Bn254FrField *input_product,
+    const Bn254FrField *input_product_sum,
+    const Bn254FrField *table,
+    const Bn254FrField *multiplicity,
+    const Bn254FrField *z_first,
+    const Bn254FrField *z_last,
+    const Bn254FrField *l0,
+    const Bn254FrField *l_last,
+    const Bn254FrField *l_active_row,
+    const Bn254FrField *y,
+    int rot,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int r_next = (i + rot) & (n - 1);
+
+    Bn254FrField t, u, p;
+    t = res[i];
+
+    // l_0(X) * z_0(X) = 0
+    t = t * *y;
+    u = l0[i] * z_first[i];
+    t += u;
+
+    // l_last(X) * z_l(X) = 0
+    t = t * *y;
+    u = l_last[i] * z_last[i];
+    t += u;
+
+    // (1 - (l_last(X) + l_blind(X))) * (
+    //   τ(X) * Π(φ_i(X)) * (ϕ(gX) - ϕ(X))
+    //   - ∑_i τ(X) * Π_{j != i} φ_j(X) + m(X) * Π(φ_i(X))
+    // ) = 0
+    //=>(1 - (l_last(X) + l_blind(X))) * (
+    //   (τ(X) * (ϕ(gX) - ϕ(X))+m(X))* Π(φ_i(X))
+    //   - ∑_i τ(X) * Π_{j != i} φ_j(X)
+    // ) = 0
+    t = t * *y;
+    u = z_first[r_next] - z_first[i];
+    u = u * table[i];
+    u = u + multiplicity[i];
+    u = u * input_product[i];
+    p = table[i] * input_product_sum[i];
+    u = u - p;
+    u = u * l_active_row[i];
+    t += u;
+
+    res[i] = t;
+}
+
+
+//logup extra inputs and z check
+__global__ void _logup_eval_h_extra_inputs(
+    Bn254FrField *res,
+    const Bn254FrField *input_product,
+    const Bn254FrField *input_product_sum,
+    const Bn254FrField *z,
+    const Bn254FrField *l_active_row,
+    const Bn254FrField *y,
+    int rot,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int r_next = (i + rot) & (n - 1);
+
+    Bn254FrField t, u;
+    t = res[i];
+
+    // (1 - (l_last(X) + l_blind(X))) * (
+    //   Π(φ_i(X)) * (ϕ(gX) - ϕ(X))
+    //   - ∑_i Π_{j != i} φ_j(X))
+    // ) = 0
+    t = t * *y;
+    u = z[r_next] - z[i];
+    u = u * input_product[i];
+    u = u - input_product_sum[i];
+    u = u * l_active_row[i];
+    t += u;
+
+    res[i] = t;
+}
+
+//logup z set check, z is grand_sum
+__global__ void _logup_eval_h_z(
+    Bn254FrField *res,
+    const Bn254FrField *z_curr,
+    const Bn254FrField *z_prev,
+    const Bn254FrField *l0,
+    const Bn254FrField *y,
+    int rot,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int r_prev = (i + n + rot) & (n - 1);
+
+    Bn254FrField t, u, p;
+    t = res[i];
+
+    // l_0(X) * (z_i(X) - z_{i-1}(\omega^(last) X)) = 0
+    t = t * *y;
+    u = z_curr[i] - z_prev[r_prev];
+    u = l0[i] * u
+    t += u;
+
+    res[i] = t;
+}
+
+
 __global__ void _shuffle_eval_h(
     Bn254FrField *res,
     const Bn254FrField *input,
@@ -1130,6 +1268,68 @@ extern "C"
         return cudaGetLastError();
     }
 
+   cudaError_t logup_eval_h(
+        Bn254FrField *res,
+        const Bn254FrField *input_product,
+        const Bn254FrField *input_product_sum,
+        const Bn254FrField *table,
+        const Bn254FrField *multiplicity,
+        const Bn254FrField *z_first,
+        const Bn254FrField *z_last,
+        const Bn254FrField *l0,
+        const Bn254FrField *l_last,
+        const Bn254FrField *l_active_row,
+        const Bn254FrField *y,
+        int rot,
+        int n,
+        cudaStream_t stream)
+    {
+        int threads = n >= 64 ? 64 : 1;
+        int blocks = n / threads;
+        _logup_eval_h<<<blocks, threads, 0, stream>>>(
+            res,
+            input_product, input_product_sum, table, multiplicity, z_first, z_last,
+            l0, l_last, l_active_row,
+            y, rot, n);
+        return cudaGetLastError();
+    }
+
+
+  cudaError_t logup_eval_h_extra_inputs(
+        Bn254FrField *res,
+        const Bn254FrField *input_product,
+        const Bn254FrField *input_product_sum,
+        const Bn254FrField *z,
+        const Bn254FrField *l_active_row,
+        const Bn254FrField *y,
+        int rot,
+        int n)
+    {
+        int threads = n >= 64 ? 64 : 1;
+        int blocks = n / threads;
+        _logup_eval_h_extra_inputs<<<blocks, threads>>>(
+            res,
+            input_product, input_product_sum, z,
+            l_active_row, y, rot, n);
+        return cudaGetLastError();
+    }
+
+    cudaError_t logup_eval_h_z_set(
+        Bn254FrField *res,
+        const Bn254FrField **set,
+        const Bn254FrField *l0,
+        const Bn254FrField *l_last,
+        const Bn254FrField *y,
+        int n_set,
+        int rot,
+        int n)
+    {
+        int threads = n >= 64 ? 64 : 1;
+        int blocks = n / threads;
+        _permutation_eval_h_p2<<<blocks, threads>>>(res, set, l0, l_last, y, n_set, rot, n);
+        return cudaGetLastError();
+    }
+
     cudaError_t shuffle_eval_h(
         Bn254FrField *res,
         const Bn254FrField *input,
@@ -1284,4 +1484,90 @@ extern "C"
 
         return cudaGetLastError();
     }
+
+    cudaError_t logup_accu_input_inv(
+        Bn254FrField *accu,
+        Bn254FrField *input,
+        Bn254FrField *temp,
+        const Bn254FrField *beta,
+        int n,
+        CUstream_st *stream)
+    {
+        int threads = n >= 64 ? 64 : 1;
+        int blocks = n / threads;
+        _eval_logup_add_c<<<blocks, threads, 0, stream>>>(
+            input, beta);
+
+        int worker = 64 * 128;
+        int size_per_worker = n / worker;
+        _eval_lookup_z_batch_invert<<<128, 64, 0, stream>>>(
+            input, temp, size_per_worker);
+
+        _eval_logup_accu_input<<<blocks, threads, 0, stream>>>(
+            accu, input);
+
+        return cudaGetLastError();
+    }
+
+    cudaError_t eval_logup_z(
+            Bn254FrField *z,
+            Bn254FrField *input,
+            Bn254FrField *table,
+            Bn254FrField *multiplicity,
+            Bn254FrField *beta,
+            int n,
+            CUstream_st *stream)
+        {
+            int threads = n >= 64 ? 64 : 1;
+            int blocks = n / threads;
+            _eval_logup_add_c<<<blocks, threads, 0, stream>>>(
+                            table, beta);
+
+            int worker = 64 * 128;
+            int size_per_worker = n / worker;
+            _eval_lookup_z_batch_invert<<<128, 64, 0, stream>>>(
+                table, z, size_per_worker);
+
+            _eval_logup_z_step2<<<blocks, threads, 0, stream>>>(
+                z, input, table, multiplicity);
+
+            //todo instead  call eval_logup_z_pure
+            worker = 64 * 64;
+            size_per_worker = n / worker;
+            _eval_lookup_z_product_batch<<<64, 64, 0, stream>>>(
+                z, input, size_per_worker);
+            _eval_lookup_z_product_batch<<<8, 8, 0, stream>>>(
+                input, table, 64);
+            _eval_lookup_z_product_single_spread<<<1, 1, 0, stream>>>(
+                table, 64);
+            _eval_lookup_z_product_batch_spread<<<8, 8, 0, stream>>>(
+                input, table, 64);
+            _eval_lookup_z_product_batch_spread_skip<<<64, 64, 0, stream>>>(
+                z, input, size_per_worker);
+
+            return cudaGetLastError();
+        }
+
+        cudaError_t eval_logup_z_pure(
+            Bn254FrField *z,
+            Bn254FrField *input,
+            Bn254FrField *table,
+            int n,
+            CUstream_st *stream)
+        {
+            int worker = 64 * 64;
+            int size_per_worker = n / worker;
+            _eval_lookup_z_product_batch<<<64, 64, 0, stream>>>(
+                z, input, size_per_worker);
+            _eval_lookup_z_product_batch<<<8, 8, 0, stream>>>(
+                input, table, 64);
+            _eval_lookup_z_product_single_spread<<<1, 1, 0, stream>>>(
+                table, 64);
+            _eval_lookup_z_product_batch_spread<<<8, 8, 0, stream>>>(
+                input, table, 64);
+            _eval_lookup_z_product_batch_spread_skip<<<64, 64, 0, stream>>>(
+                z, input, size_per_worker);
+
+            return cudaGetLastError();
+        }
 }
