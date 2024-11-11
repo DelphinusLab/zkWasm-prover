@@ -149,11 +149,12 @@ extern "C" {
         n: i32,
     ) -> cudaError;
 
-    pub fn logup_accu_input_inv(
-        accu: *mut c_void,
+    pub fn logup_sum_input_inv(
+        sum: *mut c_void,
         input: *mut c_void,
         temp: *mut c_void,
         beta: *mut c_void,
+        init: i32,
         n: i32,
         stream: *mut CUstream_st,
     ) -> cudaError;
@@ -219,6 +220,8 @@ extern "C" {
         table: *mut c_void,
         multiplicity: *mut c_void,
         beta: *mut c_void,
+        last_z: *mut c_void,
+        last_z_index: i32,
         n: i32,
         stream: *mut CUstream_st,
     ) -> cudaError;
@@ -227,6 +230,9 @@ extern "C" {
         z: *mut c_void,
         input: *mut c_void,
         table: *mut c_void,
+        test: *mut c_void,
+        last_z: *mut c_void,
+        last_z_index: i32,
         n: i32,
         stream: *mut CUstream_st,
     ) -> cudaError;

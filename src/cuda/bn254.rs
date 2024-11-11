@@ -864,7 +864,7 @@ pub fn logup_eval_h_z_set(
         device.acitve_ctx()?;
         let sets = device
             .alloc_device_buffer_from_slice(&set.iter().map(|x| x.ptr()).collect::<Vec<_>>()[..])?;
-        let err = bn254_c::logup_eval_h_z(
+        let err = bn254_c::logup_eval_h_z_set(
             res.ptr(),
             sets.ptr(),
             l0.ptr(),
@@ -880,53 +880,26 @@ pub fn logup_eval_h_z_set(
     Ok(())
 }
 
-// pub fn logup_eval_h_extra_inputs(
-//     device: &CudaDevice,
-//     res: &CudaDeviceBufRaw,
-//     input_product: &CudaDeviceBufRaw,
-//     input_product_sum: &CudaDeviceBufRaw,
-//     z: &CudaDeviceBufRaw,
-//     l_active_row: &CudaDeviceBufRaw,
-//     y: &CudaDeviceBufRaw,
-//     rot: usize,
-//     n: usize,
-// ) -> Result<(), Error> {
-//     unsafe {
-//         device.acitve_ctx()?;
-//         let err = bn254_c::logup_eval_h_extra_inputs(
-//             res.ptr(),
-//             input_product.ptr(),
-//             input_product_sum.ptr(),
-//             z.ptr(),
-//             l_active_row.ptr(),
-//             y.ptr(),
-//             rot as i32,
-//             n as i32,
-//         );
-//         to_result((), err, "fail to run permutation_eval_h_p2")?;
-//         device.synchronize()?;
-//     }
-//     Ok(())
-// }
-
-pub fn logup_accu_input_inv(
+pub fn logup_sum_input_inv(
     device: &CudaDevice,
-    accu: &CudaDeviceBufRaw,
+    sum: &CudaDeviceBufRaw,
     input: &CudaDeviceBufRaw,
     temp: &CudaDeviceBufRaw,
     beta: &CudaDeviceBufRaw,
+    init: usize,
     n: usize,
     stream: Option<cudaStream_t>,
 ) -> Result<(), Error> {
     unsafe {
         device.acitve_ctx()?;
 
-        let err = bn254_c::logup_accu_input_inv(
-            accu.ptr(),
+        let err = bn254_c::logup_sum_input_inv(
+            sum.ptr(),
             input.ptr(),
             temp.ptr(),
             beta.ptr(),
-            n,
+            init as i32,
+            n as i32,
             stream.unwrap_or(0usize as _),
         );
         to_result((), err, "fail to run field_op")?;

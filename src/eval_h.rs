@@ -15,7 +15,6 @@ use halo2_proofs::plonk::circuit::Expression;
 use halo2_proofs::plonk::evaluation_gpu::Bop;
 use halo2_proofs::plonk::evaluation_gpu::ProveExpression;
 use halo2_proofs::plonk::evaluation_gpu::ProveExpressionUnit;
-use halo2_proofs::plonk::logup::InputExpressionSet as LookupInputExpressionSet;
 use halo2_proofs::plonk::Any;
 use halo2_proofs::plonk::ProvingKey;
 use halo2_proofs::transcript::EncodedChallenge;
@@ -130,13 +129,11 @@ pub fn _export_evaluate_h_gates<C: CurveAffine>(
     advice: &[&[C::Scalar]],
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
-    lookup_products: &mut [(
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-    )],
+    lookup_products: &mut Vec<(
+        &mut Vec<C::Scalar, HugePageAllocator>,
+        &mut Vec<C::Scalar, HugePageAllocator>,
+        &mut Vec<Vec<C::Scalar, HugePageAllocator>>,
+    )>,
     shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
     beta: C::Scalar,
@@ -188,12 +185,16 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     advice: &[&[C::Scalar]],
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
-    lookup_products: &mut [(
-        &mut [&[&[C::Scalar]]],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [&[C::Scalar]],
-    )],
+    lookup_products: &mut Vec<(
+        &mut Vec<C::Scalar, HugePageAllocator>,
+        &mut Vec<C::Scalar, HugePageAllocator>,
+        &mut Vec<Vec<C::Scalar, HugePageAllocator>>,
+    )>,
+    // lookup_products: &mut [(
+    //     &mut Vec<C::Scalar,HugePageAllocator>,
+    //     &mut Vec<C::Scalar,HugePageAllocator>,
+    //     &mut Vec<Vec<C::Scalar,HugePageAllocator>>,
+    // )],
     shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
     beta: C::Scalar,
@@ -367,12 +368,11 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     advice: &[&[C::Scalar]],
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
-    lookup_products: &mut [(
-        &mut [&[&[C::Scalar]]],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [&[C::Scalar]],
-    )],
+    lookup_products: &mut Vec<(
+        &mut Vec<C::Scalar, HugePageAllocator>,
+        &mut Vec<C::Scalar, HugePageAllocator>,
+        &mut Vec<Vec<C::Scalar, HugePageAllocator>>,
+    )>,
     shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
     beta: C::Scalar,
@@ -549,7 +549,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     let timer = start_timer!(|| "evaluate_h lookup");
     let beta_buf = device.alloc_device_buffer_from_slice(&[beta][..])?;
     // let mut last_stream = (None, vec![]);
-    for (_i, (lookup, (inputs_sets, table, multiplicity, zs))) in pk
+    for (_i, (lookup, (table, multiplicity, zs))) in pk
         .vk
         .cs
         .lookups
@@ -561,9 +561,12 @@ fn evaluate_h_gates_core<C: CurveAffine>(
         //todo check degree case if degree=1 needed special process?
         // let input_deg = get_expr_degree(&lookup.input_expressions);
         let table_deg = get_expr_degree(&lookup.table_expressions);
-
-        let (input_product, input_product_sum, table) = flatten_lookup_expression(
-            &lookup.input_expressions_sets,
+        let (input_product, input_product_sum, table_expr) = flatten_lookup_expression(
+            &lookup
+                .input_expressions_sets
+                .iter()
+                .map(|set| set.0.clone())
+                .collect::<Vec<_>>(),
             &lookup.table_expressions,
             beta,
             theta,
@@ -581,7 +584,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
 
         let (table_buf, stream_table) = if table_deg > 1 {
             (
-                evaluate_prove_expr(device, &vec![table], fixed, advice, instance, &mut ctx)?,
+                evaluate_prove_expr(device, &vec![table_expr], fixed, advice, instance, &mut ctx)?,
                 None,
             )
         } else {
@@ -643,7 +646,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
             }
         }
         // todo multi stream async
-        let mut extended_zs_buf = zs
+        let extended_zs_buf = zs
             .iter()
             .map(|x| do_extended_ntt_v2(device, &mut ctx, x))
             .collect::<Result<Vec<_>, _>>()?;
@@ -707,7 +710,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                         .zip(input_product_sum_buf_iter.next())
                         .zip(extended_zs_buf_iter.next())
                 {
-                    logup_eval_h_extra_inputs(
+                    let err = logup_eval_h_extra_inputs(
                         h_buf.ptr(),
                         input_product.ptr(),
                         input_product_sum.ptr(),
@@ -716,7 +719,8 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                         y_buf.ptr(),
                         1 << (extended_k - k),
                         ctx.extended_size as i32,
-                    )?;
+                    );
+                    to_result((), err, "fail to run logup_eval_h_extra_inputs")?;
                     ctx.extended_allocator.push(input_product);
                     ctx.extended_allocator.push(input_product_sum);
                     ctx.extended_allocator.push(extend_z);
@@ -792,7 +796,7 @@ fn get_expr_degree<F: FieldExt>(expr: &Vec<Expression<F>>) -> usize {
 }
 
 fn flatten_lookup_expression<F: FieldExt>(
-    inputs_sets: &Vec<LookupInputExpressionSet<F>>,
+    inputs_sets: &Vec<Vec<Vec<Expression<F>>>>,
     table: &Vec<Expression<F>>,
     beta: F,
     theta: F,
@@ -846,7 +850,7 @@ fn flatten_lookup_expression<F: FieldExt>(
 
     let input_sets_expr = inputs_sets
         .iter()
-        .map(|set| set.0.iter().map(construct_expr).collect::<Vec<_>>())
+        .map(|set| set.iter().map(construct_expr).collect::<Vec<_>>())
         .collect::<Vec<_>>();
 
     let expr_input_product = input_sets_expr

@@ -611,16 +611,15 @@ pub(crate) fn permutation_product_open<'a, C: CurveAffine>(
 
 pub(crate) fn lookup_open<'a, C: CurveAffine>(
     pk: &'a ProvingKey<C>,
-    lookup: (&'a [C::Scalar], &'a [[C::Scalar]]),
+    lookup: (&'a [C::Scalar], &'a [Vec<C::Scalar, HugePageAllocator>]),
     x: C::Scalar,
 ) -> impl Iterator<Item = ProverQuery<'a, C::Scalar>> + Clone {
-    let x_inv = pk.vk.domain.rotate_omega(x, Rotation::prev());
     let x_next = pk.vk.domain.rotate_omega(x, Rotation::next());
     let blinding_factors = pk.vk.cs.blinding_factors();
     let x_last = pk
         .vk
         .domain
-        .rotate_omega(*x, Rotation(-((blinding_factors + 1) as i32)));
+        .rotate_omega(x, Rotation(-((blinding_factors + 1) as i32)));
 
     let (multiplicity, zs) = lookup;
 
@@ -631,7 +630,7 @@ pub(crate) fn lookup_open<'a, C: CurveAffine>(
             rotation: Rotation::cur(),
             poly: multiplicity,
         }))
-        .chain(zs.iter().flat_map(|z| {
+        .chain(zs.iter().flat_map(move |z| {
             iter::empty()
                 .chain(Some(ProverQuery {
                     point: x,
@@ -644,7 +643,7 @@ pub(crate) fn lookup_open<'a, C: CurveAffine>(
                     poly: z,
                 }))
         }))
-        .chain(zs.iter().rev().skip(1).map(|z| ProverQuery {
+        .chain(zs.iter().rev().skip(1).map(move |z| ProverQuery {
             point: x_last,
             rotation: Rotation(-((blinding_factors + 1) as i32)),
             poly: z,
