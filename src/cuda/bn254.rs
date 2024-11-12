@@ -859,6 +859,7 @@ pub fn logup_eval_h_z_set(
     y: &CudaDeviceBufRaw,
     rot: usize,
     n: usize,
+    stream: Option<cudaStream_t>,
 ) -> Result<(), Error> {
     unsafe {
         device.acitve_ctx()?;
@@ -873,9 +874,9 @@ pub fn logup_eval_h_z_set(
             set.len() as i32,
             rot as i32,
             n as i32,
+            stream.unwrap_or(0usize as _),
         );
         to_result((), err, "fail to run permutation_eval_h_p2")?;
-        device.synchronize()?;
     }
     Ok(())
 }

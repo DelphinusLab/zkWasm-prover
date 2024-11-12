@@ -1406,47 +1406,141 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     }
 
                     //extra inputs and zs
-                    for (inputs_set, z) in inputs_sets.iter().zip(z_set.iter_mut()).skip(1) {
-                        for (i, input) in inputs_set.iter().enumerate() {
-                            device.copy_from_host_to_device_async(input_buf, input, stream)?;
-                            logup_sum_input_inv(
-                                &device,
-                                z_buf,
-                                input_buf,
-                                table_buf,
-                                &beta_buf,
-                                i,
-                                size,
-                                Some(stream),
-                            )?;
-                        }
+                    // for (inputs_set, z) in inputs_sets.iter().zip(z_set.iter_mut()).skip(1) {
+                    //     for (i, input) in inputs_set.iter().enumerate() {
+                    //         device.copy_from_host_to_device_async(input_buf, input, stream)?;
+                    //         logup_sum_input_inv(
+                    //             &device,
+                    //             z_buf,
+                    //             input_buf,
+                    //             table_buf,
+                    //             &beta_buf,
+                    //             i,
+                    //             size,
+                    //             Some(stream),
+                    //         )?;
+                    //     }
+                    //
+                    //     let err = eval_logup_z_pure(
+                    //         z_buf.ptr(),
+                    //         input_buf.ptr(),
+                    //         table_buf.ptr(),
+                    //         last_z_buf.ptr(),
+                    //         unusable_rows_start as i32,
+                    //         size as i32,
+                    //         stream,
+                    //     );
+                    //
+                    //     to_result((), err, "failed to run eval_lookup_z")?;
+                    //
+                    //     intt_raw_async(
+                    //         &device,
+                    //         &mut *z_buf,
+                    //         &mut *input_buf,
+                    //         &intt_pq_buf,
+                    //         &intt_omegas_buf,
+                    //         &intt_divisor_buf,
+                    //         k,
+                    //         Some(stream),
+                    //     )?;
+                    //
+                    //     device.copy_from_device_to_host_async(&mut z[..], &z_buf, stream)?;
+                    // }
 
-                        let err = eval_logup_z_pure(
-                            z_buf.ptr(),
-                            input_buf.ptr(),
-                            table_buf.ptr(),
-                            multiplicity_buf.ptr(),
-                            last_z_buf.ptr(),
-                            unusable_rows_start as i32,
-                            size as i32,
-                            stream,
-                        );
+                    streams[idx] = Some(stream);
+                }
+            }
 
-                        to_result((), err, "failed to run eval_lookup_z")?;
+            unsafe {
+                for last_stream in streams {
+                    if let Some(last_stream) = last_stream {
+                        cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                        cuda_runtime_sys::cudaStreamDestroy(last_stream);
+                    }
+                }
+            }
 
-                        intt_raw_async(
+            let mut streams = [None; MAX_CONCURRENCY];
+            // assemble the extra inputs set
+            let mut buff = vec![];
+            let mut map = BTreeMap::new();
+            for (i, (inputs_sets, _, _, z_set)) in lookups.iter_mut() {
+                let mut inner = vec![];
+                for (inputs_set, z) in inputs_sets.iter().zip(z_set.iter_mut()).skip(1) {
+                    inner.push((i, &inputs_set[..], &mut z[..]))
+                }
+                if !inner.is_empty() {
+                    buff.push(inner);
+                }
+            }
+            let mut buff = buff.into_iter().map(|v| v.into_iter()).collect::<Vec<_>>();
+            let mut buff_interleave = Vec::new();
+            loop {
+                let mut pushed = false;
+                for (i, v) in buff.iter_mut().enumerate() {
+                    if let Some(value) = v.next() {
+                        buff_interleave.push((i, value));
+                        pushed = true;
+                    }
+                }
+                if !pushed {
+                    break;
+                }
+            }
+
+            println!("lookup extra buff={}", buff_interleave.len());
+            for (i, (lookup_index, inputs_set, z)) in buff_interleave.iter_mut().enumerate() {
+                unsafe {
+                    let idx = i % MAX_CONCURRENCY;
+                    let [z_buf, input_buf, table_buf, _] = Rc::get_mut(&mut buffers[idx]).unwrap();
+
+                    if let Some(last_stream) = streams[idx] {
+                        cuda_runtime_sys::cudaStreamSynchronize(last_stream);
+                        cuda_runtime_sys::cudaStreamDestroy(last_stream);
+                    }
+
+                    let mut stream = std::mem::zeroed();
+                    let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+                    crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
+
+                    for (i, input) in inputs_set.iter().enumerate() {
+                        device.copy_from_host_to_device_async(input_buf, input, stream)?;
+                        logup_sum_input_inv(
                             &device,
-                            &mut *z_buf,
-                            &mut *input_buf,
-                            &intt_pq_buf,
-                            &intt_omegas_buf,
-                            &intt_divisor_buf,
-                            k,
+                            z_buf,
+                            input_buf,
+                            table_buf,
+                            &beta_buf,
+                            i,
+                            size,
                             Some(stream),
                         )?;
-
-                        device.copy_from_device_to_host_async(&mut z[..], &z_buf, stream)?;
                     }
+
+                    let err = eval_logup_z_pure(
+                        z_buf.ptr(),
+                        input_buf.ptr(),
+                        table_buf.ptr(),
+                        last_z_buf[*lookup_index].ptr(),
+                        unusable_rows_start as i32,
+                        size as i32,
+                        stream,
+                    );
+
+                    to_result((), err, "failed to run eval_lookup_z")?;
+
+                    intt_raw_async(
+                        &device,
+                        &mut *z_buf,
+                        &mut *input_buf,
+                        &intt_pq_buf,
+                        &intt_omegas_buf,
+                        &intt_divisor_buf,
+                        k,
+                        Some(stream),
+                    )?;
+
+                    device.copy_from_device_to_host_async(&mut z[..], &z_buf, stream)?;
 
                     streams[idx] = Some(stream);
                 }
@@ -1550,84 +1644,13 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         .for_each(|(z, z_pre)| assert_eq!(z[0], z_pre[u]))
                 }
             }
-
-            // let mut streams = [None; MAX_CONCURRENCY];
-            // // assemble the extra inputs set
-            // let mut buff = vec![];
-            // for (_, (inputs_sets, _, _, z_set)) in lookups.iter_mut() {
-            //     for (inputs_set, z) in inputs_sets.iter().zip(z_set.iter_mut()).skip(1) {
-            //         buff.push((&inputs_set[..], &mut z[..]))
-            //     }
-            // }
-            // println!("lookup extra buff={}",buff.len());
-            // for (i, (inputs_set, z)) in buff.iter_mut().enumerate() {
-            //     unsafe {
-            //         let idx = i % MAX_CONCURRENCY;
-            //         let [z_buf, input_buf, table_buf, _] = Rc::get_mut(&mut buffers[idx]).unwrap();
-            //
-            //         if let Some(last_stream) = streams[idx] {
-            //             cuda_runtime_sys::cudaStreamSynchronize(last_stream);
-            //             cuda_runtime_sys::cudaStreamDestroy(last_stream);
-            //         }
-            //
-            //         let mut stream = std::mem::zeroed();
-            //         let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-            //         crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
-            //
-            //         for input in inputs_set.iter() {
-            //             device.copy_from_host_to_device_async(input_buf, input, stream)?;
-            //             logup_sum_input_inv(
-            //                 &device,
-            //                 z_buf,
-            //                 input_buf,
-            //                 table_buf,
-            //                 &beta_buf,
-            //                 size,
-            //                 Some(stream),
-            //             )?;
-            //         }
-            //
-            //         let err = eval_logup_z_pure(
-            //             z_buf.ptr(),
-            //             input_buf.ptr(),
-            //             table_buf.ptr(),
-            //             size as i32,
-            //             stream,
-            //         );
-            //
-            //         to_result((), err, "failed to run eval_lookup_z")?;
-            //
-            //         intt_raw_async(
-            //             &device,
-            //             &mut *z_buf,
-            //             &mut *input_buf,
-            //             &intt_pq_buf,
-            //             &intt_omegas_buf,
-            //             &intt_divisor_buf,
-            //             k,
-            //             Some(stream),
-            //         )?;
-            //
-            //         device.copy_from_device_to_host_async(&mut z[..], &z_buf, stream)?;
-            //
-            //         streams[idx] = Some(stream);
-            //     }
-            // }
-            //
-            // unsafe {
-            //     for last_stream in streams {
-            //         if let Some(last_stream) = last_stream {
-            //             cuda_runtime_sys::cudaStreamSynchronize(last_stream);
-            //             cuda_runtime_sys::cudaStreamDestroy(last_stream);
-            //         }
-            //     }
-            // }
         }
 
         let mut lookups = lookups.into_iter().map(|(_, b)| b).collect::<Vec<_>>();
         end_timer!(timer);
 
-        let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
+        let z_counts = lookups.iter().map(|x| x.3.len()).sum::<usize>();
+        let timer = start_timer!(|| format!("lookup z msm {}", z_counts));
         let lookup_z_commitments = crate::cuda::bn254::batch_msm::<C>(
             &g_buf,
             [&s_buf, &t_buf],

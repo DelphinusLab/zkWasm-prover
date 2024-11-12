@@ -147,6 +147,7 @@ extern "C" {
         n_set: i32,
         rot: i32,
         n: i32,
+        stream: *mut CUstream_st,
     ) -> cudaError;
 
     pub fn logup_sum_input_inv(
@@ -230,7 +231,6 @@ extern "C" {
         z: *mut c_void,
         input: *mut c_void,
         table: *mut c_void,
-        test: *mut c_void,
         last_z: *mut c_void,
         last_z_index: i32,
         n: i32,

@@ -548,7 +548,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
 
     let timer = start_timer!(|| "evaluate_h lookup");
     let beta_buf = device.alloc_device_buffer_from_slice(&[beta][..])?;
-    // let mut last_stream = (None, vec![]);
+    let mut last_stream = (None, vec![]);
     for (_i, (lookup, (table, multiplicity, zs))) in pk
         .vk
         .cs
@@ -634,11 +634,26 @@ fn evaluate_h_gates_core<C: CurveAffine>(
         let (multiplicity_buf, tmp0, stream0) =
             do_extended_ntt_v2_async(device, &mut ctx, multiplicity)?;
 
+        let (extended_zs_buf, zs_streams): (
+            Vec<CudaDeviceBufRaw>,
+            Vec<(CudaDeviceBufRaw, *mut CUstream_st)>,
+        ) = zs
+            .iter()
+            .map(|x| do_extended_ntt_v2_async(device, &mut ctx, x))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .unzip();
+
         unsafe {
             cuda_runtime_sys::cudaStreamSynchronize(stream0);
             cuda_runtime_sys::cudaStreamDestroy(stream0);
             ctx.extended_allocator.push(tmp0);
 
+            for (tmp_buf, stream) in zs_streams.into_iter() {
+                cuda_runtime_sys::cudaStreamSynchronize(stream);
+                cuda_runtime_sys::cudaStreamDestroy(stream);
+                ctx.extended_allocator.push(tmp_buf);
+            }
             if let Some((stream, buf)) = stream_table {
                 cuda_runtime_sys::cudaStreamSynchronize(stream);
                 cuda_runtime_sys::cudaStreamDestroy(stream);
@@ -646,14 +661,15 @@ fn evaluate_h_gates_core<C: CurveAffine>(
             }
         }
         // todo multi stream async
-        let extended_zs_buf = zs
-            .iter()
-            .map(|x| do_extended_ntt_v2(device, &mut ctx, x))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut input_product_buf_iter = input_product_buffs.into_iter();
-        let mut input_product_sum_buf_iter = input_product_sum_buffs.into_iter();
-        let input_product_buf_first = input_product_buf_iter.next().unwrap();
-        let input_product_sum_buf_first = input_product_sum_buf_iter.next().unwrap();
+        // let extended_zs_buf = zs
+        //     .iter()
+        //     .map(|x| do_extended_ntt_v2(device, &mut ctx, x))
+        //     .collect::<Result<Vec<_>, _>>()?;
+
+        // let mut input_product_buf_iter = input_product_buffs.into_iter();
+        // let mut input_product_sum_buf_iter = input_product_sum_buffs.into_iter();
+        // let input_product_buf_first = input_product_buf_iter.next().unwrap();
+        // let input_product_sum_buf_first = input_product_sum_buf_iter.next().unwrap();
 
         //todo async
         unsafe {
@@ -661,8 +677,8 @@ fn evaluate_h_gates_core<C: CurveAffine>(
             let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
             let err = logup_eval_h(
                 h_buf.ptr(),
-                input_product_buf_first.ptr(),
-                input_product_sum_buf_first.ptr(),
+                input_product_buffs[0].ptr(),
+                input_product_sum_buf[0].ptr(),
                 table_buf.ptr(),
                 multiplicity_buf.ptr(),
                 extended_zs_buf.first().unwrap().ptr(),
@@ -676,19 +692,6 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                 stream,
             );
 
-            to_result((), err, "fail to run field_op_batch_mul_sum")?;
-            unsafe {
-                cuda_runtime_sys::cudaStreamSynchronize(stream);
-                cuda_runtime_sys::cudaStreamDestroy(stream);
-                ctx.extended_allocator.append(&mut vec![
-                    input_product_buf_first,
-                    input_product_sum_buf_first,
-                    table_buf,
-                    multiplicity_buf,
-                ]);
-            }
-        }
-        unsafe {
             if sets_len > 1 {
                 logup_eval_h_z_set(
                     device,
@@ -699,16 +702,17 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                     &y_buf,
                     last_rotation,
                     ctx.extended_size,
+                    stream,
                 )?;
 
-                let mut extended_zs_buf_iter = extended_zs_buf.into_iter();
-                let zs_first_buf = extended_zs_buf_iter.next().unwrap();
-                ctx.extended_allocator.push(zs_first_buf);
-                while let Some(((input_product, input_product_sum), extend_z)) =
-                    input_product_buf_iter
-                        .next()
-                        .zip(input_product_sum_buf_iter.next())
-                        .zip(extended_zs_buf_iter.next())
+                // let mut extended_zs_buf_iter = extended_zs_buf.into_iter();
+                // let zs_first_buf = extended_zs_buf_iter.next().unwrap();
+                // ctx.extended_allocator.push(zs_first_buf);
+                while let Some(((input_product, input_product_sum), extend_z)) = input_product_buf
+                    .iter()
+                    .zip(input_product_sum_buf.iter())
+                    .zip(extended_zs_buf.iter())
+                    .skip(1)
                 {
                     let err = logup_eval_h_extra_inputs(
                         h_buf.ptr(),
@@ -719,13 +723,45 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                         y_buf.ptr(),
                         1 << (extended_k - k),
                         ctx.extended_size as i32,
+                        stream,
                     );
                     to_result((), err, "fail to run logup_eval_h_extra_inputs")?;
-                    ctx.extended_allocator.push(input_product);
-                    ctx.extended_allocator.push(input_product_sum);
-                    ctx.extended_allocator.push(extend_z);
+                    // ctx.extended_allocator.push(input_product);
+                    // ctx.extended_allocator.push(input_product_sum);
+                    // ctx.extended_allocator.push(extend_z);
                 }
             }
+
+            to_result((), err, "fail to run field_op_batch_mul_sum")?;
+            // unsafe {
+            //     cuda_runtime_sys::cudaStreamSynchronize(stream);
+            //     cuda_runtime_sys::cudaStreamDestroy(stream);
+            //     ctx.extended_allocator.append(&mut vec![
+            //         input_product_buf_first,
+            //         input_product_sum_buf_first,
+            //         table_buf,
+            //         multiplicity_buf,
+            //     ]);
+            // }
+            ///
+            if let Some(stream) = last_stream.0 {
+                cuda_runtime_sys::cudaStreamSynchronize(stream);
+                cuda_runtime_sys::cudaStreamDestroy(stream);
+                ctx.extended_allocator.append(&mut last_stream.1)
+            }
+            last_stream = (
+                Some(stream),
+                vec![
+                    table_buf,
+                    multiplicity_buf,
+                    input_product_buffs,
+                    input_product_sum_bufs,
+                    extended_zs_buf,
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            );
         }
     }
 

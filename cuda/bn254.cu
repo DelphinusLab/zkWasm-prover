@@ -1403,11 +1403,12 @@ extern "C"
         const Bn254FrField *l_active_row,
         const Bn254FrField *y,
         int rot,
-        int n)
+        int n,
+        cudaStream_t stream)
     {
         int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
-        _logup_eval_h_extra_inputs<<<blocks, threads>>>(
+        _logup_eval_h_extra_inputs<<<blocks, threads,0, stream>>>(
             res,
             input_product, input_product_sum, z,
             l_active_row, y, rot, n);
@@ -1422,11 +1423,12 @@ extern "C"
         const Bn254FrField *y,
         int n_set,
         int rot,
-        int n)
+        int n,
+        cudaStream_t stream)
     {
         int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
-        _permutation_eval_h_p2<<<blocks, threads>>>(res, set, l0, l_last, y, n_set, rot, n);
+        _permutation_eval_h_p2<<<blocks, threads, 0, stream>>>(res, set, l0, l_last, y, n_set, rot, n);
         return cudaGetLastError();
     }
 
