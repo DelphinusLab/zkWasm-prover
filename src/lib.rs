@@ -1404,49 +1404,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     ] {
                         device.copy_from_device_to_host_async(col, s_buf, stream)?;
                     }
-
-                    //extra inputs and zs
-                    // for (inputs_set, z) in inputs_sets.iter().zip(z_set.iter_mut()).skip(1) {
-                    //     for (i, input) in inputs_set.iter().enumerate() {
-                    //         device.copy_from_host_to_device_async(input_buf, input, stream)?;
-                    //         logup_sum_input_inv(
-                    //             &device,
-                    //             z_buf,
-                    //             input_buf,
-                    //             table_buf,
-                    //             &beta_buf,
-                    //             i,
-                    //             size,
-                    //             Some(stream),
-                    //         )?;
-                    //     }
-                    //
-                    //     let err = eval_logup_z_pure(
-                    //         z_buf.ptr(),
-                    //         input_buf.ptr(),
-                    //         table_buf.ptr(),
-                    //         last_z_buf.ptr(),
-                    //         unusable_rows_start as i32,
-                    //         size as i32,
-                    //         stream,
-                    //     );
-                    //
-                    //     to_result((), err, "failed to run eval_lookup_z")?;
-                    //
-                    //     intt_raw_async(
-                    //         &device,
-                    //         &mut *z_buf,
-                    //         &mut *input_buf,
-                    //         &intt_pq_buf,
-                    //         &intt_omegas_buf,
-                    //         &intt_divisor_buf,
-                    //         k,
-                    //         Some(stream),
-                    //     )?;
-                    //
-                    //     device.copy_from_device_to_host_async(&mut z[..], &z_buf, stream)?;
-                    // }
-
                     streams[idx] = Some(stream);
                 }
             }
@@ -1461,13 +1418,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             }
 
             let mut streams = [None; MAX_CONCURRENCY];
-            // assemble the extra inputs set
+            // assemble the extra inputs set, interleave them to parallel stream
+            // and keep run sequence due to the last_z written by previous inputs&z
+            // e.g. a=[1,4,7],b=[2,5],c=[3,6,8]
+            // interleave to [1,2,3,4,5,6,7,8]=>(stream:instance):[(0,1),(1,2),(2,3),(0,4),(1,5),(2,6),(0,7),(2,8)]
             let mut buff = vec![];
-            let mut map = BTreeMap::new();
-            for (i, (inputs_sets, _, _, z_set)) in lookups.iter_mut() {
+            for (lookup_i, (inputs_sets, _, _, z_set)) in lookups.iter_mut() {
                 let mut inner = vec![];
                 for (inputs_set, z) in inputs_sets.iter().zip(z_set.iter_mut()).skip(1) {
-                    inner.push((i, &inputs_set[..], &mut z[..]))
+                    inner.push((*lookup_i, &inputs_set[..], &mut z[..]))
                 }
                 if !inner.is_empty() {
                     buff.push(inner);
@@ -1488,10 +1447,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 }
             }
 
-            println!("lookup extra buff={}", buff_interleave.len());
-            for (i, (lookup_index, inputs_set, z)) in buff_interleave.iter_mut().enumerate() {
+            for (i, (lookup_index, inputs_set, z)) in buff_interleave.iter_mut() {
                 unsafe {
-                    let idx = i % MAX_CONCURRENCY;
+                    let idx = *i % MAX_CONCURRENCY;
                     let [z_buf, input_buf, table_buf, _] = Rc::get_mut(&mut buffers[idx]).unwrap();
 
                     if let Some(last_stream) = streams[idx] {
@@ -1521,7 +1479,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         z_buf.ptr(),
                         input_buf.ptr(),
                         table_buf.ptr(),
-                        last_z_buf[*lookup_index].ptr(),
+                        last_z_bufs[*lookup_index].ptr(),
                         unusable_rows_start as i32,
                         size as i32,
                         stream,

@@ -136,6 +136,7 @@ extern "C" {
         y: *mut c_void,
         rot: i32,
         n: i32,
+        stream: *mut CUstream_st,
     ) -> cudaError;
 
     pub fn logup_eval_h_z_set(
