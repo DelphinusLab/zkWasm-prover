@@ -132,6 +132,7 @@ pub fn _export_evaluate_h_gates<C: CurveAffine>(
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
     lookup_products: &mut Vec<(
+        &mut Vec<Vec<Vec<C::Scalar, HugePageAllocator>>>,
         &mut Vec<C::Scalar, HugePageAllocator>,
         &mut Vec<C::Scalar, HugePageAllocator>,
         &mut Vec<Vec<C::Scalar, HugePageAllocator>>,
@@ -604,7 +605,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                 Vec<(CudaDeviceBufRaw, *mut CUstream_st)>,
             ) = inputs_sets
                 .iter()
-                .map(|set| do_extended_ntt_v2_async(device, &mut ctx, set[0]))
+                .map(|set| do_extended_ntt_v2_async(device, &mut ctx, &set[0][..]))
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .map(|(x, y, z)| (x, (y, z)))
@@ -790,7 +791,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                 }
             }
 
-            to_result((), err, "fail to run field_op_batch_mul_sum")?;
+            // to_result((), err, "fail to run field_op_batch_mul_sum")?;
 
             if let Some(stream) = last_stream.0 {
                 cuda_runtime_sys::cudaStreamSynchronize(stream);

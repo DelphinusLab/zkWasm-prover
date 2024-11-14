@@ -250,6 +250,7 @@ extern "C" {
         input: *mut c_void,
         table: *mut c_void,
         multiplicity: *mut c_void,
+        tmp_buf: *mut c_void,
         beta: *mut c_void,
         last_z: *mut c_void,
         last_z_index: i32,

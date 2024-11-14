@@ -1427,8 +1427,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let mut buff = vec![];
             for (lookup_i, (inputs_sets, _, _, z_set)) in lookups.iter_mut() {
                 let mut inner = vec![];
-                for (inputs_set, z) in inputs_sets.iter().zip(z_set.iter_mut()).skip(1) {
-                    inner.push((*lookup_i, &inputs_set[..], &mut z[..]))
+                for (inputs_set, z) in inputs_sets.iter_mut().zip(z_set.iter_mut()).skip(1) {
+                    inner.push((*lookup_i, &mut inputs_set[..], &mut z[..]))
                 }
                 if !inner.is_empty() {
                     buff.push(inner);
@@ -1477,7 +1477,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             Some(stream),
                         )?;
                     }
-                    device.copy_from_device_to_device_async(&z_buf, &input_buf, size, stream)?;
+                    device.copy_from_device_to_device_async::<C::Scalar>(
+                        &z_buf, &input_buf, size, stream,
+                    )?;
                     let err = eval_logup_z_pure(
                         z_buf.ptr(),
                         tmp_buf.ptr(),
@@ -1548,8 +1550,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                 */
                 for (_, (inputs_sets, table, m_coeff, zs_coeff)) in lookups.iter() {
-                    let [z_buf, input_buf, table_buf, multiplicity_buf] =
-                        Rc::get_mut(&mut buffers[0]).unwrap();
+                    let [z_buf, input_buf, _, _, _] = Rc::get_mut(&mut buffers[0]).unwrap();
                     let mut m_lagrange = table.clone();
                     device.copy_from_host_to_device(z_buf, m_coeff)?;
                     ntt(
@@ -1607,7 +1608,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         *input = *input - *m * &(*table + beta).invert().unwrap();
                     }
 
-                    for (j, (input_set_sum, z_lag)) in
+                    for (_, (input_set_sum, z_lag)) in
                         input_set_sums.iter().zip(zs_lagrange.iter()).enumerate()
                     {
                         for (i, input_sum) in input_set_sum.iter().enumerate() {
@@ -1627,8 +1628,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let mut lookups = lookups.into_iter().map(|(_, b)| b).collect::<Vec<_>>();
         end_timer!(timer);
 
-        let z_counts = lookups.iter().map(|x| x.3.len()).sum::<usize>();
-        let timer = start_timer!(|| format!("lookup z msm {}", z_counts));
+        let _z_counts = lookups.iter().map(|x| x.3.len()).sum::<usize>();
+        let timer = start_timer!(|| format!("lookup z msm {}", _z_counts));
         let lookup_z_commitments = crate::cuda::bn254::batch_msm::<C>(
             &g_buf,
             [&s_buf, &t_buf],

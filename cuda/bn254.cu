@@ -1495,6 +1495,54 @@ extern "C"
         return cudaGetLastError();
     }
 
+cudaError_t logup_eval_h_v1(
+        Bn254FrField *res,
+        const Bn254FrField *input_product,
+        const Bn254FrField *input_product_sum,
+        const Bn254FrField *table,
+        const Bn254FrField *multiplicity,
+        const Bn254FrField *z_first,
+        const Bn254FrField *z_last,
+        const Bn254FrField *l0,
+        const Bn254FrField *l_last,
+        const Bn254FrField *l_active_row,
+        const Bn254FrField *y,
+        int rot,
+        int n,
+        cudaStream_t stream)
+    {
+        int threads = n >= 64 ? 64 : 1;
+        int blocks = n / threads;
+        _logup_eval_h_v1<<<blocks, threads, 0, stream>>>(
+            res,
+            input_product, input_product_sum, table, multiplicity, z_first, z_last,
+            l0, l_last, l_active_row,
+            y, rot, n);
+        return cudaGetLastError();
+    }
+
+
+  cudaError_t logup_eval_h_extra_inputs_v1(
+        Bn254FrField *res,
+        const Bn254FrField *input_product,
+        const Bn254FrField *input_product_sum,
+        const Bn254FrField *z,
+        const Bn254FrField *l_active_row,
+        const Bn254FrField *y,
+        int rot,
+        int n,
+        cudaStream_t stream)
+    {
+        int threads = n >= 64 ? 64 : 1;
+        int blocks = n / threads;
+        _logup_eval_h_extra_inputs_v1<<<blocks, threads,0, stream>>>(
+            res,
+            input_product, input_product_sum, z,
+            l_active_row, y, rot, n);
+        return cudaGetLastError();
+    }
+
+
     cudaError_t logup_eval_h_z_set(
         Bn254FrField *res,
         const Bn254FrField **set,
