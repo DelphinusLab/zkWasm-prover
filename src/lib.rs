@@ -1325,7 +1325,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             const MAX_CONCURRENCY: usize = 3;
             let mut streams = [None; MAX_CONCURRENCY];
             let mut buffers = [0; MAX_CONCURRENCY].map(|_| {
-                Rc::new([0; 4].map(|_| (device.alloc_device_buffer::<C::Scalar>(size).unwrap())))
+                Rc::new([0; 5].map(|_| (device.alloc_device_buffer::<C::Scalar>(size).unwrap())))
             });
 
             let beta_buf = device.alloc_device_buffer_from_slice(&[beta])?;
@@ -1338,7 +1338,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             {
                 unsafe {
                     let idx = *i % MAX_CONCURRENCY;
-                    let [z_buf, input_buf, table_buf, multiplicity_buf] =
+                    let [z_buf, input_buf, table_buf, multiplicity_buf, tmp_buf] =
                         Rc::get_mut(&mut buffers[idx]).unwrap();
 
                     if let Some(last_stream) = streams[idx] {
@@ -1376,6 +1376,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         input_buf.ptr(),
                         table_buf.ptr(),
                         multiplicity_buf.ptr(),
+                        tmp_buf.ptr(),
                         beta_buf.ptr(),
                         last_z_buf.ptr(),
                         unusable_rows_start as i32,
@@ -1385,11 +1386,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                     to_result((), err, "failed to run eval_lookup_z")?;
 
-                    for s_buf in [&mut *multiplicity_buf, &mut *z_buf] {
+                    for s_buf in [&mut *multiplicity_buf, &mut *z_buf, &mut *input_buf] {
                         intt_raw_async(
                             &device,
                             s_buf,
-                            &mut *input_buf,
+                            &mut *tmp_buf,
                             &intt_pq_buf,
                             &intt_omegas_buf,
                             &intt_divisor_buf,
@@ -1401,6 +1402,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     for (col, s_buf) in [
                         (&mut multiplicity[..], &multiplicity_buf),
                         (&mut z_set[0][..], &z_buf),
+                        (&mut inputs_sets[0][0][..], &input_buf),
                     ] {
                         device.copy_from_device_to_host_async(col, s_buf, stream)?;
                     }
@@ -1450,7 +1452,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             for (i, (lookup_index, inputs_set, z)) in buff_interleave.iter_mut() {
                 unsafe {
                     let idx = *i % MAX_CONCURRENCY;
-                    let [z_buf, input_buf, table_buf, _] = Rc::get_mut(&mut buffers[idx]).unwrap();
+                    let [z_buf, input_buf, table_buf, _, tmp_buf] =
+                        Rc::get_mut(&mut buffers[idx]).unwrap();
 
                     if let Some(last_stream) = streams[idx] {
                         cuda_runtime_sys::cudaStreamSynchronize(last_stream);
@@ -1462,11 +1465,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
 
                     for (i, input) in inputs_set.iter().enumerate() {
-                        device.copy_from_host_to_device_async(input_buf, input, stream)?;
+                        device.copy_from_host_to_device_async(tmp_buf, input, stream)?;
                         logup_sum_input_inv(
                             &device,
-                            z_buf,
                             input_buf,
+                            tmp_buf,
                             table_buf,
                             &beta_buf,
                             i,
@@ -1474,10 +1477,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             Some(stream),
                         )?;
                     }
-
+                    device.copy_from_device_to_device_async(&z_buf, &input_buf, size, stream)?;
                     let err = eval_logup_z_pure(
                         z_buf.ptr(),
-                        input_buf.ptr(),
+                        tmp_buf.ptr(),
                         table_buf.ptr(),
                         last_z_bufs[*lookup_index].ptr(),
                         unusable_rows_start as i32,
@@ -1487,18 +1490,35 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                     to_result((), err, "failed to run eval_lookup_z")?;
 
-                    intt_raw_async(
-                        &device,
-                        &mut *z_buf,
-                        &mut *input_buf,
-                        &intt_pq_buf,
-                        &intt_omegas_buf,
-                        &intt_divisor_buf,
-                        k,
-                        Some(stream),
-                    )?;
+                    // intt_raw_async(
+                    //     &device,
+                    //     &mut *z_buf,
+                    //     &mut *input_buf,
+                    //     &intt_pq_buf,
+                    //     &intt_omegas_buf,
+                    //     &intt_divisor_buf,
+                    //     k,
+                    //     Some(stream),
+                    // )?;
+                    //
+                    // device.copy_from_device_to_host_async(&mut z[..], &z_buf, stream)?;
+                    for s_buf in [&mut *z_buf, &mut *input_buf] {
+                        intt_raw_async(
+                            &device,
+                            s_buf,
+                            &mut *tmp_buf,
+                            &intt_pq_buf,
+                            &intt_omegas_buf,
+                            &intt_divisor_buf,
+                            k,
+                            Some(stream),
+                        )?;
+                    }
 
-                    device.copy_from_device_to_host_async(&mut z[..], &z_buf, stream)?;
+                    for (col, s_buf) in [(&mut z[..], &z_buf), (&mut inputs_set[0][..], &input_buf)]
+                    {
+                        device.copy_from_device_to_host_async(col, s_buf, stream)?;
+                    }
 
                     streams[idx] = Some(stream);
                 }
@@ -1738,7 +1758,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .collect::<Vec<_>>()[..],
             &mut lookups
                 .iter_mut()
-                .map(|(_, v1, v2, v3)| (v1, v2, v3))
+                .map(|(v0, v1, v2, v3)| (v0, v1, v2, v3))
                 .collect::<Vec<_>>(),
             &shuffle_products.iter().map(|x| &x[..]).collect::<Vec<_>>()[..],
             y,

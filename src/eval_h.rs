@@ -41,6 +41,8 @@ use crate::cuda::bn254_c;
 use crate::cuda::bn254_c::field_op_batch_mul_sum;
 use crate::cuda::bn254_c::logup_eval_h;
 use crate::cuda::bn254_c::logup_eval_h_extra_inputs;
+use crate::cuda::bn254_c::logup_eval_h_extra_inputs_v1;
+use crate::cuda::bn254_c::logup_eval_h_v1;
 use crate::cuda::bn254_c::shuffle_eval_h;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
@@ -186,6 +188,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
     lookup_products: &mut Vec<(
+        &mut Vec<Vec<Vec<C::Scalar, HugePageAllocator>>>,
         &mut Vec<C::Scalar, HugePageAllocator>,
         &mut Vec<C::Scalar, HugePageAllocator>,
         &mut Vec<Vec<C::Scalar, HugePageAllocator>>,
@@ -369,6 +372,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
     lookup_products: &mut Vec<(
+        &mut Vec<Vec<Vec<C::Scalar, HugePageAllocator>>>,
         &mut Vec<C::Scalar, HugePageAllocator>,
         &mut Vec<C::Scalar, HugePageAllocator>,
         &mut Vec<Vec<C::Scalar, HugePageAllocator>>,
@@ -549,7 +553,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
     let timer = start_timer!(|| "evaluate_h lookup");
     let beta_buf = device.alloc_device_buffer_from_slice(&[beta][..])?;
     let mut last_stream = (None, vec![]);
-    for (_i, (lookup, (table, multiplicity, zs))) in pk
+    for (_i, (lookup, (inputs_sets, table, multiplicity, zs))) in pk
         .vk
         .cs
         .lookups
@@ -560,6 +564,13 @@ fn evaluate_h_gates_core<C: CurveAffine>(
         let sets_len = lookup.input_expressions_sets.len();
         //todo check degree case if degree=1 needed special process?
         // let input_deg = get_expr_degree(&lookup.input_expressions);
+        let mut input_deg = 1;
+        lookup.input_expressions_sets.iter().for_each(|set| {
+            set.0.iter().for_each(|input| {
+                input_deg = input_deg.max(get_expr_degree(input));
+            })
+        });
+
         let table_deg = get_expr_degree(&lookup.table_expressions);
         let (input_product, input_product_sum, table_expr) = flatten_lookup_expression(
             &lookup
@@ -577,10 +588,29 @@ fn evaluate_h_gates_core<C: CurveAffine>(
             .map(|e1| evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let input_product_sum_buffs = input_product_sum
-            .into_iter()
-            .map(|e1| evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx))
-            .collect::<Result<Vec<_>, _>>()?;
+        let (input_product_sum_buffs, stream_inputs) = if input_deg > 1 {
+            (
+                input_product_sum
+                    .into_iter()
+                    .map(|e1| {
+                        evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                None,
+            )
+        } else {
+            let (extended_inputs_buf, inputs_streams): (
+                Vec<CudaDeviceBufRaw>,
+                Vec<(CudaDeviceBufRaw, *mut CUstream_st)>,
+            ) = inputs_sets
+                .iter()
+                .map(|set| do_extended_ntt_v2_async(device, &mut ctx, set[0]))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|(x, y, z)| (x, (y, z)))
+                .unzip();
+            (extended_inputs_buf, Some(inputs_streams))
+        };
 
         let (table_buf, stream_table) = if table_deg > 1 {
             (
@@ -660,27 +690,56 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                 cuda_runtime_sys::cudaStreamDestroy(stream);
                 ctx.extended_allocator.push(buf);
             }
+
+            if let Some(streams) = stream_inputs {
+                for (tmp_buf, stream) in streams.into_iter() {
+                    cuda_runtime_sys::cudaStreamSynchronize(stream);
+                    cuda_runtime_sys::cudaStreamDestroy(stream);
+                    ctx.extended_allocator.push(tmp_buf);
+                }
+            }
         }
 
         unsafe {
             let mut stream = std::mem::zeroed();
             let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-            let err = logup_eval_h(
-                h_buf.ptr(),
-                input_product_buffs[0].ptr(),
-                input_product_sum_buffs[0].ptr(),
-                table_buf.ptr(),
-                multiplicity_buf.ptr(),
-                extended_zs_buf.first().unwrap().ptr(),
-                extended_zs_buf.last().unwrap().ptr(),
-                l0_buf.ptr(),
-                l_last_buf.ptr(),
-                l_active_buf.ptr(),
-                y_buf.ptr(),
-                1 << (extended_k - k),
-                ctx.extended_size as i32,
-                stream,
-            );
+            if input_deg > 1 {
+                let err = logup_eval_h(
+                    h_buf.ptr(),
+                    input_product_buffs[0].ptr(),
+                    input_product_sum_buffs[0].ptr(),
+                    table_buf.ptr(),
+                    multiplicity_buf.ptr(),
+                    extended_zs_buf.first().unwrap().ptr(),
+                    extended_zs_buf.last().unwrap().ptr(),
+                    l0_buf.ptr(),
+                    l_last_buf.ptr(),
+                    l_active_buf.ptr(),
+                    y_buf.ptr(),
+                    1 << (extended_k - k),
+                    ctx.extended_size as i32,
+                    stream,
+                );
+                to_result((), err, "fail to run logup_eval_h_extra_inputs")?;
+            } else {
+                let err = logup_eval_h_v1(
+                    h_buf.ptr(),
+                    input_product_buffs[0].ptr(),
+                    input_product_sum_buffs[0].ptr(),
+                    table_buf.ptr(),
+                    multiplicity_buf.ptr(),
+                    extended_zs_buf.first().unwrap().ptr(),
+                    extended_zs_buf.last().unwrap().ptr(),
+                    l0_buf.ptr(),
+                    l_last_buf.ptr(),
+                    l_active_buf.ptr(),
+                    y_buf.ptr(),
+                    1 << (extended_k - k),
+                    ctx.extended_size as i32,
+                    stream,
+                );
+                to_result((), err, "fail to run logup_eval_h_extra_inputs")?;
+            }
 
             if sets_len > 1 {
                 logup_eval_h_z_set(
@@ -701,18 +760,33 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                     .zip(extended_zs_buf.iter())
                     .skip(1)
                 {
-                    let err = logup_eval_h_extra_inputs(
-                        h_buf.ptr(),
-                        input_product.ptr(),
-                        input_product_sum.ptr(),
-                        extend_z.ptr(),
-                        l_active_buf.ptr(),
-                        y_buf.ptr(),
-                        1 << (extended_k - k),
-                        ctx.extended_size as i32,
-                        stream,
-                    );
-                    to_result((), err, "fail to run logup_eval_h_extra_inputs")?;
+                    if input_deg > 1 {
+                        let err = logup_eval_h_extra_inputs(
+                            h_buf.ptr(),
+                            input_product.ptr(),
+                            input_product_sum.ptr(),
+                            extend_z.ptr(),
+                            l_active_buf.ptr(),
+                            y_buf.ptr(),
+                            1 << (extended_k - k),
+                            ctx.extended_size as i32,
+                            stream,
+                        );
+                        to_result((), err, "fail to run logup_eval_h_extra_inputs")?;
+                    } else {
+                        let err = logup_eval_h_extra_inputs_v1(
+                            h_buf.ptr(),
+                            input_product.ptr(),
+                            input_product_sum.ptr(),
+                            extend_z.ptr(),
+                            l_active_buf.ptr(),
+                            y_buf.ptr(),
+                            1 << (extended_k - k),
+                            ctx.extended_size as i32,
+                            stream,
+                        );
+                        to_result((), err, "fail to run logup_eval_h_extra_inputs")?;
+                    }
                 }
             }
 

@@ -958,6 +958,56 @@ __global__ void _logup_eval_h(
     res[i] = t;
 }
 
+__global__ void _logup_eval_h_v1(
+    Bn254FrField *res,
+    const Bn254FrField *input_product,
+    const Bn254FrField *input_product_sum,
+    const Bn254FrField *table,
+    const Bn254FrField *multiplicity,
+    const Bn254FrField *z_first,
+    const Bn254FrField *z_last,
+    const Bn254FrField *l0,
+    const Bn254FrField *l_last,
+    const Bn254FrField *l_active_row,
+    const Bn254FrField *y,
+    int rot,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int r_next = (i + rot) & (n - 1);
+
+    Bn254FrField t, u, p;
+    t = res[i];
+
+    // l_0(X) * z_0(X) = 0
+    t = t * *y;
+    u = l0[i] * z_first[i];
+    t += u;
+
+    // l_last(X) * z_l(X) = 0
+    t = t * *y;
+    u = l_last[i] * z_last[i];
+    t += u;
+
+    // (1 - (l_last(X) + l_blind(X))) * (
+    //   τ(X) * Π(φ_i(X)) * (ϕ(gX) - ϕ(X))
+    //   -τ(X) * Π(φ_i(X))*(∑_i 1/φ_j(X)) + m(X) * Π(φ_i(X))
+    // ) = 0
+    //=>(1 - (l_last(X) + l_blind(X))) * (
+    //   (τ(X) * (ϕ(gX) - ϕ(X)-(∑_i 1/φ_j(X)))+m(X))* Π(φ_i(X))
+    // ) = 0
+    t = t * *y;
+    u = z_first[r_next] - z_first[i];
+    u = u - input_product_sum[i];
+    u = u * table[i];
+    u = u + multiplicity[i];
+    u = u * input_product[i];
+    u = u * l_active_row[i];
+    t += u;
+
+    res[i] = t;
+}
+
 
 //logup extra inputs and z check
 __global__ void _logup_eval_h_extra_inputs(
@@ -989,6 +1039,36 @@ __global__ void _logup_eval_h_extra_inputs(
 
     res[i] = t;
 }
+
+__global__ void _logup_eval_h_extra_inputs_v1(
+    Bn254FrField *res,
+    const Bn254FrField *input_product,
+    const Bn254FrField *input_product_sum,
+    const Bn254FrField *z,
+    const Bn254FrField *l_active_row,
+    const Bn254FrField *y,
+    int rot,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int r_next = (i + rot) & (n - 1);
+
+    Bn254FrField t, u;
+    t = res[i];
+
+    // (1 - (l_last(X) + l_blind(X))) * (
+    //    (ϕ(gX) - ϕ(X)) -∑_i(1/φ_j(X))
+    // ) = 0
+    t = t * *y;
+    u = z[r_next] - z[i];
+    u = u - input_product_sum[i];
+    u = u * l_active_row[i];
+    t += u;
+
+    res[i] = t;
+}
+
+
 
 //logup z set check, z is grand_sum
 __global__ void _logup_eval_h_z(
@@ -1617,6 +1697,7 @@ extern "C"
             Bn254FrField *input,
             Bn254FrField *table,
             Bn254FrField *multiplicity,
+            Bn254FrField *tmp_buf,
             const Bn254FrField *beta,
             Bn254FrField *last_z,
             int last_z_index,
@@ -1640,15 +1721,15 @@ extern "C"
             worker = 64 * 64;
             size_per_worker = n / worker;
             _eval_logup_z_grand_sum_batch<<<64, 64, 0, stream>>>(
-                z, input, size_per_worker);
+                z, tmp_buf, size_per_worker);
             _eval_logup_z_grand_sum_batch<<<8, 8, 0, stream>>>(
-                input, table, 64);
+                tmp_buf, table, 64);
             _eval_logup_z_grand_sum_single_spread<<<1, 1, 0, stream>>>(
                 table, 64);
             _eval_logup_z_grand_sum_batch_spread<<<8, 8, 0, stream>>>(
-                input, table, 64);
+                tmp_buf, table, 64);
             _eval_logup_z_grand_sum_batch_spread_skip<<<64, 64, 0, stream>>>(
-                z, input, last_z, last_z_index, size_per_worker);
+                z, tmp_buf, last_z, last_z_index, size_per_worker);
 
             return cudaGetLastError();
         }
