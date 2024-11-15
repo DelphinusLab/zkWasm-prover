@@ -907,3 +907,28 @@ pub fn logup_sum_input_inv(
     }
     Ok(())
 }
+
+pub fn logup_eval_input_product_sum(
+    device: &CudaDevice,
+    product: &CudaDeviceBufRaw,
+    product_sum: &CudaDeviceBufRaw,
+    set: &[CudaDeviceBufRaw],
+    n: usize,
+    stream: Option<cudaStream_t>,
+) -> Result<(), Error> {
+    unsafe {
+        device.acitve_ctx()?;
+        let sets = device
+            .alloc_device_buffer_from_slice(&set.iter().map(|x| x.ptr()).collect::<Vec<_>>()[..])?;
+        let err = bn254_c::logup_eval_inputs_product_sum(
+            product.ptr(),
+            product_sum.ptr(),
+            sets.ptr(),
+            set.len() as i32,
+            n as i32,
+            stream.unwrap_or(0usize as _),
+        );
+        to_result((), err, "fail to run permutation_eval_h_p2")?;
+    }
+    Ok(())
+}

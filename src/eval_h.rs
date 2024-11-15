@@ -30,6 +30,7 @@ use crate::cuda::bn254::field_sub;
 use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::intt_raw_async;
 use crate::cuda::bn254::logup_eval_h_z_set;
+use crate::cuda::bn254::logup_eval_input_product_sum;
 use crate::cuda::bn254::ntt_prepare;
 use crate::cuda::bn254::ntt_raw;
 use crate::cuda::bn254::permutation_eval_h_l;
@@ -584,33 +585,73 @@ fn evaluate_h_gates_core<C: CurveAffine>(
             theta,
         );
 
-        let input_product_buffs = input_product
-            .into_iter()
-            .map(|e1| evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx))
-            .collect::<Result<Vec<_>, _>>()?;
+        let (input_product_buffs, input_product_sum_buffs, stream_inputs) = if input_deg > 1 {
+            let input_product_buffs = input_product
+                .into_iter()
+                .map(|e1| evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx))
+                .collect::<Result<Vec<_>, _>>()?;
 
-        let (input_product_sum_buffs, stream_inputs) = if input_deg > 1 {
-            (
-                input_product_sum
-                    .into_iter()
-                    .map(|e1| {
-                        evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-                None,
-            )
+            let input_product_sum_buffs = input_product_sum
+                .into_iter()
+                .map(|e1| evaluate_prove_expr(device, &vec![e1], fixed, advice, instance, &mut ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            (input_product_buffs, input_product_sum_buffs, None)
         } else {
-            let (extended_inputs_buf, inputs_streams): (
-                Vec<CudaDeviceBufRaw>,
-                Vec<(CudaDeviceBufRaw, *mut CUstream_st)>,
-            ) = inputs_sets
+            let (inputs_buf_sets, streams) = inputs_sets
                 .iter()
-                .map(|set| do_extended_ntt_v2_async(device, &mut ctx, &set[0][..]))
+                .map(|set| -> Result<_, _> {
+                    set.iter()
+                        .map(|input| -> DeviceResult<_> {
+                            logup_transform_extend_coset(
+                                device,
+                                input,
+                                &beta_buf,
+                                &intt_pq_buf,
+                                &intt_omegas_buf,
+                                &intt_divisor_buf,
+                                &mut ctx,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .unzip()
+                })
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
-                .map(|(x, y, z)| (x, (y, z)))
                 .unzip();
-            (extended_inputs_buf, Some(inputs_streams))
+
+            unsafe {
+                for st in streams.into_iter() {
+                    for (stream, tmp_buf) in st.into_iter() {
+                        cuda_runtime_sys::cudaStreamSynchronize(stream);
+                        cuda_runtime_sys::cudaStreamDestroy(stream);
+                        ctx.extended_allocator.push(tmp_buf);
+                    }
+                }
+            }
+            let mut products = vec![];
+            let mut products_sum = vec![];
+            let mut streams = vec![];
+            unsafe {
+                for set in inputs_buf_sets.iter() {
+                    let mut stream = std::mem::zeroed();
+                    let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+                    let mut product_buf = ctx.alloc(device)?;
+                    let mut product_sum_buf = ctx.alloc(device)?;
+                    logup_eval_input_product_sum(
+                        device,
+                        &product_buf,
+                        &product_sum_buf,
+                        &set,
+                        ctx.extended_size,
+                        Some(stream),
+                    )?;
+                    products.push(product_buf);
+                    products_sum.push(product_sum_buf);
+                    streams.push((steam, set));
+                }
+            }
+            (products, products_sum, Some(streams))
         };
 
         let (table_buf, stream_table) = if table_deg > 1 {
@@ -693,10 +734,10 @@ fn evaluate_h_gates_core<C: CurveAffine>(
             }
 
             if let Some(streams) = stream_inputs {
-                for (tmp_buf, stream) in streams.into_iter() {
+                for (stream, mut tmp_bufs) in streams.into_iter() {
                     cuda_runtime_sys::cudaStreamSynchronize(stream);
                     cuda_runtime_sys::cudaStreamDestroy(stream);
-                    ctx.extended_allocator.push(tmp_buf);
+                    ctx.extended_allocator.append(tmp_bufs);
                 }
             }
         }
@@ -704,43 +745,23 @@ fn evaluate_h_gates_core<C: CurveAffine>(
         unsafe {
             let mut stream = std::mem::zeroed();
             let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-            if input_deg > 1 {
-                let err = logup_eval_h(
-                    h_buf.ptr(),
-                    input_product_buffs[0].ptr(),
-                    input_product_sum_buffs[0].ptr(),
-                    table_buf.ptr(),
-                    multiplicity_buf.ptr(),
-                    extended_zs_buf.first().unwrap().ptr(),
-                    extended_zs_buf.last().unwrap().ptr(),
-                    l0_buf.ptr(),
-                    l_last_buf.ptr(),
-                    l_active_buf.ptr(),
-                    y_buf.ptr(),
-                    1 << (extended_k - k),
-                    ctx.extended_size as i32,
-                    stream,
-                );
-                to_result((), err, "fail to run logup_eval_h_extra_inputs")?;
-            } else {
-                let err = logup_eval_h_v1(
-                    h_buf.ptr(),
-                    input_product_buffs[0].ptr(),
-                    input_product_sum_buffs[0].ptr(),
-                    table_buf.ptr(),
-                    multiplicity_buf.ptr(),
-                    extended_zs_buf.first().unwrap().ptr(),
-                    extended_zs_buf.last().unwrap().ptr(),
-                    l0_buf.ptr(),
-                    l_last_buf.ptr(),
-                    l_active_buf.ptr(),
-                    y_buf.ptr(),
-                    1 << (extended_k - k),
-                    ctx.extended_size as i32,
-                    stream,
-                );
-                to_result((), err, "fail to run logup_eval_h_extra_inputs")?;
-            }
+            let err = logup_eval_h(
+                h_buf.ptr(),
+                input_product_buffs[0].ptr(),
+                input_product_sum_buffs[0].ptr(),
+                table_buf.ptr(),
+                multiplicity_buf.ptr(),
+                extended_zs_buf.first().unwrap().ptr(),
+                extended_zs_buf.last().unwrap().ptr(),
+                l0_buf.ptr(),
+                l_last_buf.ptr(),
+                l_active_buf.ptr(),
+                y_buf.ptr(),
+                1 << (extended_k - k),
+                ctx.extended_size as i32,
+                stream,
+            );
+            to_result((), err, "fail to run logup_eval_h_extra_inputs")?;
 
             if sets_len > 1 {
                 logup_eval_h_z_set(
@@ -761,37 +782,20 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                     .zip(extended_zs_buf.iter())
                     .skip(1)
                 {
-                    if input_deg > 1 {
-                        let err = logup_eval_h_extra_inputs(
-                            h_buf.ptr(),
-                            input_product.ptr(),
-                            input_product_sum.ptr(),
-                            extend_z.ptr(),
-                            l_active_buf.ptr(),
-                            y_buf.ptr(),
-                            1 << (extended_k - k),
-                            ctx.extended_size as i32,
-                            stream,
-                        );
-                        to_result((), err, "fail to run logup_eval_h_extra_inputs")?;
-                    } else {
-                        let err = logup_eval_h_extra_inputs_v1(
-                            h_buf.ptr(),
-                            input_product.ptr(),
-                            input_product_sum.ptr(),
-                            extend_z.ptr(),
-                            l_active_buf.ptr(),
-                            y_buf.ptr(),
-                            1 << (extended_k - k),
-                            ctx.extended_size as i32,
-                            stream,
-                        );
-                        to_result((), err, "fail to run logup_eval_h_extra_inputs")?;
-                    }
+                    let err = logup_eval_h_extra_inputs(
+                        h_buf.ptr(),
+                        input_product.ptr(),
+                        input_product_sum.ptr(),
+                        extend_z.ptr(),
+                        l_active_buf.ptr(),
+                        y_buf.ptr(),
+                        1 << (extended_k - k),
+                        ctx.extended_size as i32,
+                        stream,
+                    );
+                    to_result((), err, "fail to run logup_eval_h_extra_inputs")?;
                 }
             }
-
-            // to_result((), err, "fail to run field_op_batch_mul_sum")?;
 
             if let Some(stream) = last_stream.0 {
                 cuda_runtime_sys::cudaStreamSynchronize(stream);
@@ -1177,6 +1181,58 @@ fn eval_ys<F: FieldExt>(ys: &BTreeMap<u32, F>, ctx: &mut EvalHContext<F>) -> F {
     ys.iter().fold(F::zero(), |acc, (y_order, f)| {
         acc + ctx.y[*y_order as usize] * f
     })
+}
+
+fn logup_transform_extend_coset<F: FieldExt>(
+    device: &CudaDevice,
+    values: &[F],
+    beta_buf: &CudaDeviceBufRaw,
+    pq_buf: &CudaDeviceBufRaw,
+    omegas_buf: &CudaDeviceBufRaw,
+    divisor: &CudaDeviceBufRaw,
+    ctx: &mut EvalHContext<F>,
+) -> DeviceResult<(CudaDeviceBufRaw, (cudaStream_t, CudaDeviceBufRaw))> {
+    unsafe {
+        let mut stream = std::mem::zeroed();
+        let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+        let mut buf = ctx.alloc(device)?;
+        device.copy_from_host_to_device_async(&buf, values, stream)?;
+
+        let mut tmp_buf = ctx.alloc(device)?;
+        field_op_v3(
+            device,
+            &buf,
+            Some(&buf),
+            None,
+            None,
+            Some(beta_buf),
+            ctx.size,
+            FieldOp::Add,
+            Some(stream),
+        )?;
+        intt_raw_async(
+            &device,
+            &mut buf,
+            &mut tmp_buf,
+            pq_buf,
+            omegas_buf,
+            divisor,
+            ctx.k,
+            Some(stream),
+        )?;
+        do_extended_prepare(device, &mut ctx, &mut buf, Some(stream))?;
+        ntt_raw(
+            device,
+            &mut buf,
+            &mut tmp_buf,
+            &ctx.extended_ntt_pq_buf,
+            &ctx.extended_ntt_omegas_buf,
+            ctx.extended_k,
+            Some(stream),
+        )?;
+
+        Ok((buf, (stream, tmp_buf)))
+    }
 }
 
 fn evaluate_prove_expr<F: FieldExt>(
