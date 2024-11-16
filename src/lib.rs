@@ -1527,7 +1527,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                 */
                 for (_, (inputs_sets, table, m_coeff, zs_coeff)) in lookups.iter() {
-                    let [z_buf, input_buf, _, _, _] = Rc::get_mut(&mut buffers[0]).unwrap();
+                    let [z_buf, input_buf, _, _] = Rc::get_mut(&mut buffers[0]).unwrap();
                     let mut m_lagrange = table.clone();
                     device.copy_from_host_to_device(z_buf, m_coeff)?;
                     ntt(

@@ -161,7 +161,7 @@ extern "C" {
         stream: *mut CUstream_st,
     ) -> cudaError;
 
-    pub fn logup_eval_inputs_product_sum(
+    pub fn logup_eval_h_inputs_product_sum(
         product: *mut c_void,
         product_sum: *mut c_void,
         sets: *mut c_void,
@@ -230,7 +230,6 @@ extern "C" {
         input: *mut c_void,
         table: *mut c_void,
         multiplicity: *mut c_void,
-        tmp_buf: *mut c_void,
         beta: *mut c_void,
         last_z: *mut c_void,
         last_z_index: i32,

@@ -29,8 +29,8 @@ use crate::cuda::bn254::field_op_v3;
 use crate::cuda::bn254::field_sub;
 use crate::cuda::bn254::intt_raw;
 use crate::cuda::bn254::intt_raw_async;
+use crate::cuda::bn254::logup_eval_h_inputs_product_sum;
 use crate::cuda::bn254::logup_eval_h_z_set;
-use crate::cuda::bn254::logup_eval_input_product_sum;
 use crate::cuda::bn254::ntt_prepare;
 use crate::cuda::bn254::ntt_raw;
 use crate::cuda::bn254::permutation_eval_h_l;
@@ -42,8 +42,6 @@ use crate::cuda::bn254_c;
 use crate::cuda::bn254_c::field_op_batch_mul_sum;
 use crate::cuda::bn254_c::logup_eval_h;
 use crate::cuda::bn254_c::logup_eval_h_extra_inputs;
-use crate::cuda::bn254_c::logup_eval_h_extra_inputs_v1;
-use crate::cuda::bn254_c::logup_eval_h_v1;
 use crate::cuda::bn254_c::shuffle_eval_h;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
@@ -564,8 +562,6 @@ fn evaluate_h_gates_core<C: CurveAffine>(
         .enumerate()
     {
         let sets_len = lookup.input_expressions_sets.len();
-        //todo check degree case if degree=1 needed special process?
-        // let input_deg = get_expr_degree(&lookup.input_expressions);
         let mut input_deg = 1;
         lookup.input_expressions_sets.iter().for_each(|set| {
             set.0.iter().for_each(|input| {
@@ -597,12 +593,13 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                 .collect::<Result<Vec<_>, _>>()?;
             (input_product_buffs, input_product_sum_buffs, None)
         } else {
-            let (inputs_buf_sets, streams) = inputs_sets
+            let (inputs_buf_sets, streams): (Vec<_>, Vec<_>) = inputs_sets
                 .iter()
-                .map(|set| -> Result<_, _> {
-                    set.iter()
+                .map(|set| -> Result<(Vec<_>, Vec<_>), _> {
+                    let rst = set
+                        .iter()
                         .map(|input| -> DeviceResult<_> {
-                            logup_transform_extend_coset(
+                            logup_direct_transform_extend_coset(
                                 device,
                                 input,
                                 &beta_buf,
@@ -614,7 +611,8 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                         })
                         .collect::<Result<Vec<_>, _>>()?
                         .into_iter()
-                        .unzip()
+                        .unzip();
+                    Ok(rst)
                 })
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
@@ -629,16 +627,17 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                     }
                 }
             }
+
             let mut products = vec![];
             let mut products_sum = vec![];
             let mut streams = vec![];
             unsafe {
-                for set in inputs_buf_sets.iter() {
+                for set in inputs_buf_sets.into_iter() {
                     let mut stream = std::mem::zeroed();
                     let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-                    let mut product_buf = ctx.alloc(device)?;
-                    let mut product_sum_buf = ctx.alloc(device)?;
-                    logup_eval_input_product_sum(
+                    let product_buf = ctx.alloc(device)?;
+                    let product_sum_buf = ctx.alloc(device)?;
+                    logup_eval_h_inputs_product_sum(
                         device,
                         &product_buf,
                         &product_sum_buf,
@@ -648,7 +647,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                     )?;
                     products.push(product_buf);
                     products_sum.push(product_sum_buf);
-                    streams.push((steam, set));
+                    streams.push((stream, set));
                 }
             }
             (products, products_sum, Some(streams))
@@ -660,47 +659,16 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                 None,
             )
         } else {
-            unsafe {
-                let mut stream = std::mem::zeroed();
-                let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-                let mut buf = ctx.alloc(device)?;
-                device.copy_from_host_to_device_async(&buf, &table, stream)?;
-
-                let mut tmp_buf = ctx.alloc(device)?;
-                field_op_v3(
-                    device,
-                    &buf,
-                    Some(&buf),
-                    None,
-                    None,
-                    Some(&beta_buf),
-                    size,
-                    FieldOp::Add,
-                    Some(stream),
-                )?;
-                intt_raw_async(
-                    &device,
-                    &mut buf,
-                    &mut tmp_buf,
-                    &intt_pq_buf,
-                    &intt_omegas_buf,
-                    &intt_divisor_buf,
-                    k,
-                    Some(stream),
-                )?;
-                do_extended_prepare(device, &mut ctx, &mut buf, Some(stream))?;
-                ntt_raw(
-                    device,
-                    &mut buf,
-                    &mut tmp_buf,
-                    &ctx.extended_ntt_pq_buf,
-                    &ctx.extended_ntt_omegas_buf,
-                    ctx.extended_k,
-                    Some(stream),
-                )?;
-
-                (buf, Some((stream, tmp_buf)))
-            }
+            logup_direct_transform_extend_coset(
+                device,
+                &table,
+                &beta_buf,
+                &intt_pq_buf,
+                &intt_omegas_buf,
+                &intt_divisor_buf,
+                &mut ctx,
+            )
+            .map(|(buf, (stream, tmp_buf))| (buf, Some((stream, tmp_buf))))?
         };
 
         let (multiplicity_buf, tmp0, stream0) =
@@ -737,7 +705,7 @@ fn evaluate_h_gates_core<C: CurveAffine>(
                 for (stream, mut tmp_bufs) in streams.into_iter() {
                     cuda_runtime_sys::cudaStreamSynchronize(stream);
                     cuda_runtime_sys::cudaStreamDestroy(stream);
-                    ctx.extended_allocator.append(tmp_bufs);
+                    ctx.extended_allocator.append(&mut tmp_bufs);
                 }
             }
         }
@@ -1183,7 +1151,7 @@ fn eval_ys<F: FieldExt>(ys: &BTreeMap<u32, F>, ctx: &mut EvalHContext<F>) -> F {
     })
 }
 
-fn logup_transform_extend_coset<F: FieldExt>(
+fn logup_direct_transform_extend_coset<F: FieldExt>(
     device: &CudaDevice,
     values: &[F],
     beta_buf: &CudaDeviceBufRaw,
@@ -1220,7 +1188,7 @@ fn logup_transform_extend_coset<F: FieldExt>(
             ctx.k,
             Some(stream),
         )?;
-        do_extended_prepare(device, &mut ctx, &mut buf, Some(stream))?;
+        do_extended_prepare(device, ctx, &mut buf, Some(stream))?;
         ntt_raw(
             device,
             &mut buf,

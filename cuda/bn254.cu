@@ -1135,44 +1135,13 @@ __global__ void _shplonk_h_x_div_points(
     values[i] = values[i] * t.inv();
 }
 
-__global__ void _logup_eval_input_product_sum(
+
+__global__ void _logup_eval_h_inputs_product_sum(
     Bn254FrField *product,
     Bn254FrField *product_sum,
     const Bn254FrField **set,
-    int n_set)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    Bn254FrField p,u, sum;
-    //product
-    p =  Bn254FrField(1);
-    for (int j = 0;j<n_set;j++)
-    {
-        p = p*set[j][i]
-    }
-    product[i] = p;
-
-    //product_sum
-    sum =  Bn254FrField(0);
-    for (int j = 0;j<n_set;j++)
-    {
-        u = Bn254FrField(1);
-        for (int k= 0;k<n_set;k++)
-        {
-            if (k != j)
-            {
-                u = u * set[k][i];
-            }
-        }
-        sum = sum+u;
-    }
-    product_sum[i] = sum;
-}
-
-__global__ void _logup_eval_input_product_sum_v1(
-    Bn254FrField *product,
-    Bn254FrField *product_sum,
-    const Bn254FrField **set,
-    int n_set,int n)
+    int n_set,
+    int n)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int worker = blockDim.x * gridDim.x;
@@ -1183,33 +1152,34 @@ __global__ void _logup_eval_input_product_sum_v1(
 
     for (int i = start; i < end; i++)
     {
-        Bn254FrField p,u, sum;
+        Bn254FrField p, u, sum;
         //product
         p =  Bn254FrField(1);
-        for (int j = 0;j<n_set;j++)
+        for (int j = 0; j < n_set; j++)
         {
-            p = p*set[j][i]
+            p = p * set[j][i];
         }
         product[i] = p;
 
         //product_sum
         sum =  Bn254FrField(0);
-        for (int j = 0;j<n_set;j++)
+        for (int j = 0; j < n_set; j++)
         {
             u = Bn254FrField(1);
-            for (int k= 0;k<n_set;k++)
+            for (int k= 0; k < n_set; k++)
             {
                 if (k != j)
                 {
                     u = u * set[k][i];
                 }
             }
-            sum = sum+u;
+            sum = sum + u;
         }
         product_sum[i] = sum;
     }
-
 }
+
+
 
 extern "C"
 {
@@ -1740,9 +1710,6 @@ extern "C"
             int n,
             CUstream_st *stream)
         {
-            int threads = n >= 64 ? 64 : 1;
-            int blocks = n / threads;
-
             int worker = 64 * 64;
             int size_per_worker = n / worker;
             _eval_logup_z_grand_sum_batch<<<64, 64, 0, stream>>>(
@@ -1760,10 +1727,10 @@ extern "C"
             return cudaGetLastError();
         }
 
-        cudaError_t logup_eval_input_product_sum(
+        cudaError_t logup_eval_h_inputs_product_sum(
             Bn254FrField *product,
             Bn254FrField *product_sum,
-            Bn254FrField **input_set,
+            const Bn254FrField **input_set,
             int n_set,
             int n,
             CUstream_st *stream)
@@ -1771,8 +1738,8 @@ extern "C"
             int threads = n >= 64 ? 64 : 1;
             int blocks = n / threads;
 
-            _logup_eval_input_product_sum_v1<<<blocks, threads, 0, stream>>>(
-                product, product_sum, input_set, n_set,n);
+            _logup_eval_h_inputs_product_sum<<<blocks, threads, 0, stream>>>(
+                product, product_sum, input_set, n_set, n);
 
             return cudaGetLastError();
         }

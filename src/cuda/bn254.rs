@@ -908,7 +908,7 @@ pub fn logup_sum_input_inv(
     Ok(())
 }
 
-pub fn logup_eval_input_product_sum(
+pub fn logup_eval_h_inputs_product_sum(
     device: &CudaDevice,
     product: &CudaDeviceBufRaw,
     product_sum: &CudaDeviceBufRaw,
@@ -920,7 +920,7 @@ pub fn logup_eval_input_product_sum(
         device.acitve_ctx()?;
         let sets = device
             .alloc_device_buffer_from_slice(&set.iter().map(|x| x.ptr()).collect::<Vec<_>>()[..])?;
-        let err = bn254_c::logup_eval_inputs_product_sum(
+        let err = bn254_c::logup_eval_h_inputs_product_sum(
             product.ptr(),
             product_sum.ptr(),
             sets.ptr(),
