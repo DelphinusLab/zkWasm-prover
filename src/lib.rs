@@ -133,40 +133,6 @@ fn is_expression_pure_unit<F: FieldExt>(x: &Expression<F>) -> bool {
         || x.is_pure_instance().is_some()
 }
 
-// fn lookup_classify<'a, 'b, C: CurveAffine, T>(
-//     pk: &'b ProvingKey<C>,
-//     lookups_buf: Vec<T>,
-// ) -> [Vec<(usize, T)>; 3] {
-//     let mut single_unit_lookups = vec![];
-//     let mut single_comp_lookups = vec![];
-//     let mut tuple_lookups = vec![];
-//
-//     pk.vk
-//         .cs
-//         .lookups
-//         .iter()
-//         .zip(lookups_buf.into_iter())
-//         .enumerate()
-//         .for_each(|(i, (lookup, buf))| {
-//             let is_single =
-//                 lookup.input_expressions.len() == 1 && lookup.table_expressions.len() == 1;
-//
-//             if is_single {
-//                 let is_unit = is_expression_pure_unit(&lookup.input_expressions[0])
-//                     && is_expression_pure_unit(&lookup.table_expressions[0]);
-//                 if is_unit {
-//                     single_unit_lookups.push((i, buf));
-//                 } else {
-//                     single_comp_lookups.push((i, buf));
-//                 }
-//             } else {
-//                 tuple_lookups.push((i, buf))
-//             }
-//         });
-//
-//     return [single_unit_lookups, single_comp_lookups, tuple_lookups];
-// }
-
 fn lookup_classify<'a, 'b, C: CurveAffine, T>(
     pk: &'b ProvingKey<C>,
     lookups_buf: Vec<T>,
@@ -183,116 +149,14 @@ fn lookup_classify<'a, 'b, C: CurveAffine, T>(
         .for_each(|(i, (lookup, buf))| {
             //any input expressions which belongs to same table has the same len with table
             let is_single = lookup.table_expressions.len() == 1;
-
             if is_single {
                 single_lookups.push((i, buf))
-                // if is_expression_pure_unit(&lookup.table_expressions[0]){
-                //     single_unit_lookups.push((i, 0,0,0,&buf.1))
-                // }else{
-                //     single_comp_lookups.push((i, 0,0,0,&buf.1))
-                // }
-                // lookup.input_expressions_sets.iter().enumerate().for_each(|(j,set)|{
-                //     set.0.iter().enumerate().for_each(|(k,input_expressions)|{
-                //         assert_eq!(input_expressions.len(),1);
-                //         if is_expression_pure_unit(&input_expressions[0]) {
-                //             single_unit_lookups.push((i,1,j,k, &buf.0[j][k]));
-                //         } else {
-                //             single_comp_lookups.push((i,,1,j,k &buf.0[j][k]));
-                //         }
-                //     })
-                // });
-
-                // let is_unit = is_expression_pure_unit(&lookup.input_expressions[0])
-                //     && is_expression_pure_unit(&lookup.table_expressions[0]);
-                // if is_unit {
-                //     single_unit_lookups.push((i, buf));
-                // } else {
-                //     single_comp_lookups.push((i, buf));
-                // }
             } else {
                 tuple_lookups.push((i, buf))
             }
         });
 
     return [single_lookups, tuple_lookups];
-}
-
-fn handle_lookup_pair<F: FieldExt>(
-    input: &mut Vec<F, HugePageAllocator>,
-    table: &mut Vec<F, HugePageAllocator>,
-    mut permuted_input: Vec<F, HugePageAllocator>,
-    mut permuted_table: Vec<F, HugePageAllocator>,
-    unusable_rows_start: usize,
-) -> (Vec<F, HugePageAllocator>, Vec<F, HugePageAllocator>) {
-    let compare = |a: &_, b: &_| unsafe {
-        let a: &[u64; 4] = std::mem::transmute(a);
-        let b: &[u64; 4] = std::mem::transmute(b);
-        a.cmp(b)
-    };
-
-    permuted_input[..].clone_from_slice(&input[..]);
-    let mut sorted_table = table.clone();
-
-    permuted_input[0..unusable_rows_start].sort_unstable_by(compare);
-    sorted_table[0..unusable_rows_start].sort_unstable_by(compare);
-
-    let mut permuted_table_state = Vec::new_in(UnpinnedHugePageAllocator);
-    permuted_table_state.resize(input.len(), false);
-
-    permuted_input
-        .iter()
-        .take(unusable_rows_start)
-        .zip(permuted_table_state.iter_mut().take(unusable_rows_start))
-        .zip(permuted_table.iter_mut().take(unusable_rows_start))
-        .enumerate()
-        .for_each(|(row, ((input_value, table_state), table_value))| {
-            // If this is the first occurrence of `input_value` in the input expression
-            if row == 0 || *input_value != permuted_input[row - 1] {
-                *table_state = true;
-                *table_value = *input_value;
-            }
-        });
-
-    let to_next_unique = |i: &mut usize| {
-        while *i < unusable_rows_start && !permuted_table_state[*i] {
-            *i += 1;
-        }
-    };
-
-    let mut i_unique_input_idx = 0;
-    let mut i_sorted_table_idx = 0;
-    for i in 0..unusable_rows_start {
-        to_next_unique(&mut i_unique_input_idx);
-        while i_unique_input_idx < unusable_rows_start
-            && permuted_table[i_unique_input_idx] == sorted_table[i_sorted_table_idx]
-        {
-            i_unique_input_idx += 1;
-            i_sorted_table_idx += 1;
-            to_next_unique(&mut i_unique_input_idx);
-        }
-        if !permuted_table_state[i] {
-            permuted_table[i] = sorted_table[i_sorted_table_idx];
-            i_sorted_table_idx += 1;
-        }
-    }
-
-    if ADD_RANDOM {
-        for cell in &mut permuted_input[unusable_rows_start..] {
-            *cell = F::random(&mut OsRng);
-        }
-        for cell in &mut permuted_table[unusable_rows_start..] {
-            *cell = F::random(&mut OsRng);
-        }
-    } else {
-        for cell in &mut permuted_input[unusable_rows_start..] {
-            *cell = F::zero();
-        }
-        for cell in &mut permuted_table[unusable_rows_start..] {
-            *cell = F::zero();
-        }
-    }
-
-    (permuted_input, permuted_table)
 }
 
 pub fn lookup_compute_multiplicity<F: FieldExt>(
@@ -312,23 +176,48 @@ pub fn lookup_compute_multiplicity<F: FieldExt>(
     end_timer!(timer);
 
     let timer = start_timer!(|| "lookup construct m(X) values");
-    use std::sync::atomic::{AtomicU64, Ordering};
-    let m_values: Vec<AtomicU64> = (0..multiplicity.len()).map(|_| AtomicU64::new(0)).collect();
-    for inputs in inputs_set.iter().flatten() {
-        inputs.par_iter().take(unusable_rows_start).for_each(|fi| {
-            let index = sorted_table_with_indices
-                .binary_search_by_key(&fi, |&(t, _)| t)
-                .expect("binary_search_by_key");
-            let index = sorted_table_with_indices[index].1;
-            m_values[index].fetch_add(1, Ordering::Relaxed);
-        });
-    }
+    let num_threads = rayon::current_num_threads();
+    let chunk_size = (sorted_table_with_indices.len() + num_threads - 1) / num_threads;
+    let res = inputs_set
+        .iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .par_iter()
+        .map(|inputs| {
+            inputs[..unusable_rows_start]
+                .par_chunks(chunk_size)
+                .map(|chunks| {
+                    let mut map_count: BTreeMap<usize, usize> = BTreeMap::new();
+                    let mut map_cache: BTreeMap<_, usize> = BTreeMap::new();
+                    for fi in chunks {
+                        let index = if let Some(idx) = map_cache.get(fi) {
+                            *idx
+                        } else {
+                            let index = sorted_table_with_indices
+                                .binary_search_by_key(&fi, |&(t, _)| t)
+                                .expect("binary_search_by_key");
+                            let index = sorted_table_with_indices[index].1;
+                            map_cache.insert(fi, index);
+                            index
+                        };
+                        map_count
+                            .entry(index)
+                            .and_modify(|count| *count += 1)
+                            .or_insert(1);
+                    }
+                    map_count
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
 
-    multiplicity
-        .par_iter_mut()
-        .zip(m_values.par_iter())
-        .take(unusable_rows_start)
-        .for_each(|(m, v)| *m = F::from(v.load(Ordering::Relaxed)));
+    res.iter().for_each(|trees| {
+        trees.iter().for_each(|tree| {
+            for (index, count) in tree {
+                multiplicity[*index] += F::from(*count as u64);
+            }
+        })
+    });
     end_timer!(timer);
 
     if ADD_RANDOM {
