@@ -122,11 +122,7 @@ pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
             for buf in std::iter::empty()
                 .chain(Some(&mut table))
                 .chain(Some(&mut multiplicity))
-                .chain(
-                    inputs_sets
-                        .iter_mut()
-                        .flat_map(|set| set.iter_mut().flat_map()),
-                )
+                .chain(inputs_sets.iter_mut().flat_map(|set| set.iter_mut()))
                 .chain(z_set.iter_mut())
             {
                 buf.reserve(size);

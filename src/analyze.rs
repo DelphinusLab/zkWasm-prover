@@ -185,20 +185,28 @@ pub(crate) fn analyze_involved_advices<C: CurveAffine>(
     }
 
     for lookup in &pk.vk.cs.lookups {
-        if lookup.input_expressions.len() > 1 {
-            collect_involved_advices(
-                &lookup.input_expressions[..],
-                &mut uninvolved_units_after_tuple_lookup,
-            );
+        lookup.input_expressions_sets.iter().for_each(|set| {
+            set.0.iter().for_each(|input_expressions| {
+                if input_expressions.len() > 1 {
+                    collect_involved_advices(
+                        &input_expressions[..],
+                        &mut uninvolved_units_after_tuple_lookup,
+                    );
+                } else {
+                    collect_involved_advices(
+                        &input_expressions[..],
+                        &mut uninvolved_units_after_single_lookup,
+                    );
+                }
+            })
+        });
+
+        if lookup.table_expressions.len() > 1 {
             collect_involved_advices(
                 &lookup.table_expressions[..],
                 &mut uninvolved_units_after_tuple_lookup,
             );
         } else {
-            collect_involved_advices(
-                &lookup.input_expressions[..],
-                &mut uninvolved_units_after_single_lookup,
-            );
             collect_involved_advices(
                 &lookup.table_expressions[..],
                 &mut uninvolved_units_after_single_lookup,

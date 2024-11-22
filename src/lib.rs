@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::thread;
 
 use analyze::analyze_involved_advices;
-use analyze::{lookup_classify, lookup_single_classify};
+use analyze::lookup_classify;
 use ark_std::end_timer;
 use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
@@ -471,7 +471,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let instances = sub_instances;
 
             let [mut single_lookups, tuple_lookups] = lookup_classify(&pk, lookups);
-
+            let single_lookup_len = single_lookups.len();
             // todo to function
             let mut single_unit_lookups = vec![];
             let mut single_comp_lookups = vec![];
@@ -495,7 +495,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 }
             }
 
-            let timer = start_timer!(|| format!("lookup unit & comp {}", single_lookups.len()));
+            let timer = start_timer!(|| format!("lookup unit & comp {}", single_lookup_len));
 
             let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
             let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
@@ -527,11 +527,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         }
                     };
                     f(e, b);
-
-                    single_lookups.par_iter_mut().for_each(|(_, arg)| {
-                        lookup_compute_multiplicity(&arg.0, &arg.1, &mut arg.2, unusable_rows_start)
-                    });
                 });
+            single_lookups.par_iter_mut().for_each(|(_, arg)| {
+                lookup_compute_multiplicity(&arg.0, &arg.1, &mut arg.2, unusable_rows_start)
+            });
             end_timer!(timer);
 
             (
@@ -590,7 +589,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let timer = start_timer!(|| "eval tuple lookup buffer");
             let mut tuple_lookup_exprs = vec![];
             let mut tuple_host_buffers = vec![];
-            for (i, (inputs_sets, table, _, _)) in tuple_lookups.iter_mut() {
+            for (i, (inputs_sets_buf, table_buf, _, _)) in tuple_lookups.iter_mut() {
                 tuple_lookup_exprs.push(&pk.vk.cs.lookups[*i].table_expressions[..]);
                 pk.vk.cs.lookups[*i]
                     .input_expressions_sets
@@ -601,9 +600,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             .for_each(|expr| tuple_lookup_exprs.push(&expr[..]))
                     });
 
-                tuple_host_buffers.push(&mut table[..]);
-                inputs_sets.iter().for_each(|set| {
-                    set.iter()
+                tuple_host_buffers.push(&mut table_buf[..]);
+                inputs_sets_buf.iter_mut().for_each(|set| {
+                    set.iter_mut()
                         .for_each(|input| tuple_host_buffers.push(&mut input[..]))
                 })
             }
@@ -716,7 +715,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             )?;
 
             for (tidx, (i, _)) in single_lookups.iter().enumerate() {
-                lookup_multiplicity_commitments[i] = commitments[tidx];
+                lookup_multiplicity_commitments[*i] = commitments[tidx];
                 // 0:inputs, 1:table, 2:multiplicity, 3:z
                 lookup_device_buffers.insert((*i, 2), buffers.remove(&tidx).unwrap());
             }
@@ -790,7 +789,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             )?;
 
             for (tidx, (i, _)) in tuple_lookups.iter().enumerate() {
-                lookup_multiplicity_commitments[i] = commitments[tidx];
+                lookup_multiplicity_commitments[*i] = commitments[tidx];
                 lookup_device_buffers.insert((*i, 2), buffers.remove(&tidx).unwrap());
             }
 
@@ -1004,7 +1003,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             &beta_buf,
                             i,
                             size,
-                            Some(stream),
+                            Some(stream.1),
                         )?;
                     }
                     let err = eval_logup_z_pure(
@@ -1055,7 +1054,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 for (_, (inputs_sets, table, m_coeff, zs_coeff)) in lookups.iter() {
                     let [s_buf, tmp_buf, _] = Rc::get_mut(&mut buffers[0]).unwrap();
                     let mut m_lagrange = table.clone();
-                    device.copy_from_host_to_device(z_buf, m_coeff)?;
+                    device.copy_from_host_to_device(s_buf, m_coeff)?;
                     ntt(
                         &device,
                         s_buf,
@@ -1137,7 +1136,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             &g_buf,
             lookups
                 .iter()
-                .map(|x| &x.3[..])
+                .flat_map(|x| x.3.iter().map(|v| &v[..]))
                 .chain([&random_poly[..]])
                 .collect::<Vec<_>>(),
             size,
@@ -1314,7 +1313,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .iter()
                 .map(|x| &x[..])
                 .collect::<Vec<_>>()[..],
-            &mut lookups.iter_mut().map(|x| x.1).collect::<Vec<_>>(),
+            &mut lookups
+                .iter_mut()
+                .map(|(v0, v1, v2, v3)| (v0, v1, v2, v3))
+                .collect::<Vec<_>>(),
             &shuffle_products.iter().map(|x| &x[..]).collect::<Vec<_>>()[..],
             y,
             beta,
@@ -1373,12 +1375,12 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let x_last = domain.rotate_omega(x, Rotation(-((meta.blinding_factors() + 1) as i32)));
 
         for (_, _, multiplicity, zs) in lookups.iter() {
-            inputs.push((&multiplicity, x));
+            inputs.push((&multiplicity, 1, x));
             for (i, z) in zs.iter().enumerate() {
-                inputs.push((z, x));
-                inputs.push((z, x_next));
+                inputs.push((z, 1, x));
+                inputs.push((z, 1, x_next));
                 if i != zs.len() - 1 {
-                    inputs.push((z, x_last));
+                    inputs.push((z, 1, x_last));
                 }
             }
         }

@@ -343,6 +343,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     advice: &[&[C::Scalar]],
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
+    //todo check the inner mut to remove with outer mut
     lookup_products: &mut Vec<(
         &mut Vec<Vec<Vec<C::Scalar, HugePageAllocator>>>,
         &mut Vec<C::Scalar, HugePageAllocator>,
@@ -520,12 +521,12 @@ fn logup_direct_transform_extend_coset_async<F: FieldExt>(
     device.copy_from_host_to_device_async(&buf, values, stream)?;
 
     let mut tmp_buf = ctx.alloc()?;
-    field_op::<C::Scalar>(
+    field_op::<F>(
         device,
         &buf,
         &buf,
         ((), beta_buf),
-        size,
+        ctx.size,
         FieldOp::Add,
         Some(stream),
     )?;
@@ -617,6 +618,8 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
     let l0 = &pk.l0;
     let l_last = &pk.l_last;
     let l_active_row = &pk.l_active_row;
+    let blinding_factors = pk.vk.cs.blinding_factors();
+    let last_rotation = (ctx.size - (blinding_factors + 1)) << (extended_k - k);
     let (l0_buf, (l0_stream, l0_tmp)) = ctx.copy_and_extended_ntt_async(&l0.values[..])?;
     let (l_last_buf, l_last_stream_buf) = ctx.copy_and_extended_ntt_async(&l_last.values[..])?;
     let l_active_buf = ctx.alloc()?;
@@ -631,12 +634,9 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
 
     let timer = start_timer!(|| "evaluate_h permutation");
     if permutation_products.len() > 0 {
-        let blinding_factors = pk.vk.cs.blinding_factors();
-        let last_rotation = (ctx.size - (blinding_factors + 1)) << (extended_k - k);
         let chunk_len = pk.vk.cs.degree() - 2;
 
         let extended_p_buf = ctx.batch_copy_and_extended_ntt_async(permutation_products, vec![])?;
-
         {
             permutation_eval_h_p1(
                 device,
@@ -812,16 +812,17 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         });
         let table_deg = get_expr_degree(&lookup.table_expressions);
 
-        let (inputs_product_expr, inputs_product_sum_expr, table_expr) = flatten_lookup_expression(
-            &lookup
-                .input_expressions_sets
-                .iter()
-                .map(|set| set.0.clone())
-                .collect::<Vec<_>>(),
-            &lookup.table_expressions,
-            beta,
-            theta,
-        );
+        let (mut inputs_product_expr, mut inputs_product_sum_expr, table_expr) =
+            flatten_lookup_expression(
+                &lookup
+                    .input_expressions_sets
+                    .iter()
+                    .map(|set| set.0.clone())
+                    .collect::<Vec<_>>(),
+                &lookup.table_expressions,
+                beta,
+                theta,
+            );
 
         // calculate inputs_host+beta in advance for input_deg=1
         let inputs_beta_sets = if input_deg == 1 {
@@ -866,53 +867,55 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
             }
         });
 
-        let mut inputs_product_bufs = vec![];
-        let mut input_products_sum_bufs = vec![];
+        let mut inputs_products_bufs = vec![];
+        let mut inputs_products_sum_bufs = vec![];
         let mut zs_bufs = vec![];
         let mut last_waiting = m_stream_and_tmp;
 
         for i in 0..inputs_product_expr.len() {
             if input_deg > 1 {
                 let (buf, pendings_product) = ctx.evaluate_prove_expr_with_async_ntt(
-                    &inputs_product_expr[i],
+                    &vec![inputs_product_expr.remove(0)],
                     fixed,
                     advice,
                     instance,
                 )?;
-                inputs_product_bufs.push(buf);
+                inputs_products_bufs.push(buf);
                 let (buf, pendings_sum) = ctx.evaluate_prove_expr_with_async_ntt(
-                    &inputs_product_sum_expr[i],
+                    &vec![inputs_product_sum_expr.remove(0)],
                     fixed,
                     advice,
                     instance,
                 )?;
-                input_products_sum_bufs.push(buf);
+                inputs_products_sum_bufs.push(buf);
 
                 ctx.extended_ntt_wait(last_waiting)?;
-                let (z_buf, stream_and_tmp) = ctx.copy_and_extended_ntt_async(z_set_host[i])?;
+                let (z_buf, stream_and_tmp) =
+                    ctx.copy_and_extended_ntt_async(&z_set_host[i][..])?;
                 last_waiting = stream_and_tmp;
                 zs_bufs.push(z_buf);
 
                 drop([pendings_product, pendings_sum]);
             } else {
                 let (sw, stream) = CudaStreamWrapper::new_with_inner();
-                let product_buf = ctx.alloc(device)?;
-                let product_sum_buf = ctx.alloc(device)?;
+                let product_buf = ctx.alloc()?;
+                let product_sum_buf = ctx.alloc()?;
                 logup_eval_h_inputs_product_sum(
                     device,
                     &product_buf,
                     &product_sum_buf,
-                    &inputs_beta_sets.unwrap()[i],
+                    &inputs_beta_sets.as_ref().unwrap()[i],
                     ctx.extended_size,
                     Some(stream),
                 )?;
-                inputs_product_bufs.push(product_buf);
-                inputs_product_sum_bufs.push(product_sum_buf);
+                inputs_products_bufs.push(product_buf);
+                inputs_products_sum_bufs.push(product_sum_buf);
 
                 ctx.extended_ntt_wait(last_waiting)?;
-                let (z_buf, stream_and_tmp) = ctx.copy_and_extended_ntt_async(z_set_host[i])?;
+                let (z_buf, stream_and_tmp) =
+                    ctx.copy_and_extended_ntt_async(&z_set_host[i][..])?;
 
-                ctx.extended_ntt_wait((sw, tmp_buf))?;
+                drop(sw);
                 last_waiting = stream_and_tmp;
                 zs_bufs.push(z_buf);
             }
@@ -920,7 +923,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
 
         let table_buf = if table_deg > 1 {
             let (buf, pendings) =
-                ctx.evaluate_prove_expr_with_async_ntt(&table_expr, fixed, advice, instance)?;
+                ctx.evaluate_prove_expr_with_async_ntt(&vec![table_expr], fixed, advice, instance)?;
             ctx.extended_ntt_wait(last_waiting)?;
             drop(pendings);
             buf
@@ -943,8 +946,8 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         unsafe {
             let err = logup_eval_h(
                 h_buf.ptr(),
-                input_product_buffs[0].ptr(),
-                input_product_sum_buffs[0].ptr(),
+                inputs_products_bufs[0].ptr(),
+                inputs_products_sum_bufs[0].ptr(),
                 table_buf.ptr(),
                 multiplicity_buf.ptr(),
                 zs_bufs.first().unwrap().ptr(),
@@ -972,9 +975,9 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                     Some(stream),
                 )?;
 
-                for ((input_product, input_product_sum), z) in input_product_buffs
+                for ((input_product, input_product_sum), z) in inputs_products_bufs
                     .iter()
-                    .zip(input_product_sum_buffs.iter())
+                    .zip(inputs_products_sum_bufs.iter())
                     .zip(zs_bufs.iter())
                     .skip(1)
                 {
@@ -998,8 +1001,8 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                 vec![
                     vec![table_buf],
                     vec![multiplicity_buf],
-                    input_product_buffs,
-                    input_product_sum_buffs,
+                    inputs_products_bufs,
+                    inputs_products_sum_bufs,
                     zs_bufs,
                 ]
                 .into_iter()

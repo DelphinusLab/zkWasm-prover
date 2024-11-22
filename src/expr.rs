@@ -152,7 +152,7 @@ pub(crate) fn flatten_lookup_expression<F: FieldExt>(
 ) {
     let flatten_table = flatten_tuple_expressions(&table[..], Some(beta), theta);
     let [flatten_input_product, flatten_input_product_sum] =
-        flatten_lookup_input_expression(inputs_sets, Some(beta), theta);
+        flatten_lookup_input_expression(inputs_sets, beta, theta);
 
     (
         flatten_input_product,
