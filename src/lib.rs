@@ -471,63 +471,42 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let instances = sub_instances;
 
             let [mut single_lookups, tuple_lookups] = lookup_classify(&pk, lookups);
-            let single_lookup_len = single_lookups.len();
-            // todo to function
-            let mut single_unit_lookups = vec![];
-            let mut single_comp_lookups = vec![];
+            let _single_lookup_len = single_lookups.len();
+
+            let mut single_expr_bufs = vec![];
             for (i, bufs) in single_lookups.iter_mut() {
                 let lookup = &pk.vk.cs.lookups[*i];
-                if is_expression_pure_unit(&lookup.table_expressions[0]) {
-                    single_unit_lookups.push((&lookup.table_expressions[0], &mut bufs.1[..]))
-                } else {
-                    single_comp_lookups.push((&lookup.table_expressions[0], &mut bufs.1[..]))
-                }
-
+                single_expr_bufs.push((&lookup.table_expressions[0], &mut bufs.1[..]));
                 for (set, inputs) in lookup.input_expressions_sets.iter().zip(bufs.0.iter_mut()) {
                     for (input_expressions, buf) in set.0.iter().zip(inputs.iter_mut()) {
                         assert_eq!(input_expressions.len(), 1);
-                        if is_expression_pure_unit(&input_expressions[0]) {
-                            single_unit_lookups.push((&input_expressions[0], &mut buf[..]));
-                        } else {
-                            single_comp_lookups.push((&input_expressions[0], &mut buf[..]));
-                        }
+                        single_expr_bufs.push((&input_expressions[0], &mut buf[..]));
                     }
                 }
             }
 
-            let timer = start_timer!(|| format!("lookup unit & comp {}", single_lookup_len));
+            let timer = start_timer!(|| format!("lookup unit & comp {}", _single_lookup_len));
 
             let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
             let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
             let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
 
-            single_comp_lookups
-                .into_par_iter()
-                .chain(single_unit_lookups.into_par_iter())
-                .for_each(|(e, b)| {
-                    let f = |expr: &Expression<_>, target: &mut [_]| {
-                        if let Some(v) = expr.is_constant() {
-                            target.fill(v);
-                        } else if let Some(idx) = expr.is_pure_fixed() {
-                            target.clone_from_slice(&pk.fixed_values[idx].values[..]);
-                        } else if let Some(idx) = expr.is_pure_instance() {
-                            target.clone_from_slice(&instances[idx][..]);
-                        } else if let Some(idx) = expr.is_pure_advice() {
-                            target.clone_from_slice(&advices[idx][..]);
-                        } else {
-                            evaluate_expr(
-                                expr,
-                                size,
-                                1,
-                                fixed_ref,
-                                advice_ref,
-                                instance_ref,
-                                target,
-                            )
-                        }
-                    };
-                    f(e, b);
-                });
+            single_expr_bufs.into_par_iter().for_each(|(e, b)| {
+                let f = |expr: &Expression<_>, target: &mut [_]| {
+                    if let Some(v) = expr.is_constant() {
+                        target.fill(v);
+                    } else if let Some(idx) = expr.is_pure_fixed() {
+                        target.clone_from_slice(&pk.fixed_values[idx].values[..]);
+                    } else if let Some(idx) = expr.is_pure_instance() {
+                        target.clone_from_slice(&instances[idx][..]);
+                    } else if let Some(idx) = expr.is_pure_advice() {
+                        target.clone_from_slice(&advices[idx][..]);
+                    } else {
+                        evaluate_expr(expr, size, 1, fixed_ref, advice_ref, instance_ref, target)
+                    }
+                };
+                f(e, b);
+            });
             single_lookups.par_iter_mut().for_each(|(_, arg)| {
                 lookup_compute_multiplicity(&arg.0, &arg.1, &mut arg.2, unusable_rows_start)
             });
@@ -660,14 +639,20 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 Arc::get_mut_unchecked(&mut advices)
                     .iter_mut()
                     .enumerate()
-                    .filter(|(i, _)| uninvolved_units_after_single_lookup.contains(i))
+                    .filter(|(i, _)| {
+                        uninvolved_units_after_single_lookup.contains(i)
+                            || uninvolved_units_after_tuple_lookup.contains(i)
+                    })
                     .map(|(_, x)| &mut x[..])
                     .collect::<Vec<_>>()
             };
 
             let mut s_bufs: Vec<_> = (0..advices_len)
                 .into_iter()
-                .filter(|i| uninvolved_units_after_single_lookup.contains(i))
+                .filter(|i| {
+                    uninvolved_units_after_single_lookup.contains(i)
+                        || uninvolved_units_after_tuple_lookup.contains(i)
+                })
                 .map(|i| advice_device_buffers.remove(&i).unwrap())
                 .collect();
 
@@ -730,23 +715,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let timer = start_timer!(|| format!("tuple lookup msm {}", tuple_lookups.len()));
         {
-            let mut buffers = unsafe {
-                Arc::get_mut_unchecked(&mut advices)
-                    .iter_mut()
-                    .enumerate()
-                    .filter(|(i, _)| uninvolved_units_after_tuple_lookup.contains(i))
-                    .map(|(_, x)| &mut x[..])
-                    .collect::<Vec<_>>()
-            };
-
-            let mut s_bufs: Vec<_> = (0..advices_len)
-                .into_iter()
-                .filter(|i| uninvolved_units_after_tuple_lookup.contains(i))
-                .map(|i| advice_device_buffers.remove(&i).unwrap())
-                .collect();
-
-            let (sw, stream) = CudaStreamWrapper::new_with_inner();
-
             let mut lookup_scalars = vec![];
             for (_, (_, _, multiplicity, _)) in tuple_lookups.iter_mut() {
                 lookup_scalars.push(&mut multiplicity[..]);
@@ -764,27 +732,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     selector: &|_| false,
                 },
                 &|_| true,
-                &mut || {
-                    let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
-                    for s_buf in s_bufs.iter_mut() {
-                        intt_raw_async(
-                            &device,
-                            s_buf,
-                            &mut t_buf,
-                            &intt_pq_buf,
-                            &intt_omegas_buf,
-                            &intt_divisor_buf,
-                            k,
-                            None,
-                        )
-                        .unwrap();
-                    }
-                    for (dev_buf, host_buf) in s_bufs.iter().zip(buffers.iter_mut()) {
-                        device
-                            .copy_from_device_to_host_async(host_buf, dev_buf, stream)
-                            .unwrap();
-                    }
-                },
+                &mut || {},
                 size,
             )?;
 
@@ -792,8 +740,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 lookup_multiplicity_commitments[*i] = commitments[tidx];
                 lookup_device_buffers.insert((*i, 2), buffers.remove(&tidx).unwrap());
             }
-
-            sw.sync();
         }
         end_timer!(timer);
 

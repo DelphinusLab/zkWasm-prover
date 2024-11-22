@@ -23,9 +23,7 @@ use crate::cuda::bn254::permutation_eval_h_p1;
 use crate::cuda::bn254::permutation_eval_h_p2;
 use crate::cuda::bn254::pick_from_buf;
 use crate::cuda::bn254::FieldOp;
-use crate::cuda::bn254::{
-    logup_eval_h_inputs_product_sum, logup_eval_h_z_set, logup_sum_input_inv,
-};
+use crate::cuda::bn254::{logup_eval_h_inputs_product_sum, logup_eval_h_z_set};
 use crate::cuda::bn254_c;
 use crate::cuda::bn254_c::field_op_batch_mul_sum;
 use crate::cuda::bn254_c::logup_eval_h;
@@ -507,7 +505,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     Ok((x, xn, h_pieces))
 }
 
-fn logup_direct_transform_extend_coset_async<F: FieldExt>(
+fn logup_transform_extend_coset_async<F: FieldExt>(
     device: &CudaDevice,
     values: &[F],
     beta_buf: &CudaDeviceBufRaw,
@@ -812,17 +810,16 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         });
         let table_deg = get_expr_degree(&lookup.table_expressions);
 
-        let (mut inputs_product_expr, mut inputs_product_sum_expr, table_expr) =
-            flatten_lookup_expression(
-                &lookup
-                    .input_expressions_sets
-                    .iter()
-                    .map(|set| set.0.clone())
-                    .collect::<Vec<_>>(),
-                &lookup.table_expressions,
-                beta,
-                theta,
-            );
+        let (inputs_product_expr, inputs_product_sum_expr, table_expr) = flatten_lookup_expression(
+            &lookup
+                .input_expressions_sets
+                .iter()
+                .map(|set| set.0.clone())
+                .collect::<Vec<_>>(),
+            &lookup.table_expressions,
+            beta,
+            theta,
+        );
 
         // calculate inputs_host+beta in advance for input_deg=1
         let inputs_beta_sets = if input_deg == 1 {
@@ -832,7 +829,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                     let rst = set
                         .iter()
                         .map(|input| -> DeviceResult<_> {
-                            logup_direct_transform_extend_coset_async(
+                            logup_transform_extend_coset_async(
                                 device,
                                 input,
                                 &beta_buf,
@@ -875,14 +872,14 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         for i in 0..inputs_product_expr.len() {
             if input_deg > 1 {
                 let (buf, pendings_product) = ctx.evaluate_prove_expr_with_async_ntt(
-                    &vec![inputs_product_expr.remove(0)],
+                    &inputs_product_expr[i..i + 1],
                     fixed,
                     advice,
                     instance,
                 )?;
                 inputs_products_bufs.push(buf);
                 let (buf, pendings_sum) = ctx.evaluate_prove_expr_with_async_ntt(
-                    &vec![inputs_product_sum_expr.remove(0)],
+                    &inputs_product_sum_expr[i..i + 1],
                     fixed,
                     advice,
                     instance,
@@ -928,7 +925,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
             drop(pendings);
             buf
         } else {
-            let (buf, (sw, tmp_buf)) = logup_direct_transform_extend_coset_async(
+            let (buf, (sw, tmp_buf)) = logup_transform_extend_coset_async(
                 device,
                 &table_host[..],
                 &beta_buf,

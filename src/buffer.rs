@@ -33,50 +33,6 @@ pub fn prepare_advice_buffer<C: CurveAffine>(
     advices
 }
 
-// pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
-//     pk: &ProvingKey<C>,
-// ) -> DeviceResult<
-//     Vec<(
-//         Vec<C::Scalar, HugePageAllocator>,
-//         Vec<C::Scalar, HugePageAllocator>,
-//         Vec<C::Scalar, HugePageAllocator>,
-//         Vec<C::Scalar, HugePageAllocator>,
-//     )>,
-// > {
-//     let size = 1 << pk.get_vk().domain.k();
-//     let timer = start_timer!(|| format!("prepare lookup buffer, count {}", pk.vk.cs.lookups.len()));
-//     let lookups = pk
-//         .vk
-//         .cs
-//         .lookups
-//         .par_iter()
-//         .map(|_| {
-//             let mut input = Vec::new_in(HugePageAllocator);
-//             let mut table = Vec::new_in(HugePageAllocator);
-//             let mut permuted_input = Vec::new_in(HugePageAllocator);
-//             let mut permuted_table = Vec::new_in(HugePageAllocator);
-//             let mut z = Vec::new_in(HugePageAllocator);
-//
-//             for buf in [
-//                 &mut input,
-//                 &mut table,
-//                 &mut permuted_input,
-//                 &mut permuted_table,
-//                 &mut z,
-//             ] {
-//                 buf.reserve(size);
-//                 unsafe {
-//                     buf.set_len(size);
-//                 }
-//             }
-//
-//             (input, table, permuted_table, z)
-//         })
-//         .collect::<Vec<_>>();
-//     end_timer!(timer);
-//     Ok(lookups)
-// }
-
 pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
 ) -> DeviceResult<
@@ -104,19 +60,13 @@ pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
                 .map(|set| {
                     set.0
                         .iter()
-                        .map(|_| {
-                            let mut input = Vec::new_in(HugePageAllocator);
-                            input
-                        })
+                        .map(|_| Vec::new_in(HugePageAllocator))
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
 
             let mut z_set: Vec<_> = (0..argument.input_expressions_sets.len())
-                .map(|_| {
-                    let mut z = Vec::new_in(HugePageAllocator);
-                    z
-                })
+                .map(|_| Vec::new_in(HugePageAllocator))
                 .collect();
 
             for buf in std::iter::empty()

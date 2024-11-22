@@ -8,8 +8,6 @@ use halo2_proofs::plonk::ProvingKey;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 
-use crate::expr::is_expression_pure_unit;
-
 pub(crate) fn analyze_expr_tree<F: FieldExt>(
     expr: &ProveExpression<F>,
     k: usize,
