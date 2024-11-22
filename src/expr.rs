@@ -75,25 +75,90 @@ fn compose_tuple_expressions<F: FieldExt>(
 }
 
 pub(crate) fn flatten_tuple_expressions<F: FieldExt>(
-    exprs: &[Expression<F>],
+    expr: &[Expression<F>],
     challenge: Option<F>,
     theta: F,
 ) -> Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)> {
-    let composed_expr = compose_tuple_expressions(exprs, challenge, theta);
+    let composed_expr = compose_tuple_expressions(expr, challenge, theta);
     flatten_prove_expression(composed_expr)
 }
 
+pub(crate) fn flatten_lookup_input_expression<F: FieldExt>(
+    inputs_sets: &Vec<Vec<Vec<Expression<F>>>>,
+    beta: F,
+    theta: F,
+) -> [Vec<Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>>; 2] {
+    let input_sets_expr = inputs_sets
+        .iter()
+        .map(|set| {
+            set.iter()
+                .map(|input| compose_tuple_expressions(input, Some(beta), theta))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let expr_input_product = input_sets_expr
+        .iter()
+        .map(|set| {
+            let product = set.iter().skip(1).fold(set[0].clone(), |acc, v| {
+                ProveExpression::Op(Box::new(acc.clone()), Box::new(v.clone()), Bop::Product)
+            });
+            flatten_prove_expression(product)
+        })
+        .collect::<Vec<_>>();
+
+    let expr_input_product_sum = input_sets_expr
+        .iter()
+        .map(|set| {
+            let product_sum = if set.len() > 1 {
+                (0..set.len())
+                    .map(|i| {
+                        set.iter()
+                            .enumerate()
+                            .filter(|(j, _)| *j != i)
+                            .map(|(_, v)| v.clone())
+                            .reduce(|acc, v| {
+                                ProveExpression::Op(
+                                    Box::new(acc.clone()),
+                                    Box::new(v.clone()),
+                                    Bop::Product,
+                                )
+                            })
+                            .unwrap()
+                    })
+                    .reduce(|acc, v| {
+                        ProveExpression::Op(Box::new(acc.clone()), Box::new(v.clone()), Bop::Sum)
+                    })
+                    .unwrap()
+            } else {
+                ProveExpression::Y(BTreeMap::from_iter([(0, F::one())].into_iter()))
+            };
+
+            flatten_prove_expression(product_sum)
+        })
+        .collect::<Vec<_>>();
+    [expr_input_product, expr_input_product_sum]
+}
+
 pub(crate) fn flatten_lookup_expression<F: FieldExt>(
-    input: &Vec<Expression<F>>,
+    inputs_sets: &Vec<Vec<Vec<Expression<F>>>>,
     table: &Vec<Expression<F>>,
     beta: F,
-    gamma: F,
     theta: F,
-) -> [Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>; 2] {
-    [
-        flatten_tuple_expressions(&input[..], Some(beta), theta),
-        flatten_tuple_expressions(&table[..], Some(gamma), theta),
-    ]
+) -> (
+    Vec<Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>>,
+    Vec<Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>>,
+    Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>,
+) {
+    let flatten_table = flatten_tuple_expressions(&table[..], Some(beta), theta);
+    let [flatten_input_product, flatten_input_product_sum] =
+        flatten_lookup_input_expression(inputs_sets, Some(beta), theta);
+
+    (
+        flatten_input_product,
+        flatten_input_product_sum,
+        flatten_table,
+    )
 }
 
 pub(crate) fn flatten_shuffle_expression<F: FieldExt>(

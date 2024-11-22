@@ -354,3 +354,86 @@ pub fn buffer_copy_with_shift<F: FieldExt>(
     }
     Ok(())
 }
+
+pub fn logup_eval_h_z_set(
+    device: &CudaDevice,
+    res: &CudaDeviceBufRaw,
+    set: &[CudaDeviceBufRaw],
+    l0: &CudaDeviceBufRaw,
+    l_last: &CudaDeviceBufRaw,
+    y: &CudaDeviceBufRaw,
+    rot: usize,
+    n: usize,
+    stream: Option<cudaStream_t>,
+) -> Result<(), Error> {
+    unsafe {
+        device.acitve_ctx()?;
+        let sets = device
+            .alloc_device_buffer_from_slice(&set.iter().map(|x| x.ptr()).collect::<Vec<_>>()[..])?;
+        let err = bn254_c::logup_eval_h_z_set(
+            res.ptr(),
+            sets.ptr(),
+            l0.ptr(),
+            l_last.ptr(),
+            y.ptr(),
+            set.len() as i32,
+            rot as i32,
+            n as i32,
+            stream.unwrap_or(0usize as _),
+        );
+        to_result((), err, "fail to run logup_eval_h_z_set")?;
+    }
+    Ok(())
+}
+
+pub fn logup_sum_input_inv(
+    device: &CudaDevice,
+    sum: &CudaDeviceBufRaw,
+    input: &CudaDeviceBufRaw,
+    temp: &CudaDeviceBufRaw,
+    beta: &CudaDeviceBufRaw,
+    init: usize,
+    n: usize,
+    stream: Option<cudaStream_t>,
+) -> Result<(), Error> {
+    unsafe {
+        device.acitve_ctx()?;
+
+        let err = bn254_c::logup_sum_input_inv(
+            sum.ptr(),
+            input.ptr(),
+            temp.ptr(),
+            beta.ptr(),
+            init as i32,
+            n as i32,
+            stream.unwrap_or(0usize as _),
+        );
+        to_result((), err, "fail to run field_op")?;
+    }
+    Ok(())
+}
+
+pub fn logup_eval_h_inputs_product_sum(
+    device: &CudaDevice,
+    product: &CudaDeviceBufRaw,
+    product_sum: &CudaDeviceBufRaw,
+    set: &[CudaDeviceBufRaw],
+    n: usize,
+    stream: Option<cudaStream_t>,
+) -> Result<(), Error> {
+    unsafe {
+        device.acitve_ctx()?;
+        let sets = device
+            .alloc_device_buffer_from_slice(&set.iter().map(|x| x.ptr()).collect::<Vec<_>>()[..])?;
+        let err = bn254_c::logup_eval_h_inputs_product_sum(
+            product.ptr(),
+            product_sum.ptr(),
+            sets.ptr(),
+            set.len() as i32,
+            n as i32,
+            stream.unwrap_or(0usize as _),
+        );
+        to_result((), err, "fail to run permutation_eval_h_p2")?;
+    }
+    Ok(())
+}

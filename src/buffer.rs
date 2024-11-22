@@ -33,14 +33,58 @@ pub fn prepare_advice_buffer<C: CurveAffine>(
     advices
 }
 
+// pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
+//     pk: &ProvingKey<C>,
+// ) -> DeviceResult<
+//     Vec<(
+//         Vec<C::Scalar, HugePageAllocator>,
+//         Vec<C::Scalar, HugePageAllocator>,
+//         Vec<C::Scalar, HugePageAllocator>,
+//         Vec<C::Scalar, HugePageAllocator>,
+//     )>,
+// > {
+//     let size = 1 << pk.get_vk().domain.k();
+//     let timer = start_timer!(|| format!("prepare lookup buffer, count {}", pk.vk.cs.lookups.len()));
+//     let lookups = pk
+//         .vk
+//         .cs
+//         .lookups
+//         .par_iter()
+//         .map(|_| {
+//             let mut input = Vec::new_in(HugePageAllocator);
+//             let mut table = Vec::new_in(HugePageAllocator);
+//             let mut permuted_input = Vec::new_in(HugePageAllocator);
+//             let mut permuted_table = Vec::new_in(HugePageAllocator);
+//             let mut z = Vec::new_in(HugePageAllocator);
+//
+//             for buf in [
+//                 &mut input,
+//                 &mut table,
+//                 &mut permuted_input,
+//                 &mut permuted_table,
+//                 &mut z,
+//             ] {
+//                 buf.reserve(size);
+//                 unsafe {
+//                     buf.set_len(size);
+//                 }
+//             }
+//
+//             (input, table, permuted_table, z)
+//         })
+//         .collect::<Vec<_>>();
+//     end_timer!(timer);
+//     Ok(lookups)
+// }
+
 pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
 ) -> DeviceResult<
     Vec<(
+        Vec<Vec<Vec<C::Scalar, HugePageAllocator>>>,
         Vec<C::Scalar, HugePageAllocator>,
         Vec<C::Scalar, HugePageAllocator>,
-        Vec<C::Scalar, HugePageAllocator>,
-        Vec<C::Scalar, HugePageAllocator>,
+        Vec<Vec<C::Scalar, HugePageAllocator>>,
     )>,
 > {
     let size = 1 << pk.get_vk().domain.k();
@@ -50,27 +94,48 @@ pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
         .cs
         .lookups
         .par_iter()
-        .map(|_| {
-            let mut input = Vec::new_in(HugePageAllocator);
+        .map(|argument| {
             let mut table = Vec::new_in(HugePageAllocator);
-            let mut permuted_input = Vec::new_in(HugePageAllocator);
-            let mut permuted_table = Vec::new_in(HugePageAllocator);
-            let mut z = Vec::new_in(HugePageAllocator);
+            let mut multiplicity = Vec::new_in(HugePageAllocator);
 
-            for buf in [
-                &mut input,
-                &mut table,
-                &mut permuted_input,
-                &mut permuted_table,
-                &mut z,
-            ] {
+            let mut inputs_sets = argument
+                .input_expressions_sets
+                .iter()
+                .map(|set| {
+                    set.0
+                        .iter()
+                        .map(|_| {
+                            let mut input = Vec::new_in(HugePageAllocator);
+                            input
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            let mut z_set: Vec<_> = (0..argument.input_expressions_sets.len())
+                .map(|_| {
+                    let mut z = Vec::new_in(HugePageAllocator);
+                    z
+                })
+                .collect();
+
+            for buf in std::iter::empty()
+                .chain(Some(&mut table))
+                .chain(Some(&mut multiplicity))
+                .chain(
+                    inputs_sets
+                        .iter_mut()
+                        .flat_map(|set| set.iter_mut().flat_map()),
+                )
+                .chain(z_set.iter_mut())
+            {
                 buf.reserve(size);
                 unsafe {
                     buf.set_len(size);
                 }
             }
 
-            (input, table, permuted_table, z)
+            (inputs_sets, table, multiplicity, z_set)
         })
         .collect::<Vec<_>>();
     end_timer!(timer);

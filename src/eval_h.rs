@@ -23,9 +23,13 @@ use crate::cuda::bn254::permutation_eval_h_p1;
 use crate::cuda::bn254::permutation_eval_h_p2;
 use crate::cuda::bn254::pick_from_buf;
 use crate::cuda::bn254::FieldOp;
+use crate::cuda::bn254::{
+    logup_eval_h_inputs_product_sum, logup_eval_h_z_set, logup_sum_input_inv,
+};
 use crate::cuda::bn254_c;
 use crate::cuda::bn254_c::field_op_batch_mul_sum;
-use crate::cuda::bn254_c::lookup_eval_h;
+use crate::cuda::bn254_c::logup_eval_h;
+use crate::cuda::bn254_c::logup_eval_h_extra_inputs;
 use crate::cuda::bn254_c::shuffle_eval_h;
 use crate::cuda::bn254_c::shuffle_eval_h_v2;
 use crate::cuda::field_op::field_op;
@@ -339,13 +343,12 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     advice: &[&[C::Scalar]],
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
-    lookup_products: &mut [(
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-    )],
+    lookup_products: &mut Vec<(
+        &mut Vec<Vec<Vec<C::Scalar, HugePageAllocator>>>,
+        &mut Vec<C::Scalar, HugePageAllocator>,
+        &mut Vec<C::Scalar, HugePageAllocator>,
+        &mut Vec<Vec<C::Scalar, HugePageAllocator>>,
+    )>,
     shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
     beta: C::Scalar,
@@ -503,6 +506,54 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     Ok((x, xn, h_pieces))
 }
 
+fn logup_direct_transform_extend_coset_async<F: FieldExt>(
+    device: &CudaDevice,
+    values: &[F],
+    beta_buf: &CudaDeviceBufRaw,
+    pq_buf: &CudaDeviceBufRaw,
+    omegas_buf: &CudaDeviceBufRaw,
+    divisor: &CudaDeviceBufRaw,
+    ctx: &mut EvalHContext<F>,
+) -> DeviceResult<(CudaDeviceBufRaw, (CudaStreamWrapper, CudaDeviceBufRaw))> {
+    let (sw, stream) = CudaStreamWrapper::new_with_inner();
+    let mut buf = ctx.alloc()?;
+    device.copy_from_host_to_device_async(&buf, values, stream)?;
+
+    let mut tmp_buf = ctx.alloc()?;
+    field_op::<C::Scalar>(
+        device,
+        &buf,
+        &buf,
+        ((), beta_buf),
+        size,
+        FieldOp::Add,
+        Some(stream),
+    )?;
+    ntt_raw(
+        &device,
+        &mut buf,
+        &mut tmp_buf,
+        &pq_buf,
+        &omegas_buf,
+        ctx.k,
+        Some(divisor),
+        Some(&sw),
+    )?;
+    ctx.extended_ntt_prepare(&mut buf, Some(&sw))?;
+    ntt_raw(
+        device,
+        &mut buf,
+        &mut tmp_buf,
+        &ctx.extended_ntt_pq_buf,
+        &ctx.extended_ntt_omegas_buf,
+        ctx.extended_k,
+        None,
+        Some(&sw),
+    )?;
+
+    Ok((buf, (sw, tmp_buf)))
+}
+
 fn evaluate_h_gates_core<'a, C: CurveAffine>(
     device: &'a CudaDevice,
     pk: &ProvingKey<C>,
@@ -510,13 +561,12 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
     advice: &[&[C::Scalar]],
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
-    lookup_products: &mut [(
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-        &mut [C::Scalar],
-    )],
+    lookup_products: &mut Vec<(
+        &mut Vec<Vec<Vec<C::Scalar, HugePageAllocator>>>,
+        &mut Vec<C::Scalar, HugePageAllocator>,
+        &mut Vec<C::Scalar, HugePageAllocator>,
+        &mut Vec<Vec<C::Scalar, HugePageAllocator>>,
+    )>,
     shuffle_products: &[&[C::Scalar]],
     y: C::Scalar,
     beta: C::Scalar,
@@ -742,12 +792,10 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h lookup");
-    let challenge_bufs = [
-        device.alloc_device_buffer_from_slice(&[beta][..])?,
-        device.alloc_device_buffer_from_slice(&[gamma][..])?,
-    ];
+    let beta_buf = device.alloc_device_buffer_from_slice(&[beta][..])?;
+
     let mut last_round_stream_and_buffers: Option<(CudaStreamWrapper, _)> = None;
-    for (_i, (lookup, (permuted_input, permuted_table, input, table, z))) in pk
+    for (_i, (lookup, (inputs_sets_host, table_host, multiplicity_host, z_set_host))) in pk
         .vk
         .cs
         .lookups
@@ -755,21 +803,61 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         .zip(lookup_products.into_iter())
         .enumerate()
     {
-        let input_deg = get_expr_degree(&lookup.input_expressions);
+        let sets_len = lookup.input_expressions_sets.len();
+        let mut input_deg = 1;
+        lookup.input_expressions_sets.iter().for_each(|set| {
+            set.0.iter().for_each(|input| {
+                input_deg = input_deg.max(get_expr_degree(input));
+            })
+        });
         let table_deg = get_expr_degree(&lookup.table_expressions);
 
-        let expr = flatten_lookup_expression(
-            &lookup.input_expressions,
+        let (inputs_product_expr, inputs_product_sum_expr, table_expr) = flatten_lookup_expression(
+            &lookup
+                .input_expressions_sets
+                .iter()
+                .map(|set| set.0.clone())
+                .collect::<Vec<_>>(),
             &lookup.table_expressions,
             beta,
-            gamma,
             theta,
         );
 
-        let degs = [input_deg, table_deg];
-        let host_bufs = [&**input, &**permuted_input, &**table, &**permuted_table];
+        // calculate inputs_host+beta in advance for input_deg=1
+        let inputs_beta_sets = if input_deg == 1 {
+            let (inputs_buf_sets, streams): (Vec<_>, Vec<_>) = inputs_sets_host
+                .iter()
+                .map(|set| -> Result<(Vec<_>, Vec<_>), _> {
+                    let rst = set
+                        .iter()
+                        .map(|input| -> DeviceResult<_> {
+                            logup_direct_transform_extend_coset_async(
+                                device,
+                                input,
+                                &beta_buf,
+                                &intt_pq_buf,
+                                &intt_omegas_buf,
+                                &intt_divisor_buf,
+                                &mut ctx,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .unzip();
+                    Ok(rst)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .unzip();
 
-        let (z_buf, z_stream_and_tmp) = ctx.copy_and_extended_ntt_async(z)?;
+            drop(streams);
+            Some(inputs_buf_sets)
+        } else {
+            None
+        };
+
+        let (multiplicity_buf, m_stream_and_tmp) =
+            ctx.copy_and_extended_ntt_async(multiplicity_host)?;
 
         last_round_stream_and_buffers.map(|(sw, buffers)| {
             sw.sync();
@@ -778,109 +866,147 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
             }
         });
 
-        let mut bufs = vec![];
-        let mut last_waiting = z_stream_and_tmp;
-        for i in 0..2 {
-            if degs[i] > 1 {
-                let (buf, pendings) = ctx.evaluate_prove_expr_with_async_ntt(
-                    &expr[i..i + 1],
+        let mut inputs_product_bufs = vec![];
+        let mut input_products_sum_bufs = vec![];
+        let mut zs_bufs = vec![];
+        let mut last_waiting = m_stream_and_tmp;
+
+        for i in 0..inputs_product_expr.len() {
+            if input_deg > 1 {
+                let (buf, pendings_product) = ctx.evaluate_prove_expr_with_async_ntt(
+                    &inputs_product_expr[i],
                     fixed,
                     advice,
                     instance,
                 )?;
-                bufs.push(buf);
+                inputs_product_bufs.push(buf);
+                let (buf, pendings_sum) = ctx.evaluate_prove_expr_with_async_ntt(
+                    &inputs_product_sum_expr[i],
+                    fixed,
+                    advice,
+                    instance,
+                )?;
+                input_products_sum_bufs.push(buf);
 
                 ctx.extended_ntt_wait(last_waiting)?;
-                let (permuted_buf, stream_and_tmp) =
-                    ctx.copy_and_extended_ntt_async(host_bufs[i * 2 + 1])?;
+                let (z_buf, stream_and_tmp) = ctx.copy_and_extended_ntt_async(z_set_host[i])?;
                 last_waiting = stream_and_tmp;
-                bufs.push(permuted_buf);
+                zs_bufs.push(z_buf);
 
-                drop(pendings);
+                drop([pendings_product, pendings_sum]);
             } else {
                 let (sw, stream) = CudaStreamWrapper::new_with_inner();
-                let mut buf = ctx.alloc()?;
-                device.copy_from_host_to_device_async(&buf, &host_bufs[i * 2], stream)?;
-
-                let mut tmp_buf = ctx.alloc()?;
-                field_op::<C::Scalar>(
+                let product_buf = ctx.alloc(device)?;
+                let product_sum_buf = ctx.alloc(device)?;
+                logup_eval_h_inputs_product_sum(
                     device,
-                    &buf,
-                    &buf,
-                    ((), &challenge_bufs[i]),
-                    size,
-                    FieldOp::Add,
+                    &product_buf,
+                    &product_sum_buf,
+                    &inputs_beta_sets.unwrap()[i],
+                    ctx.extended_size,
                     Some(stream),
                 )?;
-                ntt_raw(
-                    &device,
-                    &mut buf,
-                    &mut tmp_buf,
-                    &intt_pq_buf,
-                    &intt_omegas_buf,
-                    k,
-                    Some(&intt_divisor_buf),
-                    Some(&sw),
-                )?;
-                ctx.extended_ntt_prepare(&mut buf, Some(&sw))?;
-                ntt_raw(
-                    device,
-                    &mut buf,
-                    &mut tmp_buf,
-                    &ctx.extended_ntt_pq_buf,
-                    &ctx.extended_ntt_omegas_buf,
-                    ctx.extended_k,
-                    None,
-                    Some(&sw),
-                )?;
-                bufs.push(buf);
+                inputs_product_bufs.push(product_buf);
+                inputs_product_sum_bufs.push(product_sum_buf);
 
                 ctx.extended_ntt_wait(last_waiting)?;
-                let (permuted_buf, stream_and_tmp) =
-                    ctx.copy_and_extended_ntt_async(host_bufs[i * 2 + 1])?;
+                let (z_buf, stream_and_tmp) = ctx.copy_and_extended_ntt_async(z_set_host[i])?;
 
                 ctx.extended_ntt_wait((sw, tmp_buf))?;
                 last_waiting = stream_and_tmp;
-                bufs.push(permuted_buf);
+                zs_bufs.push(z_buf);
             }
         }
-        let [input_buf, permuted_input_buf, table_buf, permuted_table_buf]: [_; 4] =
-            bufs.try_into().unwrap();
-        ctx.extended_ntt_wait(last_waiting)?;
+
+        let table_buf = if table_deg > 1 {
+            let (buf, pendings) =
+                ctx.evaluate_prove_expr_with_async_ntt(&table_expr, fixed, advice, instance)?;
+            ctx.extended_ntt_wait(last_waiting)?;
+            drop(pendings);
+            buf
+        } else {
+            let (buf, (sw, tmp_buf)) = logup_direct_transform_extend_coset_async(
+                device,
+                &table_host[..],
+                &beta_buf,
+                &intt_pq_buf,
+                &intt_omegas_buf,
+                &intt_divisor_buf,
+                &mut ctx,
+            )?;
+            ctx.extended_ntt_wait(last_waiting)?;
+            ctx.extended_ntt_wait((sw, tmp_buf))?;
+            buf
+        };
 
         let (sw, stream) = CudaStreamWrapper::new_with_inner();
         unsafe {
-            let err = lookup_eval_h(
+            let err = logup_eval_h(
                 h_buf.ptr(),
-                input_buf.ptr(),
+                input_product_buffs[0].ptr(),
+                input_product_sum_buffs[0].ptr(),
                 table_buf.ptr(),
-                permuted_input_buf.ptr(),
-                permuted_table_buf.ptr(),
-                z_buf.ptr(),
+                multiplicity_buf.ptr(),
+                zs_bufs.first().unwrap().ptr(),
+                zs_bufs.last().unwrap().ptr(),
                 l0_buf.ptr(),
                 l_last_buf.ptr(),
                 l_active_buf.ptr(),
                 y_buf.ptr(),
-                beta_buf.ptr(),
-                gamma_buf.ptr(),
                 1 << (extended_k - k),
                 ctx.extended_size as i32,
                 stream,
             );
+            to_result((), err, "fail to run logup_eval_h")?;
 
-            to_result((), err, "fail to run field_op_batch_mul_sum")?;
+            if sets_len > 1 {
+                logup_eval_h_z_set(
+                    device,
+                    &h_buf,
+                    &zs_bufs[..],
+                    &l0_buf,
+                    &l_last_buf,
+                    &y_buf,
+                    last_rotation,
+                    ctx.extended_size,
+                    Some(stream),
+                )?;
+
+                for ((input_product, input_product_sum), z) in input_product_buffs
+                    .iter()
+                    .zip(input_product_sum_buffs.iter())
+                    .zip(zs_bufs.iter())
+                    .skip(1)
+                {
+                    let err = logup_eval_h_extra_inputs(
+                        h_buf.ptr(),
+                        input_product.ptr(),
+                        input_product_sum.ptr(),
+                        z.ptr(),
+                        l_active_buf.ptr(),
+                        y_buf.ptr(),
+                        1 << (extended_k - k),
+                        ctx.extended_size as i32,
+                        stream,
+                    );
+                    to_result((), err, "fail to run logup_eval_h_extra_inputs")?;
+                }
+            }
+
+            last_round_stream_and_buffers = Some((
+                sw,
+                vec![
+                    vec![table_buf],
+                    vec![multiplicity_buf],
+                    input_product_buffs,
+                    input_product_sum_buffs,
+                    zs_bufs,
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            ));
         }
-
-        last_round_stream_and_buffers = Some((
-            sw,
-            [
-                input_buf,
-                table_buf,
-                permuted_input_buf,
-                permuted_table_buf,
-                z_buf,
-            ],
-        ));
     }
     end_timer!(timer);
 

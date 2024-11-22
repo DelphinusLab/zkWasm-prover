@@ -104,6 +104,66 @@ extern "C" {
         stream: *mut CUstream_st,
     ) -> cudaError;
 
+    pub fn logup_eval_h(
+        res: *mut c_void,
+        input_product: *mut c_void,
+        input_product_sum: *mut c_void,
+        table: *mut c_void,
+        multiplicity: *mut c_void,
+        z_first: *mut c_void,
+        z_last: *mut c_void,
+        l0: *mut c_void,
+        l_last: *mut c_void,
+        l_active_row: *mut c_void,
+        y: *mut c_void,
+        rot: i32,
+        n: i32,
+        stream: *mut CUstream_st,
+    ) -> cudaError;
+
+    pub fn logup_eval_h_extra_inputs(
+        res: *mut c_void,
+        input_product: *mut c_void,
+        input_product_sum: *mut c_void,
+        z: *mut c_void,
+        l_active_row: *mut c_void,
+        y: *mut c_void,
+        rot: i32,
+        n: i32,
+        stream: *mut CUstream_st,
+    ) -> cudaError;
+
+    pub fn logup_eval_h_z_set(
+        res: *mut c_void,
+        set: *mut c_void,
+        l0: *mut c_void,
+        l_last: *mut c_void,
+        y: *mut c_void,
+        n_set: i32,
+        rot: i32,
+        n: i32,
+        stream: *mut CUstream_st,
+    ) -> cudaError;
+
+    pub fn logup_sum_input_inv(
+        sum: *mut c_void,
+        input: *mut c_void,
+        temp: *mut c_void,
+        beta: *mut c_void,
+        init: i32,
+        n: i32,
+        stream: *mut CUstream_st,
+    ) -> cudaError;
+
+    pub fn logup_eval_h_inputs_product_sum(
+        product: *mut c_void,
+        product_sum: *mut c_void,
+        sets: *mut c_void,
+        n_set: i32,
+        n: i32,
+        stream: *mut CUstream_st,
+    ) -> cudaError;
+
     pub fn shuffle_eval_h(
         res: *mut c_void,
         input: *mut c_void,
@@ -169,6 +229,28 @@ extern "C" {
         permuted_input: *mut c_void,
         permuted_table: *mut c_void,
         beta_gamma: *mut c_void,
+        n: i32,
+        stream: *mut CUstream_st,
+    ) -> cudaError;
+
+    pub fn eval_logup_z(
+        z: *mut c_void,
+        input: *mut c_void,
+        table: *mut c_void,
+        multiplicity: *mut c_void,
+        beta: *mut c_void,
+        last_z: *mut c_void,
+        last_z_index: i32,
+        n: i32,
+        stream: *mut CUstream_st,
+    ) -> cudaError;
+
+    pub fn eval_logup_z_pure(
+        z: *mut c_void,
+        input: *mut c_void,
+        table: *mut c_void,
+        last_z: *mut c_void,
+        last_z_index: i32,
         n: i32,
         stream: *mut CUstream_st,
     ) -> cudaError;
