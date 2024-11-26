@@ -101,85 +101,6 @@ pub fn prepare_advice_buffer<C: CurveAffine>(
     crate::buffer::prepare_advice_buffer(pk)
 }
 
-// fn handle_lookup_pair<F: FieldExt>(
-//     input: &mut Vec<F, HugePageAllocator>,
-//     table: &mut Vec<F, HugePageAllocator>,
-//     mut permuted_table: Vec<F, HugePageAllocator>,
-//     unusable_rows_start: usize,
-// ) -> (Vec<F, HugePageAllocator>, Vec<F, HugePageAllocator>) {
-//     let input_len = input.len();
-//     let permuted_table_state_handler = thread::spawn(move || {
-//         let mut permuted_table_state = Vec::new_in(HugePageAllocator);
-//         unsafe {
-//             permuted_table_state.reserve(input_len);
-//             permuted_table_state.set_len(input_len);
-//             permuted_table_state.fill(false);
-//         }
-//         permuted_table_state
-//     });
-//
-//     let compare = |a: &_, b: &_| unsafe {
-//         let a: &[u64; 4] = std::mem::transmute(a);
-//         let b: &[u64; 4] = std::mem::transmute(b);
-//         a.cmp(b)
-//     };
-//
-//     let [mut permuted_input, sorted_table]: [Vec<_, _>; 2] = [&*input, &*table]
-//         .par_iter()
-//         .map(|buf| {
-//             let mut sort_buf = (**buf).clone();
-//             sort_buf[0..unusable_rows_start].sort_unstable_by(compare);
-//             sort_buf
-//         })
-//         .collect::<Vec<_>>()
-//         .try_into()
-//         .unwrap();
-//
-//     let mut permuted_table_state = permuted_table_state_handler.join().unwrap();
-//
-//     permuted_input
-//         .iter()
-//         .take(unusable_rows_start)
-//         .zip(permuted_table_state.iter_mut().take(unusable_rows_start))
-//         .zip(permuted_table.iter_mut().take(unusable_rows_start))
-//         .enumerate()
-//         .for_each(|(row, ((input_value, table_state), table_value))| {
-//             // If this is the first occurrence of `input_value` in the input expression
-//             if row == 0 || *input_value != permuted_input[row - 1] {
-//                 *table_state = true;
-//                 *table_value = *input_value;
-//             }
-//         });
-//
-//     let to_next_unique = |i: &mut usize| {
-//         while *i < unusable_rows_start && !permuted_table_state[*i] {
-//             *i += 1;
-//         }
-//     };
-//
-//     let mut i_unique_input_idx = 0;
-//     let mut i_sorted_table_idx = 0;
-//     for i in 0..unusable_rows_start {
-//         to_next_unique(&mut i_unique_input_idx);
-//         while i_unique_input_idx < unusable_rows_start
-//             && permuted_table[i_unique_input_idx] == sorted_table[i_sorted_table_idx]
-//         {
-//             i_unique_input_idx += 1;
-//             i_sorted_table_idx += 1;
-//             to_next_unique(&mut i_unique_input_idx);
-//         }
-//         if !permuted_table_state[i] {
-//             permuted_table[i] = sorted_table[i_sorted_table_idx];
-//             i_sorted_table_idx += 1;
-//         }
-//     }
-//
-//     fill_random(&mut permuted_input[unusable_rows_start..]);
-//     fill_random(&mut permuted_table[unusable_rows_start..]);
-//
-//     (permuted_input, permuted_table)
-// }
-
 /// Simple evaluation of an expression
 pub(crate) fn evaluate_expr<F: FieldExt>(
     expression: &Expression<F>,
@@ -285,6 +206,26 @@ pub fn lookup_compute_multiplicity<F: FieldExt>(
         })
     });
     end_timer!(timer);
+
+    if false {
+        let random = F::random(&mut OsRng);
+        let res = (0..unusable_rows_start)
+            .into_par_iter()
+            .map(|r| {
+                let inputs = inputs_set.iter().fold(F::zero(), |acc, set| {
+                    // ∑ 1/(f_i(X)+beta)
+                    let sum = set.iter().fold(F::zero(), |acc, input| {
+                        acc + (input[r] + random).invert().unwrap()
+                    });
+                    acc + sum
+                });
+                // ∑ 1/(φ_i(X)) - m(X) / τ(X)))
+                inputs - ((table[r] + random).invert().unwrap() * &multiplicity[r])
+            })
+            .collect::<Vec<_>>();
+        let last_z = res.iter().fold(F::zero(), |acc, v| acc + v);
+        assert_eq!(last_z, F::zero());
+    }
 
     fill_random(&mut multiplicity[unusable_rows_start..]);
 }
@@ -1035,9 +976,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     // l_last(X) * (z_last(X)) = 0
                     assert_eq!(z_last[u], C::Scalar::zero());
                     let mut input_set_sums = inputs_sets
-                        .iter()
+                        .par_iter()
                         .map(|input_set| {
                             (0..u)
+                                .into_par_iter()
                                 .map(|i| {
                                     input_set
                                         .iter()

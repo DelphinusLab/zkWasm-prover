@@ -52,7 +52,9 @@ pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
         .par_iter()
         .map(|argument| {
             let mut table = Vec::new_in(HugePageAllocator);
+            // multiplicity need init
             let mut multiplicity = Vec::new_in(HugePageAllocator);
+            multiplicity.resize(size, C::Scalar::zero());
 
             let mut inputs_sets = argument
                 .input_expressions_sets
@@ -71,7 +73,6 @@ pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
 
             for buf in std::iter::empty()
                 .chain(Some(&mut table))
-                .chain(Some(&mut multiplicity))
                 .chain(inputs_sets.iter_mut().flat_map(|set| set.iter_mut()))
                 .chain(z_set.iter_mut())
             {
