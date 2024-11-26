@@ -228,10 +228,17 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         _lookup_sets
     );
 
+    let _shuffle_group = pk
+        .vk
+        .cs
+        .shuffles
+        .iter()
+        .map(|x| x.0.len())
+        .collect::<Vec<_>>();
     println!(
-        "product shuffles total={}, group={}",
-        (&pk).vk.cs.shuffles.0.len(),
-        pk.vk.cs.shuffles.group(pk.vk.cs.degree()).len()
+        "product shuffles total={}, group={:?}",
+        (&pk).vk.cs.shuffles.len(),
+        _shuffle_group
     );
 
     let gpu_reserve_chuncks = std::env::var("ZKWASM_PROVER_GPU_RESERVE_CHUNCKS")

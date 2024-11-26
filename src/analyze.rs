@@ -221,15 +221,17 @@ pub(crate) fn analyze_involved_advices<C: CurveAffine>(
         }
     }
 
-    for shuffle in &pk.vk.cs.shuffles.0 {
-        collect_involved_advices(
-            &shuffle.input_expressions[..],
-            &mut uninvolved_units_after_shuffle,
-        );
-        collect_involved_advices(
-            &shuffle.shuffle_expressions[..],
-            &mut uninvolved_units_after_shuffle,
-        );
+    for shuffle_group in &pk.vk.cs.shuffles {
+        for shuffle in shuffle_group.0.iter() {
+            collect_involved_advices(
+                &shuffle.input_expressions[..],
+                &mut uninvolved_units_after_shuffle,
+            );
+            collect_involved_advices(
+                &shuffle.shuffle_expressions[..],
+                &mut uninvolved_units_after_shuffle,
+            );
+        }
     }
 
     for i in uninvolved_units_after_shuffle.iter() {

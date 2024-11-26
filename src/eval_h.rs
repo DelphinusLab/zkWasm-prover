@@ -1035,8 +1035,10 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
     }
     let betas_buf = device.alloc_device_buffer_from_slice(&betas[..])?;
 
-    let shuffle_group = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
-    for (_i, (shuffle, z)) in shuffle_group
+    for (_i, (shuffle, z)) in pk
+        .vk
+        .cs
+        .shuffles
         .iter()
         .zip(shuffle_products.iter())
         .enumerate()

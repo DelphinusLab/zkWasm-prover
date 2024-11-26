@@ -27,9 +27,10 @@ pub(crate) fn generate_shuffle_product<C: CurveAffine>(
     let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
     let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
 
-    let shuffle_groups = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
-
-    let mut more_buffer_groups = shuffle_groups
+    let mut more_buffer_groups = pk
+        .vk
+        .cs
+        .shuffles
         .par_iter()
         .map(|group| {
             group
@@ -75,7 +76,10 @@ pub(crate) fn generate_shuffle_product<C: CurveAffine>(
         }
     };
 
-    let buffer_groups = shuffle_groups
+    let buffer_groups = pk
+        .vk
+        .cs
+        .shuffles
         .par_iter()
         .zip(more_buffer_groups.par_iter_mut())
         .map(|(group, buffers)| {
