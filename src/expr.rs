@@ -1,6 +1,7 @@
 use crate::cuda::bn254_c::field_op_batch_mul_sum;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaStreamWrapper;
+use crate::device::Device;
 use crate::device::DeviceResult;
 use crate::to_result;
 use crate::CudaDevice;
@@ -188,69 +189,6 @@ pub(crate) fn flatten_shuffle_expression<F: FieldExt>(
     [expr_input, expr_table]
 }
 
-/// Simple evaluation of an expression
-pub fn _evaluate_exprs<F: FieldExt>(
-    expressions: &[Expression<F>],
-    size: usize,
-    rot_scale: i32,
-    fixed: &[&[F]],
-    advice: &[&[F]],
-    instance: &[&[F]],
-    theta: F,
-    res: &mut [F],
-) {
-    let isize = size as i32;
-    let get_rotation_idx = |idx: usize, rot: i32, rot_scale: i32, isize: i32| -> usize {
-        (((idx as i32) + (rot * rot_scale)).rem_euclid(isize)) as usize
-    };
-
-    let chunks = 12;
-    let chunk_size = size / chunks;
-
-    res.par_chunks_mut(chunk_size)
-        .enumerate()
-        .for_each(|(chunk_idx, res_chunck)| {
-            for (i, value) in res_chunck.into_iter().enumerate() {
-                let idx = chunk_idx * chunk_size + i;
-                for (i, expression) in expressions.iter().enumerate() {
-                    let v = expression.evaluate(
-                        &|scalar| scalar,
-                        &|_| panic!("virtual selectors are removed during optimization"),
-                        &|_, column_index, rotation| {
-                            fixed[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                        },
-                        &|_, column_index, rotation| {
-                            advice[column_index]
-                                [get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                        },
-                        &|_, column_index, rotation| {
-                            instance[column_index]
-                                [get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                        },
-                        &|a| -a,
-                        &|a, b| a + &b,
-                        &|a, b| {
-                            let a = a();
-                            if a == F::zero() {
-                                a
-                            } else {
-                                a * b()
-                            }
-                        },
-                        &|a, scalar| a * scalar,
-                    );
-
-                    if i > 0 && *value != F::zero() {
-                        *value = *value * theta;
-                        *value += v;
-                    } else {
-                        *value = v;
-                    }
-                }
-            }
-        });
-}
-
 fn pick_prove_unit_slice<'a, F: FieldExt>(
     unit: &ProveExpressionUnit,
     fixed: &'a [&'a [F]],
@@ -435,6 +373,96 @@ pub(crate) fn evaluate_exprs_in_gpu<F: FieldExt>(
     for (buf, _, _, _) in handlers {
         res.push(buf);
     }
+
+    Ok(res)
+}
+
+pub(crate) fn evaluate_exprs_in_gpu_pure<F: FieldExt>(
+    device: &CudaDevice,
+    advice_and_instance_buffers: &HashMap<usize, CudaDeviceBufRaw>,
+    fixed_buffers: &mut HashMap<usize, CudaDeviceBufRaw>,
+    exprs: &[Expression<F>],
+    fixed: &[&[F]],
+    theta: F,
+    advices_len: usize,
+    size: usize,
+) -> DeviceResult<CudaDeviceBufRaw> {
+    let expr = flatten_tuple_expressions(exprs, None, theta);
+
+    let mut coeffs = vec![];
+    for (_, y_map) in expr.iter() {
+        assert_eq!(y_map.len(), 1);
+        for (k, v) in y_map {
+            assert_eq!(*k, 0);
+            coeffs.push(*v);
+        }
+    }
+
+    let coeffs_buf = device.alloc_device_buffer_from_slice(&coeffs[..])?;
+
+    let mut terms = vec![]; // Array of polynomial terms [coeff0, x0, y0, ..., nil, coeff1, x1, y1, ...]
+    let mut rots = vec![];
+    for (j, (units, _)) in expr.into_iter().enumerate() {
+        terms.push(unsafe {
+            coeffs_buf
+                .ptr()
+                .offset((j * core::mem::size_of::<F>()) as isize)
+        });
+
+        for (unit, exp) in units {
+            let (buf, rot) = match unit {
+                ProveExpressionUnit::Advice {
+                    column_index,
+                    rotation,
+                } => (
+                    advice_and_instance_buffers.get(&column_index).unwrap(),
+                    rotation.0,
+                ),
+                ProveExpressionUnit::Instance {
+                    column_index,
+                    rotation,
+                } => (
+                    advice_and_instance_buffers
+                        .get(&(column_index + &advices_len))
+                        .unwrap(),
+                    rotation.0,
+                ),
+                ProveExpressionUnit::Fixed {
+                    column_index,
+                    rotation,
+                } => {
+                    if !fixed_buffers.contains_key(&column_index) {
+                        let buf =
+                            device.alloc_device_buffer_from_slice(&fixed[column_index][..])?;
+                        fixed_buffers.insert(column_index, buf);
+                    }
+                    (fixed_buffers.get(&(column_index)).unwrap(), rotation.0)
+                }
+            };
+            for _ in 0..exp {
+                terms.push(buf.ptr());
+                rots.push(rot);
+            }
+        }
+
+        terms.push(0usize as _);
+    }
+
+    let terms_buf = device.alloc_device_buffer_from_slice(&terms[..])?;
+    let rots_buf = device.alloc_device_buffer_from_slice(&rots[..])?;
+    let res = device.alloc_device_buffer::<F>(size)?;
+    let err = unsafe {
+        field_op_batch_mul_sum(
+            res.ptr(),
+            terms_buf.ptr(),
+            rots_buf.ptr(),
+            terms.len() as i32,
+            size as i32,
+            0 as _,
+        )
+    };
+
+    to_result((), err, "fail to run field_op_batch_mul_sum")?;
 
     Ok(res)
 }

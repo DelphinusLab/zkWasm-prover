@@ -286,4 +286,33 @@ extern "C" {
         prepared_sort_indices_temp_storage_bytes: i32,
         stream: *mut CUstream_st,
     ) -> cudaError;
+
+    pub fn prepare_table_lookup(
+        table: *mut c_void,
+        table_lowest_u32: *mut c_void,
+        sorted_table_lowest_u32: *mut c_void,
+        index: *mut c_void,
+        sorted_index: *mut c_void,
+        start_offset: *mut c_void,
+        candidate_sort_temp_storage: *mut c_void,
+        candidate_sort_temp_storage_bytes: u32,
+        k: u32,
+        unusable_rows_start: u32,
+        stream: *mut CUstream_st,
+    ) -> cudaError;
+
+    pub fn calc_m(
+        m: *mut c_void,
+        table: *mut c_void,
+        input: *mut c_void,
+        sorted_index: *mut c_void,
+        start_offset: *mut c_void,
+        matched_index: *mut c_void,
+        sorted_matched_index: *mut c_void,
+        candidate_sort_temp_storage: *mut c_void,
+        candidate_sort_temp_storage_bytes: u32,
+        k: u32,
+        unusable_rows_start: u32,
+        stream: *mut CUstream_st,
+    ) -> cudaError;
 }

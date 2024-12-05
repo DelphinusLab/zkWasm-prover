@@ -10,16 +10,21 @@ private:
     __device__ __host__ Field(Storage v) : value(v) {}
 
 public:
-    __device__ __host__ Field(uint v)
+    __device__ Field(uint v)
     {
         if (v == 0)
         {
             this->value = {0};
         }
+        else if (v == 1)
+        {
+            this->value = FD::get_one();
+        }
         else
         {
-            assert(v == 1);
-            this->value = FD::get_one();
+            this->value = {0};
+            *(unsigned *)&this->value = v;
+            this->value = FD::to_montgomery(this->value);
         }
     }
 

@@ -5,6 +5,7 @@
 extern crate lazy_static;
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::iter;
 use std::sync::Arc;
 use std::sync::Condvar;
@@ -12,7 +13,6 @@ use std::sync::Mutex;
 use std::thread;
 
 use analyze::analyze_involved_advices;
-use analyze::lookup_classify;
 use ark_std::end_timer;
 use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
@@ -20,13 +20,14 @@ use buffer::prepare_lookup_buffer;
 use cuda::bn254::intt_raw_async;
 use cuda::bn254::ntt;
 use cuda::msm::InttArgs;
+use cuda_runtime_sys::cudaError;
 use device::cuda::CudaStreamWrapper;
 use eval_poly::batch_poly_eval;
 use expr::evaluate_exprs;
+use expr::evaluate_exprs_in_gpu_pure;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
-use halo2_proofs::plonk::Expression;
 use halo2_proofs::plonk::ProvingKey;
 use halo2_proofs::poly::commitment::Params;
 use halo2_proofs::poly::Rotation;
@@ -47,7 +48,6 @@ use crate::device::cuda::CudaDeviceBufRaw;
 use crate::device::cuda::CUDA_BUFFER_ALLOCATOR;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
-use crate::expr::evaluate_exprs_in_gpu;
 use crate::expr::is_expression_pure_unit;
 use crate::hugetlb::print_pinned_cache_info;
 use crate::hugetlb::HugePageAllocator;
@@ -101,51 +101,6 @@ pub fn prepare_advice_buffer<C: CurveAffine>(
     crate::buffer::prepare_advice_buffer(pk)
 }
 
-/// Simple evaluation of an expression
-pub(crate) fn evaluate_expr<F: FieldExt>(
-    expression: &Expression<F>,
-    size: usize,
-    rot_scale: i32,
-    fixed: &[&[F]],
-    advice: &[&[F]],
-    instance: &[&[F]],
-    res: &mut [F],
-) {
-    let isize = size as i32;
-
-    let get_rotation_idx = |idx: usize, rot: i32, rot_scale: i32, isize: i32| -> usize {
-        (((idx as i32) + (rot * rot_scale)).rem_euclid(isize)) as usize
-    };
-
-    for (idx, value) in res.iter_mut().enumerate() {
-        *value = expression.evaluate(
-            &|scalar| scalar,
-            &|_| panic!("virtual selectors are removed during optimization"),
-            &|_, column_index, rotation| {
-                fixed[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-            },
-            &|_, column_index, rotation| {
-                advice[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-            },
-            &|_, column_index, rotation| {
-                instance[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-            },
-            &|a| -a,
-            &|a, b| a + &b,
-            &|a, b| {
-                let a = a();
-
-                if a == F::zero() {
-                    a
-                } else {
-                    a * b()
-                }
-            },
-            &|a, scalar| a * scalar,
-        );
-    }
-}
-
 pub fn lookup_compute_multiplicity<F: FieldExt>(
     inputs_set: &Vec<Vec<Vec<F, HugePageAllocator>>>,
     table: &Vec<F, HugePageAllocator>,
@@ -154,10 +109,10 @@ pub fn lookup_compute_multiplicity<F: FieldExt>(
 ) {
     let timer = start_timer!(|| "lookup table sort");
     let mut sorted_table_with_indices = table
-        .par_iter()
+        .iter()
         .take(unusable_rows_start)
         .enumerate()
-        .map(|(i, t)| (t, i))
+        .map(|(i, t)| (unsafe { std::mem::transmute::<_, &[u64; 4]>(t) }, i))
         .collect::<Vec<_>>();
     sorted_table_with_indices.par_sort_by_key(|(&t, _)| t);
     end_timer!(timer);
@@ -181,7 +136,10 @@ pub fn lookup_compute_multiplicity<F: FieldExt>(
                             *idx
                         } else {
                             let index = sorted_table_with_indices
-                                .binary_search_by_key(&fi, |&(t, _)| t)
+                                .binary_search_by_key(
+                                    &unsafe { std::mem::transmute::<_, &[u64; 4]>(fi) },
+                                    |&(t, _)| t,
+                                )
                                 .expect("binary_search_by_key");
                             let index = sorted_table_with_indices[index].1;
                             map_cache.insert(fi, index);
@@ -395,293 +353,226 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             .unwrap();
         end_timer!(timer);
 
-        // thread for part of lookups
-        let sub_pk = pk;
-        let sub_advices = advices.clone();
-        let sub_instances = instances.clone();
-        let lookup_handler = s.spawn(move || {
+        let buffer_handler = s.spawn(move || {
             let timer = start_timer!(|| "prepare buffers");
             let lookups = prepare_lookup_buffer(pk).unwrap();
             let permutations = prepare_permutation_buffers(pk).unwrap();
             let shuffles = prepare_shuffle_buffers(pk).unwrap();
-            let random_poly = generate_random_poly(size);
+            let random_poly = generate_random_poly::<C::Scalar>(size);
             end_timer!(timer);
 
-            let pk = sub_pk;
-            let advices = sub_advices;
-            let instances = sub_instances;
-
-            let [mut single_lookups, tuple_lookups] = lookup_classify(&pk, lookups);
-            let _single_lookup_len = single_lookups.len();
-
-            let mut single_expr_bufs = vec![];
-            for (i, bufs) in single_lookups.iter_mut() {
-                let lookup = &pk.vk.cs.lookups[*i];
-                single_expr_bufs.push((&lookup.table_expressions[0], &mut bufs.1[..]));
-                for (set, inputs) in lookup.input_expressions_sets.iter().zip(bufs.0.iter_mut()) {
-                    for (input_expressions, buf) in set.0.iter().zip(inputs.iter_mut()) {
-                        assert_eq!(input_expressions.len(), 1);
-                        single_expr_bufs.push((&input_expressions[0], &mut buf[..]));
-                    }
-                }
-            }
-
-            let timer = start_timer!(|| format!("lookup unit & comp {}", _single_lookup_len));
-
-            let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-
-            single_expr_bufs.into_par_iter().for_each(|(e, b)| {
-                let f = |expr: &Expression<_>, target: &mut [_]| {
-                    if let Some(v) = expr.is_constant() {
-                        target.fill(v);
-                    } else if let Some(idx) = expr.is_pure_fixed() {
-                        target.clone_from_slice(&pk.fixed_values[idx].values[..]);
-                    } else if let Some(idx) = expr.is_pure_instance() {
-                        target.clone_from_slice(&instances[idx][..]);
-                    } else if let Some(idx) = expr.is_pure_advice() {
-                        target.clone_from_slice(&advices[idx][..]);
-                    } else {
-                        evaluate_expr(expr, size, 1, fixed_ref, advice_ref, instance_ref, target)
-                    }
-                };
-                f(e, b);
-            });
-            single_lookups.par_iter_mut().for_each(|(_, arg)| {
-                lookup_compute_multiplicity(&arg.0, &arg.1, &mut arg.2, unusable_rows_start)
-            });
-            end_timer!(timer);
-
-            (
-                single_lookups,
-                tuple_lookups,
-                permutations,
-                shuffles,
-                random_poly,
-            )
+            (lookups, permutations, shuffles, random_poly)
         });
 
         // GPU Task: MSM & INTT of advices & instances
-        let timer = start_timer!(|| format!(
-            "instances and advices msm {}",
-            instances.len() + advices.len()
-        ));
+        let mut advice_and_instance_device_buffers = {
+            let timer = start_timer!(|| format!(
+                "instances and advices msm {}",
+                instances.len() + advices.len()
+            ));
 
-        let (commitments, mut advice_device_buffers) = crate::cuda::msm::batch_msm_and_intt::<C>(
-            &device,
-            &g_lagrange_buf,
-            unsafe {
-                Arc::get_mut_unchecked(&mut advices)
-                    .iter_mut()
-                    .chain(Arc::get_mut_unchecked(&mut instances).iter_mut())
-                    .map(|x| &mut x[..])
-                    .collect()
-            },
-            InttArgs {
-                pq_buf: &intt_pq_buf,
-                omegas_buf: &intt_omegas_buf,
-                divisor_buf: &intt_divisor_buf,
-                len_log: k,
-                selector: &|x| uninvolved_units.contains(&x),
-            },
-            &|x| !uninvolved_units.contains(&x),
-            size,
-        )?;
-        for commitment in commitments.iter().skip(advices.len()) {
-            transcript.common_point(*commitment).unwrap();
-        }
-        for commitment in commitments.into_iter().take(advices.len()) {
-            transcript.write_point(commitment).unwrap();
-        }
-        end_timer!(timer);
+            let (commitments, advice_and_instance_device_buffers) =
+                crate::cuda::msm::batch_msm_and_intt::<C>(
+                    &device,
+                    &g_lagrange_buf,
+                    unsafe {
+                        Arc::get_mut_unchecked(&mut advices)
+                            .iter_mut()
+                            .chain(Arc::get_mut_unchecked(&mut instances).iter_mut())
+                            .map(|x| &mut x[..])
+                            .collect()
+                    },
+                    InttArgs {
+                        pq_buf: &intt_pq_buf,
+                        omegas_buf: &intt_omegas_buf,
+                        divisor_buf: &intt_divisor_buf,
+                        len_log: k,
+                        selector: &|x| uninvolved_units.contains(&x),
+                    },
+                    &|x| !uninvolved_units.contains(&x),
+                    size,
+                )?;
+            for commitment in commitments.iter().skip(advices.len()) {
+                transcript.common_point(*commitment).unwrap();
+            }
+            for commitment in commitments.into_iter().take(advices.len()) {
+                transcript.write_point(commitment).unwrap();
+            }
+            end_timer!(timer);
+            advice_and_instance_device_buffers
+        };
 
         let theta: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
-        let timer = start_timer!(|| "wait single lookups");
-        let (mut single_lookups, mut tuple_lookups, permutations, shuffles, random_poly) =
-            lookup_handler.join().unwrap();
+        let timer = start_timer!(|| "wait prepare buffers");
+        let (mut lookups, permutations, shuffles, random_poly) = buffer_handler.join().unwrap();
         end_timer!(timer);
 
-        // GPU Task: Evaluate tuple lookup input/table buffer
-        let mut lookup_device_buffers = BTreeMap::new();
+        let timer = start_timer!(|| "calc lookup Mi(x)");
+        let mut lookup_device_buffers = HashMap::new();
         {
-            let timer = start_timer!(|| "eval tuple lookup buffer");
-            let mut tuple_lookup_exprs = vec![];
-            let mut tuple_host_buffers = vec![];
-            for (i, (inputs_sets_buf, table_buf, _, _)) in tuple_lookups.iter_mut() {
-                tuple_lookup_exprs.push(&pk.vk.cs.lookups[*i].table_expressions[..]);
-                pk.vk.cs.lookups[*i]
-                    .input_expressions_sets
-                    .iter()
-                    .for_each(|set| {
-                        set.0
-                            .iter()
-                            .for_each(|expr| tuple_lookup_exprs.push(&expr[..]))
-                    });
-
-                tuple_host_buffers.push(&mut table_buf[..]);
-                inputs_sets_buf.iter_mut().for_each(|set| {
-                    set.iter_mut()
-                        .for_each(|input| tuple_host_buffers.push(&mut input[..]))
-                })
-            }
-
             let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+            let mut fixed_buffers = std::collections::HashMap::new();
 
-            let tuple_lookup_device_buffers = evaluate_exprs_in_gpu(
-                &device,
-                &advice_device_buffers,
-                &tuple_lookup_exprs[..],
-                fixed_ref,
-                advice_ref,
-                instance_ref,
-                theta,
-                &mut tuple_host_buffers[..],
-                size,
-            )?;
+            let index_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let sorted_index_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let start_offset_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let candidate_sort_temp_storage_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
 
-            // Disabled because of memory limitation
-            if false {
-                let mut tuple_lookup_device_buffers_iter = tuple_lookup_device_buffers.into_iter();
+            let tmp_buf0 = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let tmp_buf1 = device.alloc_device_buffer::<C::Scalar>(size)?;
 
-                for (i, _) in tuple_lookups.iter() {
-                    lookup_device_buffers
-                        .insert((*i, 0), tuple_lookup_device_buffers_iter.next().unwrap());
-                    lookup_device_buffers
-                        .insert((*i, 1), tuple_lookup_device_buffers_iter.next().unwrap());
+            let (calc_sw, calc_stream) = CudaStreamWrapper::new_with_inner();
+            let (copy_sw, copy_stream) = CudaStreamWrapper::new_with_inner();
+
+            for (i, lookup) in pk.vk.cs.lookups.iter().enumerate() {
+                let m_device_buffer = device.alloc_device_buffer::<C::Scalar>(size)?;
+
+                let table_device_buffer = evaluate_exprs_in_gpu_pure(
+                    &device,
+                    &advice_and_instance_device_buffers,
+                    &mut fixed_buffers,
+                    &lookup.table_expressions[..],
+                    fixed_ref,
+                    theta,
+                    advices_len,
+                    size,
+                )?;
+
+                device.copy_from_device_to_host_async(
+                    &mut lookups[i].1,
+                    &table_device_buffer,
+                    copy_stream,
+                )?;
+
+                unsafe {
+                    let res = crate::cuda::bn254_c::prepare_table_lookup(
+                        table_device_buffer.ptr(),
+                        tmp_buf0.ptr(),
+                        tmp_buf1.ptr(),
+                        index_buf.ptr(),
+                        sorted_index_buf.ptr(),
+                        start_offset_buf.ptr(),
+                        candidate_sort_temp_storage_buf.ptr(),
+                        (std::mem::size_of::<C::Scalar>() * size) as u32,
+                        k as u32,
+                        unusable_rows_start as u32,
+                        calc_stream,
+                    );
+
+                    assert!(res == cudaError::cudaSuccess);
                 }
 
-                assert_eq!(tuple_lookup_device_buffers_iter.count(), 0);
+                calc_sw.sync();
+                copy_sw.sync();
+
+                for (set_i, input_sets) in lookup.input_expressions_sets.iter().enumerate() {
+                    for (set_inner_i, input) in input_sets.0.iter().enumerate() {
+                        let input_device_buffer = evaluate_exprs_in_gpu_pure(
+                            &device,
+                            &advice_and_instance_device_buffers,
+                            &mut fixed_buffers,
+                            &input[..],
+                            fixed_ref,
+                            theta,
+                            advices_len,
+                            size,
+                        )?;
+
+                        device.copy_from_device_to_host_async(
+                            &mut lookups[i].0[set_i][set_inner_i][..],
+                            &input_device_buffer,
+                            copy_stream,
+                        )?;
+
+                        unsafe {
+                            let res = crate::cuda::bn254_c::calc_m(
+                                m_device_buffer.ptr(),
+                                table_device_buffer.ptr(),
+                                input_device_buffer.ptr(),
+                                sorted_index_buf.ptr(),
+                                start_offset_buf.ptr(),
+                                tmp_buf0.ptr(),
+                                tmp_buf1.ptr(),
+                                candidate_sort_temp_storage_buf.ptr(),
+                                (std::mem::size_of::<C::Scalar>() * size) as u32,
+                                k as u32,
+                                unusable_rows_start as u32,
+                                calc_stream,
+                            );
+
+                            assert!(res == cudaError::cudaSuccess);
+                        }
+
+                        calc_sw.sync();
+                        copy_sw.sync();
+                    }
+                }
+
+                lookup_device_buffers.insert((i, 1), table_device_buffer);
+                lookup_device_buffers.insert((i, 2), m_device_buffer);
             }
-            end_timer!(timer);
-        }
-
-        // After theta
-        let timer = start_timer!(|| format!("lookup tuple multiplicity{}", tuple_lookups.len()));
-        let tuple_lookup_handler = s.spawn(move || {
-            tuple_lookups.par_iter_mut().for_each(|(_, arg)| {
-                lookup_compute_multiplicity(&arg.0, &arg.1, &mut arg.2, unusable_rows_start)
-            });
-
-            tuple_lookups
-        });
+        };
         end_timer!(timer);
 
-        let mut lookup_multiplicity_commitments = vec![C::identity(); pk.vk.cs.lookups.len()];
-
-        let timer =
-            start_timer!(|| format!("single lookup msm {} & advice intt", single_lookups.len(),));
-
-        {
-            let mut buffers = unsafe {
-                Arc::get_mut_unchecked(&mut advices)
-                    .iter_mut()
-                    .enumerate()
-                    .filter(|(i, _)| {
-                        uninvolved_units_after_single_lookup.contains(i)
-                            || uninvolved_units_after_tuple_lookup.contains(i)
-                    })
-                    .map(|(_, x)| &mut x[..])
-                    .collect::<Vec<_>>()
-            };
-
-            let mut s_bufs: Vec<_> = (0..advices_len)
-                .into_iter()
-                .filter(|i| {
+        // MSM on Mi(x)
+        let timer = start_timer!(|| "msm and intt Mi(x)");
+        let mut buffers = unsafe {
+            Arc::get_mut_unchecked(&mut advices)
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| {
                     uninvolved_units_after_single_lookup.contains(i)
                         || uninvolved_units_after_tuple_lookup.contains(i)
                 })
-                .map(|i| advice_device_buffers.remove(&i).unwrap())
-                .collect();
+                .map(|(_, x)| &mut x[..])
+                .collect::<Vec<_>>()
+        };
 
-            let (sw, stream) = CudaStreamWrapper::new_with_inner();
+        let mut s_bufs: Vec<_> = (0..advices_len)
+            .into_iter()
+            .filter(|i| {
+                uninvolved_units_after_single_lookup.contains(i)
+                    || uninvolved_units_after_tuple_lookup.contains(i)
+            })
+            .map(|i| advice_and_instance_device_buffers.remove(&i).unwrap())
+            .collect();
 
-            let mut lookup_scalars = vec![];
-            for (_, (_, _, multiplicity, _)) in single_lookups.iter_mut() {
-                lookup_scalars.push(&mut multiplicity[..]);
-            }
+        let (sw, stream) = CudaStreamWrapper::new_with_inner();
 
-            let (commitments, mut buffers) = crate::cuda::msm::batch_msm_and_intt_ext::<C>(
-                &device,
-                &g_lagrange_buf,
-                lookup_scalars,
-                InttArgs {
-                    pq_buf: &intt_pq_buf,
-                    omegas_buf: &intt_omegas_buf,
-                    divisor_buf: &intt_divisor_buf,
-                    len_log: k,
-                    selector: &|_| false,
-                },
-                &|_| true,
-                &mut || {
-                    let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
-                    for s_buf in s_bufs.iter_mut() {
-                        intt_raw_async(
-                            &device,
-                            s_buf,
-                            &mut t_buf,
-                            &intt_pq_buf,
-                            &intt_omegas_buf,
-                            &intt_divisor_buf,
-                            k,
-                            None,
-                        )
+        let lookup_multiplicity_commitments = crate::cuda::msm::batch_msm_ext::<C, _>(
+            &device,
+            &g_lagrange_buf,
+            (0..pk.vk.cs.lookups.len())
+                .map(|i| lookup_device_buffers.get(&(i, 2)).unwrap())
+                .collect(),
+            &mut || {
+                let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
+                for s_buf in s_bufs.iter_mut() {
+                    intt_raw_async(
+                        &device,
+                        s_buf,
+                        &mut t_buf,
+                        &intt_pq_buf,
+                        &intt_omegas_buf,
+                        &intt_divisor_buf,
+                        k,
+                        None,
+                    )
+                    .unwrap();
+                }
+                for (dev_buf, host_buf) in s_bufs.iter().zip(buffers.iter_mut()) {
+                    device
+                        .copy_from_device_to_host_async(host_buf, dev_buf, stream)
                         .unwrap();
-                    }
-                    for (dev_buf, host_buf) in s_bufs.iter().zip(buffers.iter_mut()) {
-                        device
-                            .copy_from_device_to_host_async(host_buf, dev_buf, stream)
-                            .unwrap();
-                    }
-                },
-                size,
-            )?;
+                }
+            },
+            size,
+        )?;
 
-            for (tidx, (i, _)) in single_lookups.iter().enumerate() {
-                lookup_multiplicity_commitments[*i] = commitments[tidx];
-                // 0:inputs, 1:table, 2:multiplicity, 3:z
-                lookup_device_buffers.insert((*i, 2), buffers.remove(&tidx).unwrap());
-            }
-
-            sw.sync();
-        }
-        end_timer!(timer);
-
-        let timer = start_timer!(|| "wait tuple lookup");
-        let mut tuple_lookups = tuple_lookup_handler.join().unwrap();
-        end_timer!(timer);
-
-        let timer = start_timer!(|| format!("tuple lookup msm {}", tuple_lookups.len()));
-        {
-            let mut lookup_scalars = vec![];
-            for (_, (_, _, multiplicity, _)) in tuple_lookups.iter_mut() {
-                lookup_scalars.push(&mut multiplicity[..]);
-            }
-
-            let (commitments, mut buffers) = crate::cuda::msm::batch_msm_and_intt_ext::<C>(
-                &device,
-                &g_lagrange_buf,
-                lookup_scalars,
-                InttArgs {
-                    pq_buf: &intt_pq_buf,
-                    omegas_buf: &intt_omegas_buf,
-                    divisor_buf: &intt_divisor_buf,
-                    len_log: k,
-                    selector: &|_| false,
-                },
-                &|_| true,
-                &mut || {},
-                size,
-            )?;
-
-            for (tidx, (i, _)) in tuple_lookups.iter().enumerate() {
-                lookup_multiplicity_commitments[*i] = commitments[tidx];
-                lookup_device_buffers.insert((*i, 2), buffers.remove(&tidx).unwrap());
-            }
-        }
+        drop(sw);
+        drop(s_bufs);
+        drop(buffers);
         end_timer!(timer);
 
         for commitment in lookup_multiplicity_commitments.into_iter() {
@@ -690,11 +581,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let beta: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
         let gamma: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
-
-        let mut lookups = vec![];
-        lookups.append(&mut single_lookups);
-        lookups.append(&mut tuple_lookups);
-        lookups.sort_by(|l, r| usize::cmp(&l.0, &r.0));
 
         // CPU Task: Generate Permutation product and Shuffle product
         let waker = Arc::new((Mutex::new(false), Condvar::new()));
@@ -765,10 +651,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .collect::<Vec<_>>();
 
             for ((i, (inputs_sets, table, multiplicity, z_set)), last_z_buf) in
-                lookups.iter_mut().zip(last_z_bufs.iter_mut())
+                lookups.iter_mut().enumerate().zip(last_z_bufs.iter_mut())
             {
                 unsafe {
-                    let idx = *i % MAX_CONCURRENCY;
+                    let idx = i % MAX_CONCURRENCY;
                     let stream = &streams[idx];
                     let [z_buf, input_buf, table_buf] = Rc::get_mut(&mut buffers[idx]).unwrap();
 
@@ -776,7 +662,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                     for (i, input) in inputs_sets[0].iter_mut().enumerate() {
                         device.copy_from_host_to_device_async(table_buf, input, stream.1)?;
-                        // sum  1/(input_i+beta)
+                        // sum 1 / (input_i + beta)
                         logup_sum_input_inv(
                             &device,
                             input_buf,
@@ -788,10 +674,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             Some(stream.1),
                         )?;
                     }
+
                     for (_, (d_buf, h_buf)) in
                         [(&mut *table_buf, &mut table[..])].into_iter().enumerate()
                     {
-                        let buf = lookup_device_buffers.remove(&(*i, 1));
+                        let buf = lookup_device_buffers.remove(&(i, 1));
                         match buf {
                             Some(buf) => {
                                 *d_buf = buf;
@@ -802,7 +689,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         }
                     }
 
-                    let mut multiplicity_buf = lookup_device_buffers.remove(&(*i, 2)).unwrap();
+                    let mut multiplicity_buf = lookup_device_buffers.remove(&(i, 2)).unwrap();
 
                     let err = eval_logup_z(
                         z_buf.ptr(),
@@ -848,10 +735,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             // interleave to [1,2,3,4,5,6,7,8]=>(stream:instance):[(0,1),(1,2),(2,3),(0,4),(1,5),(2,6),(0,7),(2,8)]
             // todo try  the build-in interleave
             let mut buff = vec![];
-            for (lookup_i, (inputs_sets, _, _, z_set)) in lookups.iter_mut() {
+            for (lookup_i, (inputs_sets, _, _, z_set)) in lookups.iter_mut().enumerate() {
                 let mut inner = vec![];
                 for (inputs_set, z) in inputs_sets.iter_mut().zip(z_set.iter_mut()).skip(1) {
-                    inner.push((*lookup_i, &mut inputs_set[..], &mut z[..]))
+                    inner.push((lookup_i, &mut inputs_set[..], &mut z[..]))
                 }
                 if !inner.is_empty() {
                     buff.push(inner);
@@ -938,7 +825,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                      RHS = Π(φ_i(X)) * (∑ 1/(φ_i(X)))
 
                 */
-                for (_, (inputs_sets, table, m_coeff, zs_coeff)) in lookups.iter() {
+                for (inputs_sets, table, m_coeff, zs_coeff) in lookups.iter() {
                     let [s_buf, tmp_buf, _] = Rc::get_mut(&mut buffers[0]).unwrap();
                     let mut m_lagrange = table.clone();
                     device.copy_from_host_to_device(s_buf, m_coeff)?;
@@ -1015,9 +902,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             }
         }
 
-        let mut lookups = lookups.into_iter().map(|(_, b)| b).collect::<Vec<_>>();
         end_timer!(timer);
-
         let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
         let mut lookup_z_and_random_commitments = crate::cuda::msm::batch_msm::<C, _>(
             &device,
@@ -1029,6 +914,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .collect::<Vec<_>>(),
             size,
         )?;
+
         let random_commitment = lookup_z_and_random_commitments.pop().unwrap();
         let lookup_z_commitments = lookup_z_and_random_commitments;
         end_timer!(timer);
@@ -1050,7 +936,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let mut s_bufs: Vec<_> = (0..advices_len)
             .into_iter()
             .filter(|i| uninvolved_units_after_permutation.contains(i))
-            .map(|i| advice_device_buffers.remove(&i).unwrap())
+            .map(|i| advice_and_instance_device_buffers.remove(&i).unwrap())
             .collect();
 
         let (sw, stream) = CudaStreamWrapper::new_with_inner();
@@ -1121,7 +1007,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
             let mut s_bufs: Vec<_> = (0..advices_len + instances_len)
                 .into_iter()
-                .filter_map(|i| advice_device_buffers.remove(&i))
+                .filter_map(|i| advice_and_instance_device_buffers.remove(&i))
                 .collect();
 
             let (sw, stream) = CudaStreamWrapper::new_with_inner();
@@ -1186,7 +1072,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
         let timer = start_timer!(|| "h_poly");
-
         let fixed_ref = &pk.fixed_polys.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
         let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
         let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
