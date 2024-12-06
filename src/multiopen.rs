@@ -477,12 +477,12 @@ pub mod shplonk {
                     .collect();
 
                 assert_eq!(diffs.len() + points.len(), super_point_set.len());
-
+                // set 1 when diffs is empty
                 let z_i = diffs
                     .iter()
                     .map(|root| u - root)
                     .reduce(|a, b| a * b)
-                    .unwrap();
+                    .unwrap_or(C::Scalar::one());
                 Ok((poly, z_i))
             })
             .collect::<DeviceResult<Vec<_>>>()?;
