@@ -223,7 +223,7 @@ __global__ void _eval_logup_z_grand_sum_batch_spread_skip(
 }
 
 
-__global__ void _eval_logup_add_c(
+__global__ void _eval_logup_add_random(
     Bn254FrField *input,
     const Bn254FrField *beta)
 {
@@ -231,7 +231,7 @@ __global__ void _eval_logup_add_c(
     input[i] = input[i] + beta[0];
 }
 
-__global__ void _eval_logup_z_step2(
+__global__ void _eval_logup_z_compose(
     Bn254FrField *z,
     Bn254FrField *input,
     Bn254FrField *table,
@@ -1918,7 +1918,7 @@ extern "C"
         {
             int threads = n >= 64 ? 64 : 1;
             int blocks = n / threads;
-            _eval_logup_add_c<<<blocks, threads, 0, stream>>>(
+            _eval_logup_add_random<<<blocks, threads, 0, stream>>>(
                 input, beta);
 
             int worker = 64 * 128;
@@ -1932,48 +1932,7 @@ extern "C"
             return cudaGetLastError();
         }
 
-        cudaError_t eval_logup_z(
-                Bn254FrField *z,
-                Bn254FrField *input,
-                Bn254FrField *table,
-                Bn254FrField *multiplicity,
-                const Bn254FrField *beta,
-                Bn254FrField *last_z,
-                int last_z_index,
-                int n,
-                CUstream_st *stream)
-            {
-                int threads = n >= 64 ? 64 : 1;
-                int blocks = n / threads;
-                _eval_logup_add_c<<<blocks, threads, 0, stream>>>(
-                                table, beta);
-
-                int worker = 64 * 128;
-                int size_per_worker = n / worker;
-                _eval_lookup_z_batch_invert<<<128, 64, 0, stream>>>(
-                    table, z, size_per_worker);
-
-                _eval_logup_z_step2<<<blocks, threads, 0, stream>>>(
-                    z, input, table, multiplicity);
-
-                //todo instead  call eval_logup_z_pure
-                worker = 64 * 64;
-                size_per_worker = n / worker;
-                _eval_logup_z_grand_sum_batch<<<64, 64, 0, stream>>>(
-                    z, input, size_per_worker);
-                _eval_logup_z_grand_sum_batch<<<8, 8, 0, stream>>>(
-                    input, table, 64);
-                _eval_logup_z_grand_sum_single_spread<<<1, 1, 0, stream>>>(
-                    table, 64);
-                _eval_logup_z_grand_sum_batch_spread<<<8, 8, 0, stream>>>(
-                    input, table, 64);
-                _eval_logup_z_grand_sum_batch_spread_skip<<<64, 64, 0, stream>>>(
-                    z, input, last_z, last_z_index, size_per_worker);
-
-                return cudaGetLastError();
-            }
-
-            cudaError_t eval_logup_z_pure(
+        cudaError_t eval_logup_z_pure(
                 Bn254FrField *z,
                 Bn254FrField *input,
                 Bn254FrField *table,
@@ -1997,6 +1956,33 @@ extern "C"
                     z, input, last_z, last_z_index, size_per_worker);
 
                 return cudaGetLastError();
+            }
+
+        cudaError_t eval_logup_z(
+                Bn254FrField *z,
+                Bn254FrField *input,
+                Bn254FrField *table,
+                Bn254FrField *multiplicity,
+                const Bn254FrField *beta,
+                Bn254FrField *last_z,
+                int last_z_index,
+                int n,
+                CUstream_st *stream)
+            {
+                int threads = n >= 64 ? 64 : 1;
+                int blocks = n / threads;
+                _eval_logup_add_random<<<blocks, threads, 0, stream>>>(
+                                table, beta);
+
+                int worker = 64 * 128;
+                int size_per_worker = n / worker;
+                _eval_lookup_z_batch_invert<<<128, 64, 0, stream>>>(
+                    table, z, size_per_worker);
+
+                _eval_logup_z_compose<<<blocks, threads, 0, stream>>>(
+                    z, input, table, multiplicity);
+
+                return eval_logup_z_pure(z, input, table, last_z, last_z_index, n, stream);
             }
 
             cudaError_t logup_eval_h_inputs_product_sum(

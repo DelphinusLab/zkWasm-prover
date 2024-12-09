@@ -319,6 +319,54 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
         Ok(res)
     }
 
+    fn ntt_and_extend_ntt_async(
+        &mut self,
+        values: &[F],
+        beta_buf: &CudaDeviceBufRaw,
+        pq_buf: &CudaDeviceBufRaw,
+        omegas_buf: &CudaDeviceBufRaw,
+        divisor: &CudaDeviceBufRaw,
+    ) -> DeviceResult<(CudaDeviceBufRaw, (CudaStreamWrapper, CudaDeviceBufRaw))> {
+        let (sw, stream) = CudaStreamWrapper::new_with_inner();
+        let mut buf = self.alloc()?;
+        self.device
+            .copy_from_host_to_device_async(&buf, values, stream)?;
+
+        let mut tmp_buf = self.alloc()?;
+        field_op::<F>(
+            &self.device,
+            &buf,
+            &buf,
+            ((), beta_buf),
+            self.size,
+            FieldOp::Add,
+            Some(stream),
+        )?;
+        ntt_raw(
+            &self.device,
+            &mut buf,
+            &mut tmp_buf,
+            &pq_buf,
+            &omegas_buf,
+            self.k,
+            Some(divisor),
+            Some(&sw),
+        )?;
+        self.extended_ntt_prepare(&mut buf, Some(&sw))?;
+        ntt_raw(
+            &self.device,
+            &mut buf,
+            &mut tmp_buf,
+            &self.extended_ntt_pq_buf,
+            &self.extended_ntt_omegas_buf,
+            self.extended_k,
+            None,
+            Some(&sw),
+        )?;
+
+        Ok((buf, (sw, tmp_buf)))
+    }
+
     fn extended_ntt_wait(
         &mut self,
         last: (CudaStreamWrapper, CudaDeviceBufRaw),
@@ -503,54 +551,6 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     }
 
     Ok((x, xn, h_pieces))
-}
-
-fn logup_transform_extend_coset_async<F: FieldExt>(
-    device: &CudaDevice,
-    values: &[F],
-    beta_buf: &CudaDeviceBufRaw,
-    pq_buf: &CudaDeviceBufRaw,
-    omegas_buf: &CudaDeviceBufRaw,
-    divisor: &CudaDeviceBufRaw,
-    ctx: &mut EvalHContext<F>,
-) -> DeviceResult<(CudaDeviceBufRaw, (CudaStreamWrapper, CudaDeviceBufRaw))> {
-    let (sw, stream) = CudaStreamWrapper::new_with_inner();
-    let mut buf = ctx.alloc()?;
-    device.copy_from_host_to_device_async(&buf, values, stream)?;
-
-    let mut tmp_buf = ctx.alloc()?;
-    field_op::<F>(
-        device,
-        &buf,
-        &buf,
-        ((), beta_buf),
-        ctx.size,
-        FieldOp::Add,
-        Some(stream),
-    )?;
-    ntt_raw(
-        &device,
-        &mut buf,
-        &mut tmp_buf,
-        &pq_buf,
-        &omegas_buf,
-        ctx.k,
-        Some(divisor),
-        Some(&sw),
-    )?;
-    ctx.extended_ntt_prepare(&mut buf, Some(&sw))?;
-    ntt_raw(
-        device,
-        &mut buf,
-        &mut tmp_buf,
-        &ctx.extended_ntt_pq_buf,
-        &ctx.extended_ntt_omegas_buf,
-        ctx.extended_k,
-        None,
-        Some(&sw),
-    )?;
-
-    Ok((buf, (sw, tmp_buf)))
 }
 
 fn evaluate_h_gates_core<'a, C: CurveAffine>(
@@ -821,22 +821,20 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
             theta,
         );
 
-        // calculate inputs_host+beta in advance for input_deg=1
-        let inputs_beta_sets = if input_deg == 1 {
+        // calculate inputs+beta extend coset in advance for input_deg=1
+        let inputs_add_beta_sets = if input_deg == 1 {
             let (inputs_buf_sets, streams): (Vec<_>, Vec<_>) = inputs_sets_host
                 .iter()
                 .map(|set| -> Result<(Vec<_>, Vec<_>), _> {
                     let rst = set
                         .iter()
                         .map(|input| -> DeviceResult<_> {
-                            logup_transform_extend_coset_async(
-                                device,
+                            ctx.ntt_and_extend_ntt_async(
                                 input,
                                 &beta_buf,
                                 &intt_pq_buf,
                                 &intt_omegas_buf,
                                 &intt_divisor_buf,
-                                &mut ctx,
                             )
                         })
                         .collect::<Result<Vec<_>, _>>()?
@@ -901,7 +899,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                     device,
                     &product_buf,
                     &product_sum_buf,
-                    &inputs_beta_sets.as_ref().unwrap()[i],
+                    &inputs_add_beta_sets.as_ref().unwrap()[i],
                     ctx.extended_size,
                     Some(stream),
                 )?;
@@ -921,23 +919,21 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         let table_buf = if table_deg > 1 {
             let (buf, pendings) =
                 ctx.evaluate_prove_expr_with_async_ntt(&vec![table_expr], fixed, advice, instance)?;
-            ctx.extended_ntt_wait(last_waiting)?;
             drop(pendings);
             buf
         } else {
-            let (buf, (sw, tmp_buf)) = logup_transform_extend_coset_async(
-                device,
+            let (buf, (sw, tmp_buf)) = ctx.ntt_and_extend_ntt_async(
                 &table_host[..],
                 &beta_buf,
                 &intt_pq_buf,
                 &intt_omegas_buf,
                 &intt_divisor_buf,
-                &mut ctx,
             )?;
-            ctx.extended_ntt_wait(last_waiting)?;
+
             ctx.extended_ntt_wait((sw, tmp_buf))?;
             buf
         };
+        ctx.extended_ntt_wait(last_waiting)?;
 
         let (sw, stream) = CudaStreamWrapper::new_with_inner();
         unsafe {
