@@ -548,7 +548,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 lookup_device_buffers.insert((i, 2), m_device_buffer);
             }
         };
-        drop(fixed_buffers);
         end_timer!(timer);
 
         // MSM on Mi(x)
@@ -626,177 +625,120 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         // GPU Task: Generate Lookup product
         let timer = start_timer!(|| "generate lookup z");
         {
-            use std::rc::Rc;
-            const MAX_CONCURRENCY: usize = 3;
-            let streams = [0; MAX_CONCURRENCY].map(|_| CudaStreamWrapper::new_with_inner());
-            let mut buffers = [0; MAX_CONCURRENCY].map(|_| {
-                Rc::new([0; 3].map(|_| (device.alloc_device_buffer::<C::Scalar>(size).unwrap())))
-            });
-
             let beta_buf = device.alloc_device_buffer_from_slice(&[beta])?;
-            // remember the previous z's last_value
-            let mut last_z_bufs = (0..lookups.len())
-                .map(|_| device.alloc_device_buffer::<C::Scalar>(1).unwrap())
-                .collect::<Vec<_>>();
+            let tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let last_z_buf = device.alloc_device_buffer::<C::Scalar>(pk.vk.cs.lookups.len())?;
 
-            for ((i, (inputs_sets, table, multiplicity, z_set)), last_z_buf) in
-                lookups.iter_mut().enumerate().zip(last_z_bufs.iter_mut())
+            let mut z_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let mut sum_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+
+            for ((lookup_i, lookup), (_, _, multiplicity, z_set)) in
+                pk.vk.cs.lookups.iter().enumerate().zip(lookups.iter_mut())
             {
-                unsafe {
-                    let idx = i % MAX_CONCURRENCY;
-                    let stream = &streams[idx];
-                    let [z_buf, input_buf, table_buf] = Rc::get_mut(&mut buffers[idx]).unwrap();
+                let mut multiplicity_buf = lookup_device_buffers.remove(&(lookup_i, 2)).unwrap();
+                let table_buf = lookup_device_buffers.remove(&(lookup_i, 1)).unwrap();
 
-                    stream.0.sync();
+                for (set_i, input_sets) in lookup.input_expressions_sets.iter().enumerate() {
+                    for (set_inner_i, input) in input_sets.0.iter().enumerate() {
+                        let input_buf = evaluate_exprs_in_gpu_pure(
+                            &device,
+                            &advice_and_instance_device_buffers,
+                            &mut fixed_buffers,
+                            &input[..],
+                            fixed_ref,
+                            theta,
+                            advices_len,
+                            size,
+                        )?;
 
-                    for (i, input) in inputs_sets[0].iter_mut().enumerate() {
-                        device.copy_from_host_to_device_async(table_buf, input, stream.1)?;
-                        // sum 1 / (input_i + beta)
+                        let timer = start_timer!(|| "logup_sum_input_inv");
                         logup_sum_input_inv(
                             &device,
-                            input_buf,
-                            table_buf,
-                            z_buf,
+                            &sum_buf,
+                            &input_buf,
+                            &tmp_buf,
                             &beta_buf,
-                            i,
+                            set_inner_i,
                             size,
-                            Some(stream.1),
+                            None,
                         )?;
+                        device.synchronize()?;
+                        end_timer!(timer);
                     }
 
-                    for (_, (d_buf, h_buf)) in
-                        [(&mut *table_buf, &mut table[..])].into_iter().enumerate()
-                    {
-                        let buf = lookup_device_buffers.remove(&(i, 1));
-                        match buf {
-                            Some(buf) => {
-                                *d_buf = buf;
-                            }
-                            None => {
-                                device.copy_from_host_to_device_async(&*d_buf, h_buf, stream.1)?;
-                            }
+                    let (mut device_buffers, host_buffers) = if set_i == 0 {
+                        let timer = start_timer!(|| "eval_logup_z");
+                        unsafe {
+                            let err = eval_logup_z(
+                                z_buf.ptr(),
+                                sum_buf.ptr(),
+                                table_buf.ptr(),
+                                multiplicity_buf.ptr(),
+                                beta_buf.ptr(),
+                                last_z_buf
+                                    .ptr()
+                                    .add(lookup_i * core::mem::size_of::<C::Scalar>()),
+                                unusable_rows_start as i32,
+                                size as i32,
+                                0 as _,
+                            );
+
+                            to_result((), err, "failed to run eval_lookup_z")?;
                         }
-                    }
+                        device.synchronize()?;
+                        end_timer!(timer);
 
-                    let mut multiplicity_buf = lookup_device_buffers.remove(&(i, 2)).unwrap();
+                        (
+                            vec![&mut multiplicity_buf, &mut z_buf],
+                            vec![&mut multiplicity[..], &mut z_set[set_i][..]],
+                        )
+                    } else {
+                        let timer = start_timer!(|| "eval_logup_z_pure");
+                        unsafe {
+                            core::mem::swap(&mut z_buf, &mut sum_buf);
+                            let err = eval_logup_z_pure(
+                                z_buf.ptr(),
+                                sum_buf.ptr(),
+                                table_buf.ptr(),
+                                last_z_buf
+                                    .ptr()
+                                    .add(lookup_i * core::mem::size_of::<C::Scalar>()),
+                                unusable_rows_start as i32,
+                                size as i32,
+                                0 as _,
+                            );
 
-                    let err = eval_logup_z(
-                        z_buf.ptr(),
-                        input_buf.ptr(),
-                        table_buf.ptr(),
-                        multiplicity_buf.ptr(),
-                        beta_buf.ptr(),
-                        last_z_buf.ptr(),
-                        unusable_rows_start as i32,
-                        size as i32,
-                        stream.1,
-                    );
+                            to_result((), err, "failed to run eval_lookup_z")?;
+                        }
+                        device.synchronize()?;
+                        end_timer!(timer);
 
-                    to_result((), err, "failed to run eval_lookup_z")?;
+                        (vec![&mut z_buf], vec![&mut z_set[set_i][..]])
+                    };
 
-                    for s_buf in [&mut multiplicity_buf, &mut *z_buf] {
+                    for s_buf in device_buffers.iter_mut() {
                         intt_raw_async(
                             &device,
-                            s_buf,
-                            &mut *input_buf,
+                            *s_buf,
+                            &mut t_buf,
                             &intt_pq_buf,
                             &intt_omegas_buf,
                             &intt_divisor_buf,
                             k,
-                            Some(stream.1),
+                            None,
                         )?;
                     }
 
-                    for (col, s_buf) in [
-                        (&mut multiplicity[..], &multiplicity_buf),
-                        (&mut z_set[0][..], z_buf),
-                    ] {
-                        device.copy_from_device_to_host_async(col, &s_buf, stream.1)?;
+                    for (s_buf, col) in device_buffers.into_iter().zip(host_buffers.into_iter()) {
+                        device.copy_from_device_to_host_async(col, &s_buf, 0 as _)?;
                     }
-                }
-            }
-            for stream in streams.iter() {
-                stream.0.sync()
-            }
-            // assemble the extra inputs set, interleave them to parallel stream
-            // and keep run sequence due to the last_z written by previous inputs&z
-            // e.g. inputs_a=[1,4,7],inputs_b=[2,5],inputs_c=[3,6,8]
-            // interleave to [1,2,3,4,5,6,7,8]=>(stream:instance):[(0,1),(1,2),(2,3),(0,4),(1,5),(2,6),(0,7),(2,8)]
-            // todo try  the build-in interleave
-            let mut buff = vec![];
-            for (lookup_i, (inputs_sets, _, _, z_set)) in lookups.iter_mut().enumerate() {
-                let mut inner = vec![];
-                for (inputs_set, z) in inputs_sets.iter_mut().zip(z_set.iter_mut()).skip(1) {
-                    inner.push((lookup_i, &mut inputs_set[..], &mut z[..]))
-                }
-                if !inner.is_empty() {
-                    buff.push(inner);
-                }
-            }
-            let mut buff = buff.into_iter().map(|v| v.into_iter()).collect::<Vec<_>>();
-            let mut buff_interleave = Vec::new();
-            loop {
-                let mut pushed = false;
-                for (i, v) in buff.iter_mut().enumerate() {
-                    if let Some(value) = v.next() {
-                        buff_interleave.push((i, value));
-                        pushed = true;
-                    }
-                }
-                if !pushed {
-                    break;
+
+                    device.synchronize()?;
                 }
             }
 
-            for (i, (lookup_index, inputs_set, z)) in buff_interleave.iter_mut() {
-                unsafe {
-                    let idx = *i % MAX_CONCURRENCY;
-                    let stream = &streams[idx];
-                    let [z_buf, input_buf, table_buf] = Rc::get_mut(&mut buffers[idx]).unwrap();
-
-                    stream.0.sync();
-
-                    for (i, input) in inputs_set.iter().enumerate() {
-                        device.copy_from_host_to_device_async(input_buf, input, stream.1)?;
-                        logup_sum_input_inv(
-                            &device,
-                            z_buf,
-                            input_buf,
-                            table_buf,
-                            &beta_buf,
-                            i,
-                            size,
-                            Some(stream.1),
-                        )?;
-                    }
-                    let err = eval_logup_z_pure(
-                        z_buf.ptr(),
-                        input_buf.ptr(),
-                        table_buf.ptr(),
-                        last_z_bufs[*lookup_index].ptr(),
-                        unusable_rows_start as i32,
-                        size as i32,
-                        stream.1,
-                    );
-
-                    to_result((), err, "failed to run eval_lookup_z")?;
-
-                    intt_raw_async(
-                        &device,
-                        &mut *z_buf,
-                        &mut *input_buf,
-                        &intt_pq_buf,
-                        &intt_omegas_buf,
-                        &intt_divisor_buf,
-                        k,
-                        Some(stream.1),
-                    )?;
-
-                    device.copy_from_device_to_host_async(&mut z[..], &z_buf, stream.1)?;
-                }
-            }
-
-            drop(streams);
+            drop(fixed_buffers);
 
             if false {
                 let (ntt_omegas_buf, ntt_pq_buf) =
@@ -815,13 +757,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                 */
                 for (inputs_sets, table, m_coeff, zs_coeff) in lookups.iter() {
-                    let [s_buf, tmp_buf, _] = Rc::get_mut(&mut buffers[0]).unwrap();
+                    let mut s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+                    let mut tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+
                     let mut m_lagrange = table.clone();
-                    device.copy_from_host_to_device(s_buf, m_coeff)?;
+                    device.copy_from_host_to_device(&mut s_buf, m_coeff)?;
                     ntt(
                         &device,
-                        s_buf,
-                        tmp_buf,
+                        &mut s_buf,
+                        &mut tmp_buf,
                         &ntt_pq_buf,
                         &ntt_omegas_buf,
                         &mut m_lagrange[..],
@@ -832,11 +776,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         .map(|_| table.clone())
                         .collect::<Vec<_>>();
                     for (z, z_lagrange) in zs_coeff.iter().zip(zs_lagrange.iter_mut()) {
-                        device.copy_from_host_to_device(s_buf, z)?;
+                        device.copy_from_host_to_device(&mut s_buf, z)?;
                         ntt(
                             &device,
-                            s_buf,
-                            tmp_buf,
+                            &mut s_buf,
+                            &mut tmp_buf,
                             &ntt_pq_buf,
                             &ntt_omegas_buf,
                             &mut z_lagrange[..],
@@ -849,8 +793,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     let z_last = zs_lagrange.last().unwrap();
                     // l_0(X) * (z_first(X)) = 0
                     assert_eq!(z_first[0], C::Scalar::zero());
-                    // l_last(X) * (z_last(X)) = 0
-                    assert_eq!(z_last[u], C::Scalar::zero());
                     let mut input_set_sums = inputs_sets
                         .par_iter()
                         .map(|input_set| {
@@ -874,11 +816,14 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         *input = *input - *m * &(*table + beta).invert().unwrap();
                     }
 
-                    for (_, (input_set_sum, z_lag)) in
+                    for (zi, (input_set_sum, z_lag)) in
                         input_set_sums.iter().zip(zs_lagrange.iter()).enumerate()
                     {
                         for (i, input_sum) in input_set_sum.iter().enumerate() {
-                            assert_eq!(z_lag[i + 1], *input_sum + z_lag[i]);
+                            if z_lag[i + 1] != *input_sum + z_lag[i] {
+                                println!("bug at {} {}", zi, i);
+                                assert!(false);
+                            }
                         }
                     }
 
@@ -886,7 +831,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         .iter()
                         .skip(1)
                         .zip(zs_lagrange.iter())
-                        .for_each(|(z, z_pre)| assert_eq!(z[0], z_pre[u]))
+                        .for_each(|(z, z_pre)| assert_eq!(z[0], z_pre[u]));
+
+                    // l_last(X) * (z_last(X)) = 0
+                    assert_eq!(z_last[u], C::Scalar::zero());
                 }
             }
         }
