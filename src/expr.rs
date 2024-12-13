@@ -466,3 +466,30 @@ pub(crate) fn evaluate_exprs_in_gpu_pure<F: FieldExt>(
 
     Ok(res)
 }
+
+pub(crate) fn load_fixed_buffer_into_gpu<F: FieldExt>(
+    device: &CudaDevice,
+    fixed_buffers: &mut HashMap<usize, CudaDeviceBufRaw>,
+    exprs: &[Expression<F>],
+    fixed: &[&[F]],
+) -> DeviceResult<()> {
+    for e in exprs {
+        let pe = ProveExpression::<F>::from_expr(e);
+        for (units, _) in flatten_prove_expression(pe) {
+            for (unit, _) in units {
+                match unit {
+                    ProveExpressionUnit::Fixed { column_index, .. }
+                        if !fixed_buffers.contains_key(&column_index) =>
+                    {
+                        let buf =
+                            device.alloc_device_buffer_from_slice(&fixed[column_index][..])?;
+                        fixed_buffers.insert(column_index, buf);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(())
+}

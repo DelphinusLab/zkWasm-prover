@@ -49,6 +49,7 @@ use crate::device::cuda::CUDA_BUFFER_ALLOCATOR;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
 use crate::expr::is_expression_pure_unit;
+use crate::expr::load_fixed_buffer_into_gpu;
 use crate::hugetlb::print_pinned_cache_info;
 use crate::hugetlb::HugePageAllocator;
 use crate::multiopen::gwc;
@@ -230,19 +231,7 @@ pub fn create_proof_from_advices_with_shplonk<
     _create_proof_from_advices(params, pk, instances, advices, transcript, false)
 }
 
-fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
-    params: &Params<C>,
-    pk: &ProvingKey<C>,
-    instances: &[&[C::Scalar]],
-    mut advices: Arc<Vec<Vec<C::Scalar, HugePageAllocator>>>,
-    transcript: &mut T,
-    use_gwc: bool,
-) -> Result<(), Error> {
-    if pk.ev.gpu_gates_expr.len() != 1 {
-        println!("Multi-GPU detected, please set CUDA_VISIBLE_DEVICES to use one GPU");
-        assert!(false);
-    }
-
+fn print_prove_info<C: CurveAffine>(pk: &ProvingKey<C>) -> Result<(), Error> {
     println!(
         "permutation groups is {}",
         (&pk)
@@ -273,20 +262,36 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         pk.vk.cs.shuffles.group(pk.vk.cs.degree()).len()
     );
 
+    println!("k is {}", pk.get_vk().domain.k());
+
+    print_pinned_cache_info();
+
+    let device = CudaDevice::get_device(0).unwrap();
+    device.synchronize()?;
+    device.print_memory_info()?;
+
+    Ok(())
+}
+
+fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
+    params: &Params<C>,
+    pk: &ProvingKey<C>,
+    instances: &[&[C::Scalar]],
+    mut advices: Arc<Vec<Vec<C::Scalar, HugePageAllocator>>>,
+    transcript: &mut T,
+    use_gwc: bool,
+) -> Result<(), Error> {
+    if pk.ev.gpu_gates_expr.len() != 1 {
+        println!("Multi-GPU detected, please set CUDA_VISIBLE_DEVICES to use one GPU");
+        assert!(false);
+    }
+
     let gpu_reserve_chuncks = std::env::var("ZKWASM_PROVER_GPU_RESERVE_CHUNCKS")
         .ok()
         .and_then(|s| usize::from_str_radix(&s, 10).ok())
         .unwrap_or(144);
 
     thread::scope(|s| {
-        let timer = start_timer!(|| "proof prepare");
-        let k = pk.get_vk().domain.k() as usize;
-        let size = 1 << pk.get_vk().domain.k();
-        let advices_len = advices.len();
-        let instances_len = instances.len();
-        println!("k is {}", k);
-        print_pinned_cache_info();
-
         {
             let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
             allocator.reset(
@@ -295,6 +300,12 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             );
         }
 
+        let timer = start_timer!(|| "proof prepare");
+
+        let k = pk.get_vk().domain.k() as usize;
+        let size = 1 << pk.get_vk().domain.k();
+        let advices_len = advices.len();
+        let instances_len = instances.len();
         let meta = &pk.vk.cs;
         let unusable_rows_start = size - (meta.blinding_factors() + 1);
         let domain = &pk.vk.domain;
@@ -315,11 +326,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .collect::<Vec<_>>(),
         );
 
-        let device = CudaDevice::get_device(0).unwrap();
-
-        device.synchronize()?;
-        device.print_memory_info()?;
-
         let named = &pk.vk.cs.named_advices;
         unsafe { Arc::get_mut_unchecked(&mut advices) }
             .par_iter_mut()
@@ -329,6 +335,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     fill_random(&mut advice[unusable_rows_start..]);
                 }
             });
+
+        let device = CudaDevice::get_device(0).unwrap();
 
         let (intt_omegas_buf, intt_pq_buf) =
             ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
@@ -343,6 +351,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             uninvolved_units_after_shuffle,
         ) = analyze_involved_advices(pk);
         end_timer!(timer);
+
+        print_prove_info(pk)?;
 
         let timer = start_timer!(|| "copy g_lagrange buffer");
         let g_buf = device
@@ -408,12 +418,35 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let (mut lookups, permutations, shuffles, random_poly) = buffer_handler.join().unwrap();
         end_timer!(timer);
 
+        let mut fixed_buffers = std::collections::HashMap::new();
+        {
+            let timer = start_timer!(|| "load fixed values for lookup Mi(x)");
+            let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+            for (_, lookup) in pk.vk.cs.lookups.iter().enumerate() {
+                load_fixed_buffer_into_gpu(
+                    &device,
+                    &mut fixed_buffers,
+                    &lookup.table_expressions[..],
+                    fixed_ref,
+                )?;
+
+                for (_, input_sets) in lookup.input_expressions_sets.iter().enumerate() {
+                    for (_, input) in input_sets.0.iter().enumerate() {
+                        load_fixed_buffer_into_gpu(
+                            &device,
+                            &mut fixed_buffers,
+                            &input[..],
+                            fixed_ref,
+                        )?;
+                    }
+                }
+            }
+            end_timer!(timer);
+        }
+
         let timer = start_timer!(|| "calc lookup Mi(x)");
         let mut lookup_device_buffers = HashMap::new();
         {
-            let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let mut fixed_buffers = std::collections::HashMap::new();
-
             let index_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
             let sorted_index_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
             let start_offset_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
@@ -425,6 +458,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let (calc_sw, calc_stream) = CudaStreamWrapper::new_with_inner();
             let (copy_sw, copy_stream) = CudaStreamWrapper::new_with_inner();
 
+            let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
             for (i, lookup) in pk.vk.cs.lookups.iter().enumerate() {
                 let m_device_buffer = device.alloc_device_buffer::<C::Scalar>(size)?;
 
@@ -468,6 +502,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                 for (set_i, input_sets) in lookup.input_expressions_sets.iter().enumerate() {
                     for (set_inner_i, input) in input_sets.0.iter().enumerate() {
+                        // calc about 20us for k22 in RTX4090
                         let input_device_buffer = evaluate_exprs_in_gpu_pure(
                             &device,
                             &advice_and_instance_device_buffers,
@@ -485,6 +520,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             copy_stream,
                         )?;
 
+                        // calc about 1ms for k22 in RTX4090
                         unsafe {
                             let res = crate::cuda::bn254_c::calc_m(
                                 m_device_buffer.ptr(),
@@ -503,7 +539,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                             assert!(res == cudaError::cudaSuccess);
                         }
-
                         calc_sw.sync();
                         copy_sw.sync();
                     }
@@ -514,9 +549,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             }
         };
         end_timer!(timer);
+        drop(fixed_buffers);
 
         // MSM on Mi(x)
-        let timer = start_timer!(|| "msm and intt Mi(x)");
+        let timer = start_timer!(|| "lookup Mi(x) msm");
         let mut buffers = unsafe {
             Arc::get_mut_unchecked(&mut advices)
                 .iter_mut()
