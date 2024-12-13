@@ -446,6 +446,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         let timer = start_timer!(|| "calc lookup Mi(x)");
         let mut lookup_device_buffers = HashMap::new();
+        let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
         {
             let index_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
             let sorted_index_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
@@ -458,7 +459,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             let (calc_sw, calc_stream) = CudaStreamWrapper::new_with_inner();
             let (copy_sw, copy_stream) = CudaStreamWrapper::new_with_inner();
 
-            let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
             for (i, lookup) in pk.vk.cs.lookups.iter().enumerate() {
                 let m_device_buffer = device.alloc_device_buffer::<C::Scalar>(size)?;
 
@@ -548,67 +548,20 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 lookup_device_buffers.insert((i, 2), m_device_buffer);
             }
         };
-        end_timer!(timer);
         drop(fixed_buffers);
+        end_timer!(timer);
 
         // MSM on Mi(x)
         let timer = start_timer!(|| "lookup Mi(x) msm");
-        let mut buffers = unsafe {
-            Arc::get_mut_unchecked(&mut advices)
-                .iter_mut()
-                .enumerate()
-                .filter(|(i, _)| {
-                    uninvolved_units_after_single_lookup.contains(i)
-                        || uninvolved_units_after_tuple_lookup.contains(i)
-                })
-                .map(|(_, x)| &mut x[..])
-                .collect::<Vec<_>>()
-        };
-
-        let mut s_bufs: Vec<_> = (0..advices_len)
-            .into_iter()
-            .filter(|i| {
-                uninvolved_units_after_single_lookup.contains(i)
-                    || uninvolved_units_after_tuple_lookup.contains(i)
-            })
-            .map(|i| advice_and_instance_device_buffers.remove(&i).unwrap())
-            .collect();
-
-        let (sw, stream) = CudaStreamWrapper::new_with_inner();
-
         let lookup_multiplicity_commitments = crate::cuda::msm::batch_msm_ext::<C, _>(
             &device,
             &g_lagrange_buf,
             (0..pk.vk.cs.lookups.len())
                 .map(|i| lookup_device_buffers.get(&(i, 2)).unwrap())
                 .collect(),
-            &mut || {
-                let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
-                for s_buf in s_bufs.iter_mut() {
-                    intt_raw_async(
-                        &device,
-                        s_buf,
-                        &mut t_buf,
-                        &intt_pq_buf,
-                        &intt_omegas_buf,
-                        &intt_divisor_buf,
-                        k,
-                        None,
-                    )
-                    .unwrap();
-                }
-                for (dev_buf, host_buf) in s_bufs.iter().zip(buffers.iter_mut()) {
-                    device
-                        .copy_from_device_to_host_async(host_buf, dev_buf, stream)
-                        .unwrap();
-                }
-            },
+            &mut || {},
             size,
         )?;
-
-        drop(sw);
-        drop(s_bufs);
-        drop(buffers);
         end_timer!(timer);
 
         for commitment in lookup_multiplicity_commitments.into_iter() {
@@ -937,23 +890,72 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 }
             }
         }
-
         end_timer!(timer);
-        let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
-        let mut lookup_z_and_random_commitments = crate::cuda::msm::batch_msm::<C, _>(
-            &device,
-            &g_buf,
-            lookups
-                .iter()
-                .flat_map(|x| x.3.iter().map(|v| &v[..]))
-                .chain([&random_poly[..]])
-                .collect::<Vec<_>>(),
-            size,
-        )?;
 
-        let random_commitment = lookup_z_and_random_commitments.pop().unwrap();
-        let lookup_z_commitments = lookup_z_and_random_commitments;
-        end_timer!(timer);
+        let (lookup_z_commitments, random_commitment) = {
+            let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
+            let (sw, stream) = CudaStreamWrapper::new_with_inner();
+
+            let mut buffers = unsafe {
+                Arc::get_mut_unchecked(&mut advices)
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(i, _)| {
+                        uninvolved_units_after_single_lookup.contains(i)
+                            || uninvolved_units_after_tuple_lookup.contains(i)
+                    })
+                    .map(|(_, x)| &mut x[..])
+                    .collect::<Vec<_>>()
+            };
+
+            let mut s_bufs: Vec<_> = (0..advices_len)
+                .into_iter()
+                .filter(|i| {
+                    uninvolved_units_after_single_lookup.contains(i)
+                        || uninvolved_units_after_tuple_lookup.contains(i)
+                })
+                .map(|i| advice_and_instance_device_buffers.remove(&i).unwrap())
+                .collect();
+
+            let mut lookup_z_and_random_commitments = crate::cuda::msm::batch_msm_ext::<C, _>(
+                &device,
+                &g_buf,
+                lookups
+                    .iter()
+                    .flat_map(|x| x.3.iter().map(|v| &v[..]))
+                    .chain([&random_poly[..]])
+                    .collect::<Vec<_>>(),
+                &mut || {
+                    let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
+                    for s_buf in s_bufs.iter_mut() {
+                        intt_raw_async(
+                            &device,
+                            s_buf,
+                            &mut t_buf,
+                            &intt_pq_buf,
+                            &intt_omegas_buf,
+                            &intt_divisor_buf,
+                            k,
+                            None,
+                        )
+                        .unwrap();
+                    }
+                    for (dev_buf, host_buf) in s_bufs.iter().zip(buffers.iter_mut()) {
+                        device
+                            .copy_from_device_to_host_async(host_buf, dev_buf, stream)
+                            .unwrap();
+                    }
+                },
+                size,
+            )?;
+            drop(sw);
+            drop(buffers);
+            drop(s_bufs);
+            end_timer!(timer);
+
+            let random_commitment = lookup_z_and_random_commitments.pop().unwrap();
+            (lookup_z_and_random_commitments, random_commitment)
+        };
 
         let timer = start_timer!(|| "wait permutation_products");
         let mut permutation_products = permutation_products_handler.join().unwrap();
