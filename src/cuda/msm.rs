@@ -231,12 +231,12 @@ pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
 
     drop(streams);
 
-    (before_final_round)();
-
     let (sw, stream) = CudaStreamWrapper::new_with_inner();
     for (i, buffer) in pending_copy_queue.iter() {
         device.copy_from_device_to_host_async(&mut scalar_buf[*i][..], &buffer, stream)?;
     }
+
+    (before_final_round)();
 
     let res = batch_msm_acc(
         device,

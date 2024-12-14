@@ -803,7 +803,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         .enumerate()
     {
         let sets_len = lookup.input_expressions_sets.len();
-        let mut input_deg = 1;
+        let mut input_deg = 2;
         lookup.input_expressions_sets.iter().for_each(|set| {
             set.0.iter().for_each(|input| {
                 input_deg = input_deg.max(get_expr_degree(input));

@@ -957,6 +957,35 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "permutation z msm and intt & advice intt");
+        let (sw, stream) = CudaStreamWrapper::new_with_inner();
+        let mut s_bufs: Vec<_> = (0..advices_len)
+            .into_iter()
+            .filter(|i| uninvolved_units_after_permutation.contains(i))
+            .map(|i| advice_and_instance_device_buffers.remove(&i).unwrap())
+            .collect();
+
+        {
+            let timer =
+                start_timer!(|| format!("INTT on permutation involved advices {}", s_bufs.len()));
+            let mut t_buf = device
+                .alloc_device_buffer_non_zeroed::<C::Scalar>(size)
+                .unwrap();
+            for s_buf in s_bufs.iter_mut() {
+                intt_raw_async(
+                    &device,
+                    s_buf,
+                    &mut t_buf,
+                    &intt_pq_buf,
+                    &intt_omegas_buf,
+                    &intt_divisor_buf,
+                    k,
+                    Some(stream),
+                )?;
+            }
+            sw.sync();
+            end_timer!(timer);
+        }
+
         let mut buffers = unsafe {
             Arc::get_mut_unchecked(&mut advices)
                 .iter_mut()
@@ -965,14 +994,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .map(|(_, x)| &mut x[..])
                 .collect::<Vec<_>>()
         };
-
-        let mut s_bufs: Vec<_> = (0..advices_len)
-            .into_iter()
-            .filter(|i| uninvolved_units_after_permutation.contains(i))
-            .map(|i| advice_and_instance_device_buffers.remove(&i).unwrap())
-            .collect();
-
-        let (sw, stream) = CudaStreamWrapper::new_with_inner();
 
         let (permutation_commitments, _) = crate::cuda::msm::batch_msm_and_intt_ext::<C>(
             &device,
@@ -990,23 +1011,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             },
             &|_| false,
             &mut || {
-                let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
-                for s_buf in s_bufs.iter_mut() {
-                    intt_raw_async(
-                        &device,
-                        s_buf,
-                        &mut t_buf,
-                        &intt_pq_buf,
-                        &intt_omegas_buf,
-                        &intt_divisor_buf,
-                        k,
-                        None,
-                    )
-                    .unwrap();
-                }
-                for (dev_buf, host_buf) in s_bufs.iter().zip(buffers.iter_mut()) {
-                    device
-                        .copy_from_device_to_host_async(host_buf, dev_buf, stream)
+                for (dev_buf, host_buf) in s_bufs.iter_mut().zip(buffers.iter_mut()) {
+                    copy_queue
+                        .push_with_new_buffer(&device, dev_buf, *host_buf, size)
                         .unwrap();
                 }
             },
