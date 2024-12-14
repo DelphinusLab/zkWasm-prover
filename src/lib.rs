@@ -417,7 +417,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             advice_and_instance_device_buffers
         };
 
-        log::debug!(
+        info!(
             "advice_and_instance_device_buffers size is {}",
             advice_and_instance_device_buffers.len()
         );

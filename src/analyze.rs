@@ -92,6 +92,7 @@ pub(crate) fn analyze_expr_tree<F: FieldExt>(
 //     return [single_unit_lookups, single_comp_lookups, tuple_lookups];
 // }
 
+/*
 pub(crate) fn lookup_classify<'a, 'b, C: CurveAffine, T>(
     pk: &'b ProvingKey<C>,
     lookups_buf: Vec<T>,
@@ -117,6 +118,7 @@ pub(crate) fn lookup_classify<'a, 'b, C: CurveAffine, T>(
 
     return [single_lookups, tuple_lookups];
 }
+*/
 
 // pub(crate) fn lookup_single_classify<'a, 'b, C: CurveAffine, T,U>(
 //     pk: &'b ProvingKey<C>,

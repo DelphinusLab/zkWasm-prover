@@ -109,6 +109,15 @@ pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
 
     let msm_count = scalar_buf.len();
 
+    // Allocated at first to make device memory more continuous.
+    let mut cache_bufs = vec![];
+    for i in 0..msm_count {
+        if (cache_buffer_selector)(i) {
+            let buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?;
+            cache_bufs.push(buf);
+        }
+    }
+
     let mut cached_buffer = HashMap::new();
 
     // k22, 8, 13bits is best for RTX4090
@@ -128,27 +137,25 @@ pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
     ];
 
     let mut scalar_dev_bufs = [
-        device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
-        device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
+        device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?,
+        device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?,
     ];
 
     let mut intt_tmp_bufs = [
-        device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
-        device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
+        device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?,
+        device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?,
     ];
 
     // About 30MB per MSM
     // layout: | bucktes | msm worker remain | collect worker remain |
     let curve_buf_size = bucket_size + worker * 2;
-    let curve_buf = device
-        .alloc_device_buffer_non_zeroed::<C::Curve>(msm_count * curve_buf_size)
-        .unwrap();
+    let curve_buf =
+        device.alloc_device_buffer_non_zeroed::<C::Curve>(msm_count * curve_buf_size)?;
     let single_sort_indices_size = len * windows;
     let sort_temp_storage_size = single_sort_indices_size * 3; // ~2N = 2 * windows * len, pick 32 as upper bound
 
-    let sort_indices_temp_storage_buf = device
-        .alloc_device_buffer_non_zeroed::<u32>(sort_temp_storage_size)
-        .unwrap();
+    let sort_indices_temp_storage_buf =
+        device.alloc_device_buffer_non_zeroed::<u32>(sort_temp_storage_size)?;
 
     let indices_buf = [0; 4].map(|_| {
         device
@@ -159,8 +166,9 @@ pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
     let acc_indices_buf = (0..msm_count)
         .into_iter()
         .map(|_| device.alloc_device_buffer_non_zeroed::<u32>(worker * 2))
-        .collect::<DeviceResult<Vec<_>>>()
-        .unwrap();
+        .collect::<DeviceResult<Vec<_>>>()?;
+
+    let mut pending_copy_queue = vec![];
 
     for i in 0..msm_count {
         let idx = i & 1;
@@ -169,28 +177,8 @@ pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
         let last_stream = &streams[1 - idx];
         stream.0.sync();
 
-        device
-            .copy_from_host_to_device_async(scalar_dev_buf, &scalar_buf[i][..], stream.1)
-            .unwrap();
+        device.copy_from_host_to_device_async(scalar_dev_buf, &scalar_buf[i][..], stream.1)?;
         last_stream.0.sync(); // sync to reuse sort_indices_buf
-
-        // copy the last buf
-        if i > 0 {
-            if (intt_args.selector)(i - 1) {
-                device
-                    .copy_from_device_to_host_async(
-                        &mut scalar_buf[i - 1][..],
-                        &scalar_dev_bufs[1 - idx],
-                        streams[1 - idx].1,
-                    )
-                    .unwrap();
-            }
-            if (cache_buffer_selector)(i - 1) {
-                let mut buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(len).unwrap();
-                mem::swap(&mut scalar_dev_bufs[1 - idx], &mut buf);
-                cached_buffer.insert(i - 1, buf);
-            }
-        }
 
         let scalar_dev_buf = &scalar_dev_bufs[idx];
         unsafe {
@@ -217,6 +205,7 @@ pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
         }
 
         if (intt_args.selector)(i) {
+            assert!(!(cache_buffer_selector)(i));
             intt_raw_async(
                 device,
                 &mut scalar_dev_bufs[idx],
@@ -226,34 +215,28 @@ pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
                 intt_args.divisor_buf,
                 intt_args.len_log,
                 Some(stream.1),
-            )
-            .unwrap();
-        }
-    }
+            )?;
 
-    {
-        let idx = 1 - (msm_count & 1);
-
-        if (intt_args.selector)(msm_count - 1) {
-            device
-                .copy_from_device_to_host_async(
-                    &mut scalar_buf[msm_count - 1][..],
-                    &scalar_dev_bufs[idx],
-                    streams[idx].1,
-                )
-                .unwrap();
-        }
-
-        if (cache_buffer_selector)(msm_count - 1) {
-            let mut buf = device.alloc_device_buffer::<C::Scalar>(len).unwrap();
+            let mut buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?;
             mem::swap(&mut scalar_dev_bufs[idx], &mut buf);
-            cached_buffer.insert(msm_count - 1, buf);
+            pending_copy_queue.push((i, buf));
+        }
+
+        if (cache_buffer_selector)(i) {
+            let mut buf = cache_bufs.pop().unwrap();
+            mem::swap(&mut scalar_dev_bufs[idx], &mut buf);
+            cached_buffer.insert(i, buf);
         }
     }
 
     drop(streams);
 
     (before_final_round)();
+
+    let (sw, stream) = CudaStreamWrapper::new_with_inner();
+    for (i, buffer) in pending_copy_queue.iter() {
+        device.copy_from_device_to_host_async(&mut scalar_buf[*i][..], &buffer, stream)?;
+    }
 
     let res = batch_msm_acc(
         device,
@@ -265,6 +248,8 @@ pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
         bucket_size,
         curve_buf_size,
     )?;
+
+    sw.sync();
 
     Ok((res, cached_buffer))
 }
@@ -312,23 +297,21 @@ pub(crate) fn batch_msm_ext<C: CurveAffine, B: ToDevBuffer>(
     ];
 
     let scalar_dev_bufs = [
-        device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
-        device.alloc_device_buffer::<C::Scalar>(len).unwrap(),
+        device.alloc_device_buffer::<C::Scalar>(len)?,
+        device.alloc_device_buffer::<C::Scalar>(len)?,
     ];
 
     // About 30MB per MSM
     // layout: | bucktes | msm worker remain | collect worker remain |
     let curve_buf_size = bucket_size + worker * 2;
-    let curve_buf = device
-        .alloc_device_buffer_non_zeroed::<C::Curve>(msm_count * curve_buf_size)
-        .unwrap();
+    let curve_buf =
+        device.alloc_device_buffer_non_zeroed::<C::Curve>(msm_count * curve_buf_size)?;
 
     let single_sort_indices_size = len * windows;
     let sort_temp_storage_size = single_sort_indices_size * 3; // ~2N = 2 * windows * len, pick 32 as upper bound
 
-    let sort_indices_temp_storage_buf = device
-        .alloc_device_buffer_non_zeroed::<u32>(sort_temp_storage_size)
-        .unwrap();
+    let sort_indices_temp_storage_buf =
+        device.alloc_device_buffer_non_zeroed::<u32>(sort_temp_storage_size)?;
 
     let indices_buf = [0; 4].map(|_| {
         device
