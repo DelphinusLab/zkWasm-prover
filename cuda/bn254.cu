@@ -15,6 +15,34 @@ typedef Curve<Bn254FpField> Bn254G1;
 #include "zprize_ec_wrapper.cuh"
 #endif
 
+__global__ void batch_add_beta_invert_kernel(
+    Bn254FrField *z,
+    Bn254FrField *tmp,
+    const Bn254FrField *beta_ptr,
+    int size_per_worker)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    Bn254FrField t(1);
+    Bn254FrField u(1);
+    Bn254FrField beta = beta_ptr[0];
+    for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++)
+    {
+        u = t * (z[j] + beta);
+        tmp[j] = t;
+        t = u;
+    }
+
+    t = t.inv();
+
+    for (int j = i * size_per_worker + size_per_worker - 1; j >= i * size_per_worker; j--)
+    {
+        u = z[j] + beta;
+        z[j] = t * tmp[j];
+        t = t * u;
+        tmp[j] = u;
+    }
+}
+
 __global__ void batch_invert_kernel(
     Bn254FrField *z,
     Bn254FrField *tmp,
@@ -48,19 +76,21 @@ __global__ void _eval_logup_z_grand_sum_batch(
     int size_per_worker)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i != 0)
+
+    Bn254FrField t(0);
+    for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++)
     {
-        i--;
-        Bn254FrField t(0);
-        for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++)
-        {
-            t += z[j];
-        }
+        t += z[j];
+        z[j] = t - z[j];
+    }
+
+    if (i != gridDim.x * blockDim.x - 1)
+    {
         res[i + 1] = t;
     }
     else
     {
-        res[i] = Bn254FrField(0);
+        res[0] = Bn254FrField(0);
     }
 }
 __global__ void _eval_logup_z_grand_sum_batch_init(
@@ -117,17 +147,11 @@ __global__ void _eval_logup_z_grand_sum_batch_spread_skip(
     int size_per_worker)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    Bn254FrField t = res[i];
-    Bn254FrField u;
-    for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++)
+    Bn254FrField t = res[i / size_per_worker];
+    z[i] += t;
+    if (i == last_z_index)
     {
-        u = z[j] + t;
-        z[j] = t;
-        if (j == last_z_index)
-        {
-            last_z[0] = z[j];
-        }
-        t = u;
+        last_z[0] = z[i];
     }
 }
 
@@ -2081,7 +2105,7 @@ extern "C"
         _eval_logup_z_grand_sum_batch_spread<<<mid_blocks, mid_threads, 0, stream>>>(
             input, table, mid_size_per_worker);
 
-        _eval_logup_z_grand_sum_batch_spread_skip<<<blocks, threads, 0, stream>>>(
+        _eval_logup_z_grand_sum_batch_spread_skip<<<n / threads, threads, 0, stream>>>(
             z, input, last_z, last_z_index, size_per_worker);
 
         return cudaGetLastError();
@@ -2100,13 +2124,11 @@ extern "C"
     {
         int threads = n >= 64 ? 64 : 1;
         int blocks = n / threads;
-        _eval_logup_add_c<<<blocks, threads, 0, stream>>>(
-            table, beta);
 
-        int worker = 64 * 128;
+        int worker = 16 * 1024;
         int size_per_worker = n / worker;
-        batch_invert_kernel<<<128, 64, 0, stream>>>(
-            table, z, size_per_worker);
+        batch_add_beta_invert_kernel<<<1024, 16, 0, stream>>>(
+            table, z, beta, size_per_worker);
 
         _eval_logup_z_step2<<<blocks, threads, 0, stream>>>(
             z, input, table, multiplicity);
