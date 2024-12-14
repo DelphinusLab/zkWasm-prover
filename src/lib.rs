@@ -35,6 +35,7 @@ use halo2_proofs::poly::commitment::Params;
 use halo2_proofs::poly::Rotation;
 use halo2_proofs::transcript::EncodedChallenge;
 use halo2_proofs::transcript::TranscriptWrite;
+use log::{debug, error, info};
 use permutation::generate_permutation_product;
 use rayon::prelude::*;
 use shuffle::generate_shuffle_product;
@@ -236,7 +237,7 @@ pub fn create_proof_from_advices_with_shplonk<
 }
 
 fn print_prove_info<C: CurveAffine>(pk: &ProvingKey<C>) -> Result<(), Error> {
-    println!(
+    info!(
         "permutation groups is {}",
         (&pk)
             .vk
@@ -254,19 +255,19 @@ fn print_prove_info<C: CurveAffine>(pk: &ProvingKey<C>) -> Result<(), Error> {
         .iter()
         .map(|lookup| lookup.input_expressions_sets.len())
         .collect::<Vec<_>>();
-    println!(
+    info!(
         "lookups len={}, sets={:?}",
         pk.vk.cs.lookups.len(),
         _lookup_sets
     );
 
-    println!(
+    info!(
         "product shuffles total={}, group={}",
         (&pk).vk.cs.shuffles.0.len(),
         pk.vk.cs.shuffles.group(pk.vk.cs.degree()).len()
     );
 
-    println!("k is {}", pk.get_vk().domain.k());
+    info!("k is {}", pk.get_vk().domain.k());
 
     print_pinned_cache_info();
 
@@ -286,7 +287,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
     use_gwc: bool,
 ) -> Result<(), Error> {
     if pk.ev.gpu_gates_expr.len() != 1 {
-        println!("Multi-GPU detected, please set CUDA_VISIBLE_DEVICES to use one GPU");
+        error!("Multi-GPU detected, please set CUDA_VISIBLE_DEVICES to use one GPU");
         assert!(false);
     }
 
@@ -416,10 +417,16 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             advice_and_instance_device_buffers
         };
 
+        log::debug!(
+            "advice_and_instance_device_buffers size is {}",
+            advice_and_instance_device_buffers.len()
+        );
+
         let theta: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
         let timer = start_timer!(|| "wait prepare buffers");
         let (mut lookups, permutations, shuffles, random_poly) = buffer_handler.join().unwrap();
+        let random_buffer = device.alloc_device_buffer_from_slice(&random_poly[..])?;
         end_timer!(timer);
 
         let mut fixed_buffers = std::collections::HashMap::new();
@@ -448,6 +455,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             end_timer!(timer);
         }
 
+        info!("fixed_buffers size is {}", fixed_buffers.len());
+
         let timer = start_timer!(|| "calc lookup Mi(x)");
         let mut lookup_device_buffers = HashMap::new();
         let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
@@ -465,7 +474,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             for (i, lookup) in pk.vk.cs.lookups.iter().enumerate() {
                 let m_device_buffer = device.alloc_device_buffer::<C::Scalar>(size)?;
 
-                let timer = start_timer!(|| "eval table");
+                // let timer = start_timer!(|| "eval table");
                 let table_device_buffer = evaluate_exprs_in_gpu_pure(
                     &device,
                     &advice_and_instance_device_buffers,
@@ -476,9 +485,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     advices_len,
                     size,
                 )?;
-                end_timer!(timer);
+                // end_timer!(timer);
 
-                let timer = start_timer!(|| "prepare_table_lookup");
+                // let timer = start_timer!(|| "prepare_table_lookup");
                 unsafe {
                     let res = crate::cuda::bn254_c::prepare_table_lookup(
                         table_device_buffer.ptr(),
@@ -497,13 +506,13 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     assert!(res == cudaError::cudaSuccess);
                 }
                 calc_sw.sync();
-                end_timer!(timer);
+                // end_timer!(timer);
 
                 for (_, input_sets) in lookup.input_expressions_sets.iter().enumerate() {
                     for (_, input) in input_sets.0.iter().enumerate() {
                         // calc about 20us for k22 in RTX4090
 
-                        let timer = start_timer!(|| "eval input");
+                        // let timer = start_timer!(|| "eval input");
                         let input_device_buffer = evaluate_exprs_in_gpu_pure(
                             &device,
                             &advice_and_instance_device_buffers,
@@ -514,11 +523,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             advices_len,
                             size,
                         )?;
-                        end_timer!(timer);
+                        // end_timer!(timer);
 
                         // calc about 1ms for k22 in RTX4090
 
-                        let timer = start_timer!(|| "calc_m");
+                        // let timer = start_timer!(|| "calc_m");
                         unsafe {
                             let res = crate::cuda::bn254_c::calc_m(
                                 m_device_buffer.ptr(),
@@ -538,7 +547,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             assert!(res == cudaError::cudaSuccess);
                         }
                         calc_sw.sync();
-                        end_timer!(timer);
+                        // end_timer!(timer);
                     }
                 }
 
@@ -547,6 +556,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             }
         };
         end_timer!(timer);
+
+        debug!(
+            "lookup_device_buffers size is {}",
+            lookup_device_buffers.len()
+        );
 
         // MSM on Mi(x)
         let timer = start_timer!(|| "lookup Mi(x) msm");
@@ -620,18 +634,19 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             shuffle_products_handler
         };
 
-        let mut copy_queue = AsyncCopyQueue::new(32);
+        let mut copy_queue = AsyncCopyQueue::new(28);
 
         // GPU Task: Generate Lookup product
+        let mut z_buffers = vec![];
         let timer = start_timer!(|| "generate lookup z");
         {
             let beta_buf = device.alloc_device_buffer_from_slice(&[beta])?;
-            let tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-            let last_z_buf = device.alloc_device_buffer::<C::Scalar>(pk.vk.cs.lookups.len())?;
 
-            let mut z_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-            let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-            let mut sum_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let last_z_buf = device.alloc_device_buffer::<C::Scalar>(pk.vk.cs.lookups.len())?;
+            let tmp_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
+            let mut z_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
+            let mut t_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
+            let mut sum_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
 
             let (calc_sw, calc_stream) = CudaStreamWrapper::new_with_inner();
 
@@ -641,15 +656,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 let mut multiplicity_buf = lookup_device_buffers.remove(&(lookup_i, 2)).unwrap();
                 let table_buf = lookup_device_buffers.remove(&(lookup_i, 1)).unwrap();
 
-                let timer = start_timer!(|| "copy table");
+                //let timer = start_timer!(|| "copy table");
                 if get_expr_degree(&lookup.table_expressions) == 1 {
                     copy_queue.push_with_copy_buffer(&device, &table_buf, &mut table[..], size)?;
                 }
-                end_timer!(timer);
+                //end_timer!(timer);
 
                 for (set_i, input_sets) in lookup.input_expressions_sets.iter().enumerate() {
                     for (set_inner_i, input_expr) in input_sets.0.iter().enumerate() {
-                        let timer = start_timer!(|| "eval input");
+                        //let timer = start_timer!(|| "eval input");
                         let input_buf = evaluate_exprs_in_gpu_pure(
                             &device,
                             &advice_and_instance_device_buffers,
@@ -660,20 +675,20 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             advices_len,
                             size,
                         )?;
-                        end_timer!(timer);
+                        //end_timer!(timer);
 
                         if get_expr_degree(input_expr) == 1 {
-                            let timer = start_timer!(|| "copy input");
+                            //let timer = start_timer!(|| "copy input");
                             copy_queue.push_with_copy_buffer(
                                 &device,
                                 &input_buf,
                                 &mut input[set_i][set_inner_i][..],
                                 size,
                             )?;
-                            end_timer!(timer);
+                            //end_timer!(timer);
                         }
 
-                        let timer = start_timer!(|| "logup_sum_input_inv");
+                        //let timer = start_timer!(|| "logup_sum_input_inv");
                         logup_sum_input_inv(
                             &device,
                             &sum_buf,
@@ -686,11 +701,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         )?;
 
                         calc_sw.sync();
-                        end_timer!(timer);
+                        //end_timer!(timer);
                     }
 
-                    let (device_buffers, host_buffers) = if set_i == 0 {
-                        let timer = start_timer!(|| "eval_logup_z");
+                    let intt_tasks = if set_i == 0 {
+                        //let timer = start_timer!(|| "eval_logup_z");
                         unsafe {
                             let err = eval_logup_z(
                                 z_buf.ptr(),
@@ -709,14 +724,14 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             to_result((), err, "failed to run eval_logup_z")?;
                         }
                         calc_sw.sync();
-                        end_timer!(timer);
+                        //end_timer!(timer);
 
-                        (
-                            vec![&mut multiplicity_buf, &mut z_buf],
-                            vec![&mut multiplicity[..], &mut z_set[set_i][..]],
-                        )
+                        vec![
+                            (&mut multiplicity_buf, &mut multiplicity[..], true),
+                            (&mut z_buf, &mut z_set[set_i][..], false),
+                        ]
                     } else {
-                        let timer = start_timer!(|| "eval_logup_z_pure");
+                        //let timer = start_timer!(|| "eval_logup_z_pure");
                         unsafe {
                             core::mem::swap(&mut z_buf, &mut sum_buf);
                             let err = eval_logup_z_pure(
@@ -733,12 +748,12 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                             to_result((), err, "failed to run eval_logup_z")?;
                         }
-                        end_timer!(timer);
+                        //end_timer!(timer);
 
-                        (vec![&mut z_buf], vec![&mut z_set[set_i][..]])
+                        vec![(&mut z_buf, &mut z_set[set_i][..], false)]
                     };
 
-                    for (s_buf, col) in device_buffers.into_iter().zip(host_buffers.into_iter()) {
+                    for (s_buf, col, copy) in intt_tasks {
                         intt_raw_async(
                             &device,
                             s_buf,
@@ -750,9 +765,14 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             Some(calc_stream),
                         )?;
                         calc_sw.sync();
-
-                        copy_queue.push_with_new_buffer::<C::Scalar>(&device, s_buf, col, size)?;
+                        if copy {
+                            copy_queue
+                                .push_with_new_buffer::<C::Scalar>(&device, s_buf, col, size)?;
+                        }
                     }
+
+                    z_buffers.push((z_buf, lookup_i, set_i));
+                    z_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
                 }
             }
 
@@ -837,7 +857,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     {
                         for (i, input_sum) in input_set_sum.iter().enumerate() {
                             if z_lag[i + 1] != *input_sum + z_lag[i] {
-                                println!("bug at {} {}", zi, i);
+                                debug!("bug at {} {}", zi, i);
                                 assert!(false);
                             }
                         }
@@ -858,14 +878,38 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         drop(fixed_buffers);
 
-        let timer = start_timer!(|| "wait copy queue");
-        copy_queue.sync_all();
-        end_timer!(timer);
-
         let (lookup_z_commitments, random_commitment) = {
-            let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
             let (sw, stream) = CudaStreamWrapper::new_with_inner();
 
+            let timer = start_timer!(|| "INTT on lookup involved advices");
+            let mut t_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
+            let mut s_bufs: Vec<_> = (0..advices_len)
+                .into_iter()
+                .filter(|i| {
+                    uninvolved_units_after_single_lookup.contains(i)
+                        || uninvolved_units_after_tuple_lookup.contains(i)
+                })
+                .map(|i| advice_and_instance_device_buffers.remove(&i).unwrap())
+                .collect();
+
+            for s_buf in s_bufs.iter_mut() {
+                intt_raw_async(
+                    &device,
+                    s_buf,
+                    &mut t_buf,
+                    &intt_pq_buf,
+                    &intt_omegas_buf,
+                    &intt_divisor_buf,
+                    k,
+                    Some(stream),
+                )
+                .unwrap();
+            }
+            sw.sync();
+            copy_queue.sync_all();
+            end_timer!(timer);
+
+            let timer = start_timer!(|| format!("lookup z msm {}", z_buffers.len() + 1));
             let mut buffers = unsafe {
                 Arc::get_mut_unchecked(&mut advices)
                     .iter_mut()
@@ -878,38 +922,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     .collect::<Vec<_>>()
             };
 
-            let mut s_bufs: Vec<_> = (0..advices_len)
-                .into_iter()
-                .filter(|i| {
-                    uninvolved_units_after_single_lookup.contains(i)
-                        || uninvolved_units_after_tuple_lookup.contains(i)
-                })
-                .map(|i| advice_and_instance_device_buffers.remove(&i).unwrap())
-                .collect();
-
             let mut lookup_z_and_random_commitments = crate::cuda::msm::batch_msm_ext::<C, _>(
                 &device,
                 &g_buf,
-                lookups
+                z_buffers
                     .iter()
-                    .flat_map(|x| x.3.iter().map(|v| &v[..]))
-                    .chain([&random_poly[..]])
+                    .map(|x| &x.0)
+                    .chain(vec![random_buffer].iter())
                     .collect::<Vec<_>>(),
                 &mut || {
-                    let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
-                    for s_buf in s_bufs.iter_mut() {
-                        intt_raw_async(
-                            &device,
-                            s_buf,
-                            &mut t_buf,
-                            &intt_pq_buf,
-                            &intt_omegas_buf,
-                            &intt_divisor_buf,
-                            k,
-                            None,
-                        )
-                        .unwrap();
-                    }
                     for (dev_buf, host_buf) in s_bufs.iter().zip(buffers.iter_mut()) {
                         device
                             .copy_from_device_to_host_async(host_buf, dev_buf, stream)
@@ -918,6 +939,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 },
                 size,
             )?;
+
+            for (z, lookup_i, set_i) in z_buffers {
+                copy_queue.push(&device, z, &mut lookups[lookup_i].3[set_i])?;
+            }
             drop(sw);
             drop(buffers);
             drop(s_bufs);
@@ -1076,6 +1101,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             transcript.write_point(random_commitment).unwrap();
             sw.sync();
         }
+
+        let timer = start_timer!(|| "wait copy queue");
+        copy_queue.sync_all();
+        end_timer!(timer);
 
         let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 

@@ -3,6 +3,7 @@ use cuda_runtime_sys::cudaError;
 use libc::{
     c_void, mmap, MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_PRIVATE, PROT_READ, PROT_WRITE,
 };
+use log::info;
 use std::{
     alloc::{AllocError, Allocator, Layout},
     collections::HashMap,
@@ -143,7 +144,7 @@ lazy_static! {
 
 pub fn print_pinned_cache_info() {
     let pinned_buffer_cache = PINNED_BUFFER_CACHE.lock().unwrap();
-    println!(
+    info!(
         "zkwasm-prover cached pinned memory size: {} MB",
         (pinned_buffer_cache.buffers.len() * ALLOC_SIZE) >> 20
     );

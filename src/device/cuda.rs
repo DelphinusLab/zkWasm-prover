@@ -1,6 +1,7 @@
 use core::cell::RefCell;
 use core::mem;
 use cuda_runtime_sys::{cudaError, cudaStream_t, CUstream_st};
+use log::info;
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::{ffi::c_void, sync::Mutex};
@@ -294,7 +295,7 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
             let mut free = 0;
             let mut total = 0;
             cuda_runtime_sys::cudaMemGetInfo(&mut free, &mut total);
-            println!("free is {}, total is {}", free, total);
+            info!("free is {}, total is {}", free, total);
         }
         Ok(())
     }
