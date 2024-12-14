@@ -15,6 +15,50 @@ typedef Curve<Bn254FpField> Bn254G1;
 #include "zprize_ec_wrapper.cuh"
 #endif
 
+__global__ void logup_sum_input_inv_kernel(
+    Bn254FrField *accu,
+    const Bn254FrField *z,
+    Bn254FrField *tmp,
+    const Bn254FrField *beta_ptr,
+    int init,
+    int size_per_worker)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int start = i * size_per_worker;
+    int end = i * size_per_worker + size_per_worker;
+
+    Bn254FrField beta = beta_ptr[0];
+    tmp[start] = z[start] + beta;
+    for (int j = start + 1; j < end; j++)
+    {
+        tmp[j] = tmp[j - 1] * (z[j] + beta);
+    }
+
+    Bn254FrField t = tmp[end - 1].inv();
+
+    for (int j = end - 1; j > start; j--)
+    {
+        if (init == 0)
+        {
+            accu[j] = t * tmp[j - 1];
+        }
+        else
+        {
+            accu[j] += t * tmp[j - 1];
+        }
+        t = t * (z[j] + beta);
+    }
+
+    if (init == 0)
+    {
+        accu[start] = t;
+    }
+    else
+    {
+        accu[start] += t;
+    }
+}
+
 __global__ void batch_add_beta_invert_kernel(
     Bn254FrField *z,
     Bn254FrField *tmp,
@@ -22,25 +66,26 @@ __global__ void batch_add_beta_invert_kernel(
     int size_per_worker)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    Bn254FrField t(1);
-    Bn254FrField u(1);
+    int start = i * size_per_worker;
+    int end = i * size_per_worker + size_per_worker;
+
     Bn254FrField beta = beta_ptr[0];
-    for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++)
+    tmp[start] = z[start] + beta;
+    for (int j = start + 1; j < end; j++)
     {
-        u = t * (z[j] + beta);
-        tmp[j] = t;
+        tmp[j] = tmp[j - 1] * (z[j] + beta);
+    }
+
+    Bn254FrField t = tmp[end - 1].inv();
+
+    for (int j = end - 1; j > start; j--)
+    {
+        Bn254FrField u = t * (z[j] + beta);
+        z[j] = t * tmp[j - 1];
         t = u;
     }
 
-    t = t.inv();
-
-    for (int j = i * size_per_worker + size_per_worker - 1; j >= i * size_per_worker; j--)
-    {
-        u = z[j] + beta;
-        z[j] = t * tmp[j];
-        t = t * u;
-        tmp[j] = u;
-    }
+    z[start] = t;
 }
 
 __global__ void batch_invert_kernel(
@@ -2063,18 +2108,15 @@ extern "C"
         int n,
         CUstream_st *stream)
     {
-        int threads = n >= 64 ? 64 : 1;
-        int blocks = n / threads;
-        _eval_logup_add_c<<<blocks, threads, 0, stream>>>(
-            input, beta);
+        int threads = 16;
+        int blocks = 2048;
 
-        int worker = 64 * 128;
+        int worker = threads * blocks;
         int size_per_worker = n / worker;
-        batch_invert_kernel<<<128, 64, 0, stream>>>(
-            input, temp, size_per_worker);
+        assert(size_per_worker >= 1);
 
-        _eval_logup_accu_input<<<blocks, threads, 0, stream>>>(
-            sum, input, init);
+        logup_sum_input_inv_kernel<<<blocks, threads, 0, stream>>>(
+            sum, input, temp, beta, init, size_per_worker);
 
         return cudaGetLastError();
     }
