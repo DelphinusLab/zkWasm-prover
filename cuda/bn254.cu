@@ -15,17 +15,7 @@ typedef Curve<Bn254FpField> Bn254G1;
 #include "zprize_ec_wrapper.cuh"
 #endif
 
-__global__ void _eval_lookup_z_step1(
-    Bn254FrField *z,
-    const Bn254FrField *permuted_input,
-    const Bn254FrField *permuted_table,
-    Bn254FrField *beta_gamma)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    z[i] = (permuted_input[i] + beta_gamma[0]) * (permuted_table[i] + beta_gamma[1]);
-}
-
-__global__ void _eval_lookup_z_batch_invert(
+__global__ void batch_invert_kernel(
     Bn254FrField *z,
     Bn254FrField *tmp,
     int size_per_worker)
@@ -48,86 +38,6 @@ __global__ void _eval_lookup_z_batch_invert(
         z[j] = t * tmp[j];
         t = t * u;
         tmp[j] = u;
-    }
-}
-
-__global__ void _eval_lookup_z_step2(
-    Bn254FrField *input,
-    Bn254FrField *table,
-    Bn254FrField *beta_gamma)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    input[i] = (input[i] + beta_gamma[0]) * (table[i] + beta_gamma[1]);
-}
-
-__global__ void _eval_lookup_z_step3(
-    Bn254FrField *z,
-    Bn254FrField *input,
-    Bn254FrField *beta_gamma)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    z[i] = z[i] * input[i];
-}
-
-__global__ void _eval_lookup_z_product_batch(
-    Bn254FrField *z,
-    Bn254FrField *res,
-    int size_per_worker)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i != 0)
-    {
-        i--;
-        Bn254FrField t(1);
-        for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++)
-        {
-            t *= z[j];
-        }
-        res[i + 1] = t;
-    }
-    else
-    {
-        res[i] = Bn254FrField(1);
-    }
-}
-
-__global__ void _eval_lookup_z_product_single_spread(
-    Bn254FrField *res,
-    int size_per_worker)
-{
-    for (int i = 1; i < size_per_worker; i++)
-    {
-        res[i] *= res[i - 1];
-    }
-}
-
-__global__ void _eval_lookup_z_product_batch_spread(
-    Bn254FrField *z,
-    Bn254FrField *res,
-    int size_per_worker)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    z[i * size_per_worker] *= res[i];
-    for (int j = i * size_per_worker + 1; j < i * size_per_worker + size_per_worker; j++)
-    {
-        z[j] *= z[j - 1];
-    }
-}
-
-// Place a Bn254FrField::one() in the front
-__global__ void _eval_lookup_z_product_batch_spread_skip(
-    Bn254FrField *z,
-    Bn254FrField *res,
-    int size_per_worker)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    Bn254FrField t = res[i];
-    Bn254FrField u;
-    for (int j = i * size_per_worker; j < i * size_per_worker + size_per_worker; j++)
-    {
-        u = z[j] * t;
-        z[j] = t;
-        t = u;
     }
 }
 
@@ -1433,46 +1343,6 @@ extern "C"
 
         return cudaGetLastError();
     }
-
-    cudaError_t eval_lookup_z(
-        Bn254FrField *z,
-        Bn254FrField *input,
-        Bn254FrField *table,
-        const Bn254FrField *permuted_input,
-        const Bn254FrField *permuted_table,
-        Bn254FrField *beta_gamma,
-        int n,
-        CUstream_st *stream)
-    {
-        int threads = n >= 64 ? 64 : 1;
-        int blocks = n / threads;
-        _eval_lookup_z_step1<<<blocks, threads, 0, stream>>>(
-            z, permuted_input, permuted_table, beta_gamma);
-        _eval_lookup_z_step2<<<blocks, threads, 0, stream>>>(
-            input, table, beta_gamma);
-
-        int worker = 64 * 128;
-        int size_per_worker = n / worker;
-        _eval_lookup_z_batch_invert<<<128, 64, 0, stream>>>(
-            z, table, size_per_worker);
-        _eval_lookup_z_step3<<<blocks, threads, 0, stream>>>(
-            z, input, beta_gamma);
-
-        worker = 64 * 64;
-        size_per_worker = n / worker;
-        _eval_lookup_z_product_batch<<<64, 64, 0, stream>>>(
-            z, input, size_per_worker);
-        _eval_lookup_z_product_batch<<<8, 8, 0, stream>>>(
-            input, table, 64);
-        _eval_lookup_z_product_single_spread<<<1, 1, 0, stream>>>(
-            table, 64);
-        _eval_lookup_z_product_batch_spread<<<8, 8, 0, stream>>>(
-            input, table, 64);
-        _eval_lookup_z_product_batch_spread_skip<<<64, 64, 0, stream>>>(
-            z, input, size_per_worker);
-
-        return cudaGetLastError();
-    }
 }
 
 __global__ void count_nonzero_buckets(
@@ -1943,55 +1813,55 @@ extern "C"
         cudaStream_t stream)
     {
         find_matched_table_index_kernel<<<(1 << (k - 5)), 32, 0, stream>>>(table, input, sorted_index, start_offset, matched_index, k, unusable_rows_start);
-        
-                unsigned *sort_indices_temp_storage{};
-                size_t sort_indices_temp_storage_bytes = 0;
 
-                CHECK_RETURN(cub::DeviceRadixSort::SortKeys(
-                    sort_indices_temp_storage, sort_indices_temp_storage_bytes, matched_index, sorted_matched_index,
-                    1 << k, 0, k, stream));
+        unsigned *sort_indices_temp_storage{};
+        size_t sort_indices_temp_storage_bytes = 0;
 
-                bool alloc_for_sort = sort_indices_temp_storage_bytes > candidate_sort_temp_storage_bytes;
-                if (alloc_for_sort)
-                {
-                    printf("realloc for bytes %lu\n", sort_indices_temp_storage_bytes);
-                    CHECK_RETURN(cudaMallocAsync(&sort_indices_temp_storage, sort_indices_temp_storage_bytes, stream));
-                }
-                else
-                {
-                    sort_indices_temp_storage = candidate_sort_temp_storage;
-                }
+        CHECK_RETURN(cub::DeviceRadixSort::SortKeys(
+            sort_indices_temp_storage, sort_indices_temp_storage_bytes, matched_index, sorted_matched_index,
+            1 << k, 0, k, stream));
 
-                CHECK_RETURN(cub::DeviceRadixSort::SortKeys(
-                    sort_indices_temp_storage, sort_indices_temp_storage_bytes, matched_index, sorted_matched_index,
-                    1 << k, 0, k, stream));
+        bool alloc_for_sort = sort_indices_temp_storage_bytes > candidate_sort_temp_storage_bytes;
+        if (alloc_for_sort)
+        {
+            printf("realloc for bytes %lu\n", sort_indices_temp_storage_bytes);
+            CHECK_RETURN(cudaMallocAsync(&sort_indices_temp_storage, sort_indices_temp_storage_bytes, stream));
+        }
+        else
+        {
+            sort_indices_temp_storage = candidate_sort_temp_storage;
+        }
 
-                if (alloc_for_sort)
-                {
-                    CHECK_RETURN(cudaFreeAsync(sort_indices_temp_storage, stream));
-                }
+        CHECK_RETURN(cub::DeviceRadixSort::SortKeys(
+            sort_indices_temp_storage, sort_indices_temp_storage_bytes, matched_index, sorted_matched_index,
+            1 << k, 0, k, stream));
 
-                unsigned worker_bits = k - 1;
-                unsigned blocks = worker_bits > 5 ? (1 << (worker_bits - 5)) : 1;
-                unsigned threads = worker_bits > 5 ? 32 : (1 << worker_bits);
-                merge_index_init<<<blocks, threads, 0, stream>>>(m, sorted_matched_index, matched_index, unusable_rows_start, 1 << k);
+        if (alloc_for_sort)
+        {
+            CHECK_RETURN(cudaFreeAsync(sort_indices_temp_storage, stream));
+        }
 
-                bool dir = false;
-                for (int worker_bits = k - 2; worker_bits >= 0; worker_bits--)
-                {
-                    unsigned blocks = worker_bits > 5 ? (1 << (worker_bits - 5)) : 1;
-                    unsigned threads = worker_bits > 5 ? 32 : (1 << worker_bits);
-                    if (dir)
-                    {
-                        merge_index<<<blocks, threads, 0, stream>>>(m, sorted_matched_index, matched_index, unusable_rows_start, 1 << (worker_bits + 1));
-                    }
-                    else
-                    {
-                        merge_index<<<blocks, threads, 0, stream>>>(m, matched_index, sorted_matched_index, unusable_rows_start, 1 << (worker_bits + 1));
-                    }
-                    dir = !dir;
-                }
-        
+        unsigned worker_bits = k - 1;
+        unsigned blocks = worker_bits > 5 ? (1 << (worker_bits - 5)) : 1;
+        unsigned threads = worker_bits > 5 ? 32 : (1 << worker_bits);
+        merge_index_init<<<blocks, threads, 0, stream>>>(m, sorted_matched_index, matched_index, unusable_rows_start, 1 << k);
+
+        bool dir = false;
+        for (int worker_bits = k - 2; worker_bits >= 0; worker_bits--)
+        {
+            unsigned blocks = worker_bits > 5 ? (1 << (worker_bits - 5)) : 1;
+            unsigned threads = worker_bits > 5 ? 32 : (1 << worker_bits);
+            if (dir)
+            {
+                merge_index<<<blocks, threads, 0, stream>>>(m, sorted_matched_index, matched_index, unusable_rows_start, 1 << (worker_bits + 1));
+            }
+            else
+            {
+                merge_index<<<blocks, threads, 0, stream>>>(m, matched_index, sorted_matched_index, unusable_rows_start, 1 << (worker_bits + 1));
+            }
+            dir = !dir;
+        }
+
         return cudaGetLastError();
     }
 
@@ -2176,11 +2046,43 @@ extern "C"
 
         int worker = 64 * 128;
         int size_per_worker = n / worker;
-        _eval_lookup_z_batch_invert<<<128, 64, 0, stream>>>(
+        batch_invert_kernel<<<128, 64, 0, stream>>>(
             input, temp, size_per_worker);
 
         _eval_logup_accu_input<<<blocks, threads, 0, stream>>>(
             sum, input, init);
+
+        return cudaGetLastError();
+    }
+
+    cudaError_t eval_logup_z_pure(
+        Bn254FrField *z,
+        Bn254FrField *input,
+        Bn254FrField *table,
+        Bn254FrField *last_z,
+        int last_z_index,
+        int n,
+        CUstream_st *stream)
+    {
+        int threads = 16;
+        int blocks = 1024;
+        int worker = threads * blocks;
+        int size_per_worker = n / worker;
+        _eval_logup_z_grand_sum_batch<<<blocks, threads, 0, stream>>>(
+            z, input, size_per_worker);
+
+        int mid_threads = 8;
+        int mid_blocks = 16;
+        int mid_size_per_worker = worker / mid_threads / mid_blocks;
+        _eval_logup_z_grand_sum_batch_init<<<mid_blocks, mid_threads, 0, stream>>>(
+            input, table, last_z, mid_size_per_worker);
+        _eval_logup_z_grand_sum_single_spread<<<1, 1, 0, stream>>>(
+            table, mid_threads * mid_blocks);
+        _eval_logup_z_grand_sum_batch_spread<<<mid_blocks, mid_threads, 0, stream>>>(
+            input, table, mid_size_per_worker);
+
+        _eval_logup_z_grand_sum_batch_spread_skip<<<blocks, threads, 0, stream>>>(
+            z, input, last_z, last_z_index, size_per_worker);
 
         return cudaGetLastError();
     }
@@ -2203,51 +2105,13 @@ extern "C"
 
         int worker = 64 * 128;
         int size_per_worker = n / worker;
-        _eval_lookup_z_batch_invert<<<128, 64, 0, stream>>>(
+        batch_invert_kernel<<<128, 64, 0, stream>>>(
             table, z, size_per_worker);
 
         _eval_logup_z_step2<<<blocks, threads, 0, stream>>>(
             z, input, table, multiplicity);
 
-        // TODO: instead call eval_logup_z_pure
-        worker = 64 * 64;
-        size_per_worker = n / worker;
-        _eval_logup_z_grand_sum_batch<<<64, 64, 0, stream>>>(
-            z, input, size_per_worker);
-        _eval_logup_z_grand_sum_batch<<<8, 8, 0, stream>>>(
-            input, table, 64);
-        _eval_logup_z_grand_sum_single_spread<<<1, 1, 0, stream>>>(
-            table, 64);
-        _eval_logup_z_grand_sum_batch_spread<<<8, 8, 0, stream>>>(
-            input, table, 64);
-        _eval_logup_z_grand_sum_batch_spread_skip<<<64, 64, 0, stream>>>(
-            z, input, last_z, last_z_index, size_per_worker);
-
-        return cudaGetLastError();
-    }
-
-    cudaError_t eval_logup_z_pure(
-        Bn254FrField *z,
-        Bn254FrField *input,
-        Bn254FrField *table,
-        Bn254FrField *last_z,
-        int last_z_index,
-        int n,
-        CUstream_st *stream)
-    {
-        int worker = 64 * 64;
-        int size_per_worker = n / worker;
-        _eval_logup_z_grand_sum_batch<<<64, 64, 0, stream>>>(
-            z, input, size_per_worker);
-
-        _eval_logup_z_grand_sum_batch_init<<<8, 8, 0, stream>>>(
-            input, table, last_z, 64);
-        _eval_logup_z_grand_sum_single_spread<<<1, 1, 0, stream>>>(
-            table, 64);
-        _eval_logup_z_grand_sum_batch_spread<<<8, 8, 0, stream>>>(
-            input, table, 64);
-        _eval_logup_z_grand_sum_batch_spread_skip<<<64, 64, 0, stream>>>(
-            z, input, last_z, last_z_index, size_per_worker);
+        eval_logup_z_pure(z, input, table, last_z, last_z_index, n, stream);
 
         return cudaGetLastError();
     }

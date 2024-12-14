@@ -387,6 +387,7 @@ pub(crate) fn evaluate_exprs_in_gpu_pure<F: FieldExt>(
     advices_len: usize,
     size: usize,
 ) -> DeviceResult<CudaDeviceBufRaw> {
+    let (sw, stream) = CudaStreamWrapper::new_with_inner();
     let expr = flatten_tuple_expressions(exprs, None, theta);
 
     let mut coeffs = vec![];
@@ -398,7 +399,7 @@ pub(crate) fn evaluate_exprs_in_gpu_pure<F: FieldExt>(
         }
     }
 
-    let coeffs_buf = device.alloc_device_buffer_from_slice(&coeffs[..])?;
+    let coeffs_buf = device.alloc_device_buffer_from_slice_async(&coeffs[..], stream)?;
 
     let mut terms = vec![]; // Array of polynomial terms [coeff0, x0, y0, ..., nil, coeff1, x1, y1, ...]
     let mut rots = vec![];
@@ -432,8 +433,10 @@ pub(crate) fn evaluate_exprs_in_gpu_pure<F: FieldExt>(
                     rotation,
                 } => {
                     if !fixed_buffers.contains_key(&column_index) {
-                        let buf =
-                            device.alloc_device_buffer_from_slice(&fixed[column_index][..])?;
+                        let buf = device.alloc_device_buffer_from_slice_async(
+                            &fixed[column_index][..],
+                            stream,
+                        )?;
                         fixed_buffers.insert(column_index, buf);
                     }
                     (fixed_buffers.get(&(column_index)).unwrap(), rotation.0)
@@ -448,9 +451,9 @@ pub(crate) fn evaluate_exprs_in_gpu_pure<F: FieldExt>(
         terms.push(0usize as _);
     }
 
-    let terms_buf = device.alloc_device_buffer_from_slice(&terms[..])?;
-    let rots_buf = device.alloc_device_buffer_from_slice(&rots[..])?;
-    let res = device.alloc_device_buffer::<F>(size)?;
+    let terms_buf = device.alloc_device_buffer_from_slice_async(&terms[..], stream)?;
+    let rots_buf = device.alloc_device_buffer_from_slice_async(&rots[..], stream)?;
+    let res = device.alloc_device_buffer_async::<F>(size, &sw)?;
     let err = unsafe {
         field_op_batch_mul_sum(
             res.ptr(),
@@ -458,11 +461,13 @@ pub(crate) fn evaluate_exprs_in_gpu_pure<F: FieldExt>(
             rots_buf.ptr(),
             terms.len() as i32,
             size as i32,
-            0 as _,
+            stream,
         )
     };
 
     to_result((), err, "fail to run field_op_batch_mul_sum")?;
+
+    sw.sync();
 
     Ok(res)
 }
@@ -492,4 +497,8 @@ pub(crate) fn load_fixed_buffer_into_gpu<F: FieldExt>(
     }
 
     Ok(())
+}
+
+pub(crate) fn get_expr_degree<F: FieldExt>(expr: &Vec<Expression<F>>) -> usize {
+    expr.iter().map(|x| x.degree()).max().unwrap()
 }

@@ -222,17 +222,6 @@ extern "C" {
         n: i32,
     ) -> cudaError;
 
-    pub fn eval_lookup_z(
-        z: *mut c_void,
-        input: *mut c_void,
-        table: *mut c_void,
-        permuted_input: *mut c_void,
-        permuted_table: *mut c_void,
-        beta_gamma: *mut c_void,
-        n: i32,
-        stream: *mut CUstream_st,
-    ) -> cudaError;
-
     pub fn eval_logup_z(
         z: *mut c_void,
         input: *mut c_void,

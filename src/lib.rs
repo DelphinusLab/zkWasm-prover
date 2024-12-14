@@ -26,6 +26,7 @@ use device::cuda::CudaStreamWrapper;
 use eval_poly::batch_poly_eval;
 use expr::evaluate_exprs;
 use expr::evaluate_exprs_in_gpu_pure;
+use expr::get_expr_degree;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
@@ -72,6 +73,7 @@ mod expr;
 mod hugetlb;
 mod multiopen;
 mod permutation;
+mod profile;
 mod shuffle;
 
 const ADD_RANDOM: bool = true;
@@ -609,12 +611,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             shuffle_products_handler
         };
 
-        let mut copy_queue = AsyncCopyQueue::new(10);
+        let mut copy_queue = AsyncCopyQueue::new(16);
 
         // GPU Task: Generate Lookup product
         let timer = start_timer!(|| "generate lookup z");
         {
-            let copy_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
             let beta_buf = device.alloc_device_buffer_from_slice(&[beta])?;
             let tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
             let last_z_buf = device.alloc_device_buffer::<C::Scalar>(pk.vk.cs.lookups.len())?;
@@ -631,10 +632,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 let mut multiplicity_buf = lookup_device_buffers.remove(&(lookup_i, 2)).unwrap();
                 let table_buf = lookup_device_buffers.remove(&(lookup_i, 1)).unwrap();
 
-                copy_queue.push_with_copy_buffer(&device, &table_buf, &mut table[..], size)?;
+                //let timer = start_timer!(|| "copy table");
+                if get_expr_degree(&lookup.table_expressions) == 1 {
+                    copy_queue.push_with_copy_buffer(&device, &table_buf, &mut table[..], size)?;
+                }
+                //end_timer!(timer);
 
                 for (set_i, input_sets) in lookup.input_expressions_sets.iter().enumerate() {
                     for (set_inner_i, input_expr) in input_sets.0.iter().enumerate() {
+                        //let timer = start_timer!(|| "eval input");
                         let input_buf = evaluate_exprs_in_gpu_pure(
                             &device,
                             &advice_and_instance_device_buffers,
@@ -645,15 +651,20 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             advices_len,
                             size,
                         )?;
+                        //end_timer!(timer);
 
-                        copy_queue.push_with_copy_buffer(
-                            &device,
-                            &input_buf,
-                            &mut input[set_i][set_inner_i][..],
-                            size,
-                        )?;
+                        //let timer = start_timer!(|| "copy input");
+                        if get_expr_degree(input_expr) == 1 {
+                            copy_queue.push_with_copy_buffer(
+                                &device,
+                                &input_buf,
+                                &mut input[set_i][set_inner_i][..],
+                                size,
+                            )?;
+                        }
+                        //end_timer!(timer);
 
-                        let timer = start_timer!(|| "logup_sum_input_inv");
+                        //let timer = start_timer!(|| "logup_sum_input_inv");
                         logup_sum_input_inv(
                             &device,
                             &sum_buf,
@@ -666,11 +677,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         )?;
 
                         calc_sw.sync();
-                        end_timer!(timer);
+                        //end_timer!(timer);
                     }
 
-                    let (mut device_buffers, host_buffers) = if set_i == 0 {
-                        let timer = start_timer!(|| "eval_logup_z");
+                    let (device_buffers, host_buffers) = if set_i == 0 {
+                        //let timer = start_timer!(|| "eval_logup_z");
                         unsafe {
                             let err = eval_logup_z(
                                 z_buf.ptr(),
@@ -686,17 +697,17 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                 calc_stream,
                             );
 
-                            to_result((), err, "failed to run eval_lookup_z")?;
+                            to_result((), err, "failed to run eval_logup_z")?;
                         }
                         calc_sw.sync();
-                        end_timer!(timer);
+                        //end_timer!(timer);
 
                         (
                             vec![&mut multiplicity_buf, &mut z_buf],
                             vec![&mut multiplicity[..], &mut z_set[set_i][..]],
                         )
                     } else {
-                        let timer = start_timer!(|| "eval_logup_z_pure");
+                        //let timer = start_timer!(|| "eval_logup_z_pure");
                         unsafe {
                             core::mem::swap(&mut z_buf, &mut sum_buf);
                             let err = eval_logup_z_pure(
@@ -708,13 +719,12 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                                     .add(lookup_i * core::mem::size_of::<C::Scalar>()),
                                 unusable_rows_start as i32,
                                 size as i32,
-                                0 as _,
+                                calc_stream,
                             );
 
-                            to_result((), err, "failed to run eval_lookup_z")?;
+                            to_result((), err, "failed to run eval_logup_z")?;
                         }
-                        device.synchronize()?;
-                        end_timer!(timer);
+                        //end_timer!(timer);
 
                         (vec![&mut z_buf], vec![&mut z_set[set_i][..]])
                     };
@@ -734,12 +744,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                         copy_queue.push_with_new_buffer::<C::Scalar>(&device, s_buf, col, size)?;
                     }
-
-                    device.synchronize()?;
                 }
             }
-
-            drop(fixed_buffers);
 
             if false {
                 let (ntt_omegas_buf, ntt_pq_buf) =
@@ -840,6 +846,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             }
         }
         end_timer!(timer);
+
+        drop(fixed_buffers);
 
         let timer = start_timer!(|| "wait copy queue");
         copy_queue.sync_all();

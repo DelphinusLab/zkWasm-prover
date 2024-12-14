@@ -44,6 +44,7 @@ use crate::device::Device as _;
 use crate::device::DeviceResult;
 use crate::expr::flatten_lookup_expression;
 use crate::expr::flatten_shuffle_expression;
+use crate::expr::get_expr_degree;
 use crate::expr::is_expression_pure_unit;
 use crate::hugetlb::HugePageAllocator;
 
@@ -1148,12 +1149,4 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
     end_timer!(timer);
 
     Ok((ctx, h_buf))
-}
-
-fn get_expr_degree<F: FieldExt>(expr: &Vec<Expression<F>>) -> usize {
-    let mut deg = 0;
-    for expr in expr {
-        deg = deg.max(expr.degree());
-    }
-    deg
 }

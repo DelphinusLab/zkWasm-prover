@@ -186,7 +186,7 @@ pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
                     .unwrap();
             }
             if (cache_buffer_selector)(i - 1) {
-                let mut buf = device.alloc_device_buffer::<C::Scalar>(len).unwrap();
+                let mut buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(len).unwrap();
                 mem::swap(&mut scalar_dev_bufs[1 - idx], &mut buf);
                 cached_buffer.insert(i - 1, buf);
             }

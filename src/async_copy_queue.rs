@@ -1,6 +1,4 @@
-use std::collections::VecDeque;
-
-use ark_std::{end_timer, start_timer};
+use std::{collections::VecDeque, time::Instant};
 
 use crate::device::{
     cuda::{CudaDevice, CudaDeviceBufRaw, CudaStreamWrapper},
@@ -24,7 +22,13 @@ impl AsyncCopyQueue {
         if self.queue.len() == self.max {
             // let timer = start_timer!(|| "wait async copy queue");
             let (head, head_sw) = self.queue.pop_front().unwrap();
+            let now = Instant::now();
             head_sw.sync();
+            let new_now = Instant::now();
+            let duration = new_now.duration_since(now).as_millis();
+            if duration >= 1 {
+                println!("long time sync {}ms", duration);
+            }
             drop(head);
             // end_timer!(timer);
         }
