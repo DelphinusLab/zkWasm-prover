@@ -56,6 +56,20 @@ pub fn prepare_fixed_buffer<C: CurveAffine>(
     ]
 }
 
+pub fn prepare_permutation_poly_buffer<C: CurveAffine>(
+    pk: &ProvingKey<C>,
+) -> Vec<Vec<C::Scalar, HugePageAllocator>> {
+    pk.permutation
+        .polys
+        .iter()
+        .map(|x| {
+            let mut buf = Vec::new_in(HugePageAllocator);
+            buf.extend_from_slice(&x[..]);
+            buf
+        })
+        .collect::<Vec<_>>()
+}
+
 pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
 ) -> DeviceResult<

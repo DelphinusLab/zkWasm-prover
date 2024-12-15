@@ -324,34 +324,16 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
     fn batch_copy_and_extended_ntt_async(
         &mut self,
         batch_data: &[&[F]],
-        pre_stream_and_tmps: Vec<(CudaStreamWrapper, CudaDeviceBufRaw)>,
     ) -> DeviceResult<Vec<CudaDeviceBufRaw>> {
-        const BATCH_SIZE: usize = 4;
-
-        let mut stream_and_tmp_queue = [0; BATCH_SIZE].map(|_| None);
-        let mut index = 0;
-
-        let mut push_stream_and_tmp = |ctx: &mut Self, mut stream_and_tmp| {
-            std::mem::swap(&mut stream_and_tmp, &mut stream_and_tmp_queue[index]);
-            stream_and_tmp.map(|x| ctx.extended_ntt_wait(x));
-            index = (index + 1) % BATCH_SIZE;
-        };
-
-        for pre_stream_and_tmp in pre_stream_and_tmps {
-            push_stream_and_tmp(self, Some(pre_stream_and_tmp));
-        }
-
         let mut res = vec![];
+        let mut prev_stream_and_tmp = None;
         for data in batch_data {
             let (buf, stream_and_tmp) = self.copy_and_extended_ntt_async(data)?;
-            push_stream_and_tmp(self, Some(stream_and_tmp));
-            res.push(buf)
+            res.push(buf);
+            self.extended_ntt_wait_opt(prev_stream_and_tmp)?;
+            prev_stream_and_tmp = Some(stream_and_tmp);
         }
-
-        for stream_and_tmp in stream_and_tmp_queue.into_iter().filter_map(|x| x) {
-            self.extended_ntt_wait(stream_and_tmp)?;
-        }
-
+        self.extended_ntt_wait_opt(prev_stream_and_tmp)?;
         Ok(res)
     }
 
@@ -388,6 +370,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     advice: &[&[C::Scalar]],
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
+    permutation_poly: &[&[C::Scalar]],
     //todo check the inner mut to remove with outer mut
     lookup_products: &mut Vec<(
         &mut Vec<Vec<Vec<C::Scalar, HugePageAllocator>>>,
@@ -417,6 +400,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
         advice,
         instance,
         permutation_products,
+        permutation_poly,
         lookup_products,
         shuffle_products,
         y,
@@ -607,6 +591,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
     advice: &[&[C::Scalar]],
     instance: &[&[C::Scalar]],
     permutation_products: &[&[C::Scalar]],
+    permutation_poly: &[&[C::Scalar]],
     lookup_products: &mut Vec<(
         &mut Vec<Vec<Vec<C::Scalar, HugePageAllocator>>>,
         &mut Vec<C::Scalar, HugePageAllocator>,
@@ -685,7 +670,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
     if permutation_products.len() > 0 {
         let chunk_len = pk.vk.cs.degree() - 2;
 
-        let extended_p_buf = ctx.batch_copy_and_extended_ntt_async(permutation_products, vec![])?;
+        let extended_p_buf = ctx.batch_copy_and_extended_ntt_async(permutation_products)?;
         {
             permutation_eval_h_p1(
                 device,
@@ -713,7 +698,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
             for ((extended_p_buf, columns), polys) in extended_p_buf
                 .into_iter()
                 .zip(pk.vk.cs.permutation.columns.chunks(chunk_len))
-                .zip(pk.permutation.polys.chunks(chunk_len))
+                .zip(permutation_poly.chunks(chunk_len))
             {
                 let l_acc = ctx.alloc()?;
                 let r_acc = extended_p_buf;
@@ -732,7 +717,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                         Any::Fixed => &fixed[column.index()],
                         Any::Instance => &instance[column.index()],
                     })
-                    .zip(polys.iter())
+                    .zip(polys)
                 {
                     let mut l_res = ctx.alloc()?;
                     let mut r_res = ctx.alloc()?;
@@ -768,7 +753,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                     let l_tmp = {
                         device.copy_from_host_to_device_async(
                             &p_coset_buf,
-                            &permutation.values[..],
+                            &permutation[..],
                             l_stream,
                         )?;
                         permutation_eval_h_l(
@@ -855,7 +840,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         let mut input_deg = 1;
         lookup.input_expressions_sets.iter().for_each(|set| {
             set.0.iter().for_each(|input| {
-                input_deg = input_deg.max(get_expr_degree(input));
+                input_deg = input_deg.max(get_expr_degree(&input));
             })
         });
         let table_deg = get_expr_degree(&lookup.table_expressions);

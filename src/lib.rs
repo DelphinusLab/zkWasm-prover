@@ -576,6 +576,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         };
         end_timer!(timer);
 
+        drop(fixed_values);
+
+        let permutation_polys_handler = s.spawn(|| prepare_permutation_poly_buffer(pk));
+
         debug!(
             "lookup_device_buffers size is {}",
             lookup_device_buffers.len()
@@ -689,7 +693,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             &advice_and_instance_device_buffers,
                             &mut fixed_buffers,
                             &input_expr[..],
-                            fixed_ref,
+                            &[],
                             theta,
                             advices_len,
                             size,
@@ -1139,6 +1143,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
         let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
 
+        let permutation_polys = permutation_polys_handler.join().unwrap();
+
         let (x, _xn, h_pieces) = evaluate_h_gates_and_vanishing_construct(
             &device,
             &pk,
@@ -1149,6 +1155,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .iter()
                 .map(|x| &x[..])
                 .collect::<Vec<_>>()[..],
+            &permutation_polys.iter().map(|x| &x[..]).collect::<Vec<_>>()[..],
             &mut lookups
                 .iter_mut()
                 .map(|(v0, v1, v2, v3)| (v0, v1, v2, v3))
@@ -1190,7 +1197,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         inputs.push((&random_poly, 1, x));
 
-        for poly in pk.permutation.polys.iter() {
+        for poly in permutation_polys.iter() {
             inputs.push((&poly, 0, x));
         }
 
@@ -1297,10 +1304,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             poly: &pk.fixed_polys[column.index()],
                         }),
                 )
-                .chain((&pk).permutation.polys.iter().map(move |poly| ProverQuery {
+                .chain(permutation_polys.iter().map(move |poly| ProverQuery {
                     point: x,
                     rotation: Rotation::cur(),
-                    poly: &poly.values[..],
+                    poly: &poly[..],
                 }))
                 // We query the h(X) polynomial at x
                 .chain(
