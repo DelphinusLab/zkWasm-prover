@@ -28,7 +28,7 @@ pub(crate) fn analyze_expr_tree<F: FieldExt>(
         })
         .collect::<Vec<_, _>>();
 
-    let limit = if k < 23 { 26 } else { 10 };
+    let limit = if k < 23 { 27 } else { 10 };
     let mut v = HashSet::new();
 
     let mut expr_group = vec![];
