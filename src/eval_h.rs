@@ -187,9 +187,12 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
             let rots_buf = self
                 .device
                 .alloc_device_buffer_from_slice_async(&rots[..], stream)?;
+
             for stream_and_tmp in stream_and_tmp_queue {
                 self.extended_ntt_wait(stream_and_tmp)?;
             }
+
+            sw.sync();
 
             unsafe {
                 let err = field_op_batch_mul_sum(
@@ -802,8 +805,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         .zip(lookup_products.into_iter())
         .enumerate()
     {
-        let sets_len = lookup.input_expressions_sets.len();
-        let mut input_deg = 2;
+        let mut input_deg = 1;
         lookup.input_expressions_sets.iter().for_each(|set| {
             set.0.iter().for_each(|input| {
                 input_deg = input_deg.max(get_expr_degree(input));
@@ -821,39 +823,6 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
             beta,
             theta,
         );
-
-        // calculate inputs_host+beta in advance for input_deg=1
-        let inputs_beta_sets = if input_deg == 1 {
-            let (inputs_buf_sets, streams): (Vec<_>, Vec<_>) = inputs_sets_host
-                .iter()
-                .map(|set| -> Result<(Vec<_>, Vec<_>), _> {
-                    let rst = set
-                        .iter()
-                        .map(|input| -> DeviceResult<_> {
-                            logup_transform_extend_coset_async(
-                                device,
-                                input,
-                                &beta_buf,
-                                &intt_pq_buf,
-                                &intt_omegas_buf,
-                                &intt_divisor_buf,
-                                &mut ctx,
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_iter()
-                        .unzip();
-                    Ok(rst)
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .unzip();
-
-            drop(streams);
-            Some(inputs_buf_sets)
-        } else {
-            None
-        };
 
         let (multiplicity_buf, m_stream_and_tmp) =
             ctx.copy_and_extended_ntt_async(multiplicity_host)?;
@@ -898,11 +867,28 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                 let (sw, stream) = CudaStreamWrapper::new_with_inner();
                 let product_buf = ctx.alloc()?;
                 let product_sum_buf = ctx.alloc()?;
+
+                let mut inputs_beta_sets = vec![];
+
+                for input in inputs_sets_host[i].iter() {
+                    let (buf, sw_tmp) = logup_transform_extend_coset_async(
+                        device,
+                        &input,
+                        &beta_buf,
+                        &intt_pq_buf,
+                        &intt_omegas_buf,
+                        &intt_divisor_buf,
+                        &mut ctx,
+                    )?;
+                    inputs_beta_sets.push(buf);
+                    drop(sw_tmp);
+                }
+
                 logup_eval_h_inputs_product_sum(
                     device,
                     &product_buf,
                     &product_sum_buf,
-                    &inputs_beta_sets.as_ref().unwrap()[i],
+                    &inputs_beta_sets,
                     ctx.extended_size,
                     Some(stream),
                 )?;
@@ -960,6 +946,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
             );
             to_result((), err, "fail to run logup_eval_h")?;
 
+            let sets_len = lookup.input_expressions_sets.len();
             if sets_len > 1 {
                 logup_eval_h_z_set(
                     device,
@@ -1009,6 +996,13 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
             ));
         }
     }
+
+    last_round_stream_and_buffers.map(|(sw, buffers)| {
+        sw.sync();
+        for buffer in buffers {
+            ctx.free(buffer);
+        }
+    });
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h shuffle");
