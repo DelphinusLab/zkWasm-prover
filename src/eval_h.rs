@@ -871,7 +871,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                 let mut inputs_beta_sets = vec![];
 
                 for input in inputs_sets_host[i].iter() {
-                    let (buf, sw_tmp) = logup_transform_extend_coset_async(
+                    let (buf, stream_and_tmp) = logup_transform_extend_coset_async(
                         device,
                         &input,
                         &beta_buf,
@@ -881,8 +881,12 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                         &mut ctx,
                     )?;
                     inputs_beta_sets.push(buf);
-                    drop(sw_tmp);
+
+                    ctx.extended_ntt_wait(last_waiting)?;
+                    last_waiting = stream_and_tmp;
                 }
+
+                ctx.extended_ntt_wait(last_waiting)?;
 
                 logup_eval_h_inputs_product_sum(
                     device,
@@ -895,11 +899,10 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                 inputs_products_bufs.push(product_buf);
                 inputs_products_sum_bufs.push(product_sum_buf);
 
-                ctx.extended_ntt_wait(last_waiting)?;
                 let (z_buf, stream_and_tmp) =
                     ctx.copy_and_extended_ntt_async(&z_set_host[i][..])?;
 
-                drop(sw);
+                sw.sync();
                 last_waiting = stream_and_tmp;
                 zs_bufs.push(z_buf);
             }
