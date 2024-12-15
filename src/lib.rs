@@ -7,6 +7,7 @@ extern crate lazy_static;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::iter;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -27,6 +28,7 @@ use eval_poly::batch_poly_eval;
 use expr::evaluate_exprs;
 use expr::evaluate_exprs_in_gpu_pure;
 use expr::get_expr_degree;
+use expr::load_fixed_buffer_into_gpu_async;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
@@ -52,7 +54,6 @@ use crate::device::cuda::CUDA_BUFFER_ALLOCATOR;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
 use crate::expr::is_expression_pure_unit;
-use crate::expr::load_fixed_buffer_into_gpu;
 use crate::hugetlb::print_pinned_cache_info;
 use crate::hugetlb::HugePageAllocator;
 use crate::multiopen::gwc;
@@ -359,6 +360,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         print_prove_info(pk)?;
 
+        let mut fixed_buffer_handler = s.spawn(move || prepare_fixed_buffer(pk));
+
         let timer = start_timer!(|| "copy g_lagrange buffer");
         let g_buf = device
             .alloc_device_buffer_from_slice(&params.g[..])
@@ -379,15 +382,20 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             (lookups, permutations, shuffles, random_poly)
         });
 
-        // GPU Task: MSM & INTT of advices & instances
+        // GPU Task: MSM & INTT of advices & instances, load fixed values into GPU
+        let mut fixed_buffers = std::collections::HashMap::new();
+        let mut fixed_values = vec![];
+        let mut fixed_polys = vec![];
         let mut advice_and_instance_device_buffers = {
             let timer = start_timer!(|| format!(
                 "instances and advices msm {}",
                 instances.len() + advices.len()
             ));
 
+            let copy_sw = CudaStreamWrapper::new();
+
             let (commitments, advice_and_instance_device_buffers) =
-                crate::cuda::msm::batch_msm_and_intt::<C>(
+                crate::cuda::msm::batch_msm_and_intt_ext::<C>(
                     &device,
                     &g_lagrange_buf,
                     unsafe {
@@ -405,6 +413,43 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         selector: &|x| uninvolved_units.contains(&x),
                     },
                     &|x| !uninvolved_units.contains(&x),
+                    &mut || {
+                        let mut s = s.spawn(move || [vec![], vec![]]);
+                        core::mem::swap(&mut s, &mut fixed_buffer_handler);
+
+                        let timer = start_timer!(|| "wait fixed buffers");
+                        let mut buffers = s.join().unwrap();
+                        end_timer!(timer);
+                        core::mem::swap(&mut buffers[0], &mut fixed_values);
+                        core::mem::swap(&mut buffers[1], &mut fixed_polys);
+
+                        let fixed_ref =
+                            &fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+                        for (_, lookup) in pk.vk.cs.lookups.iter().enumerate() {
+                            load_fixed_buffer_into_gpu_async(
+                                &device,
+                                &mut fixed_buffers,
+                                &lookup.table_expressions[..],
+                                fixed_ref,
+                                &copy_sw,
+                            )
+                            .unwrap();
+
+                            for (_, input_sets) in lookup.input_expressions_sets.iter().enumerate()
+                            {
+                                for (_, input) in input_sets.0.iter().enumerate() {
+                                    load_fixed_buffer_into_gpu_async(
+                                        &device,
+                                        &mut fixed_buffers,
+                                        &input[..],
+                                        fixed_ref,
+                                        &copy_sw,
+                                    )
+                                    .unwrap();
+                                }
+                            }
+                        }
+                    },
                     size,
                 )?;
             for commitment in commitments.iter().skip(advices.len()) {
@@ -413,6 +458,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             for commitment in commitments.into_iter().take(advices.len()) {
                 transcript.write_point(commitment).unwrap();
             }
+            copy_sw.sync();
             end_timer!(timer);
             advice_and_instance_device_buffers
         };
@@ -429,37 +475,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let random_buffer = device.alloc_device_buffer_from_slice(&random_poly[..])?;
         end_timer!(timer);
 
-        let mut fixed_buffers = std::collections::HashMap::new();
-        {
-            let timer = start_timer!(|| "load fixed values for lookup Mi(x)");
-            let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            for (_, lookup) in pk.vk.cs.lookups.iter().enumerate() {
-                load_fixed_buffer_into_gpu(
-                    &device,
-                    &mut fixed_buffers,
-                    &lookup.table_expressions[..],
-                    fixed_ref,
-                )?;
-
-                for (_, input_sets) in lookup.input_expressions_sets.iter().enumerate() {
-                    for (_, input) in input_sets.0.iter().enumerate() {
-                        load_fixed_buffer_into_gpu(
-                            &device,
-                            &mut fixed_buffers,
-                            &input[..],
-                            fixed_ref,
-                        )?;
-                    }
-                }
-            }
-            end_timer!(timer);
-        }
-
         info!("fixed_buffers size is {}", fixed_buffers.len());
 
         let timer = start_timer!(|| "calc lookup Mi(x)");
         let mut lookup_device_buffers = HashMap::new();
-        let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+        let fixed_ref = &fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
         {
             let index_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
             let sorted_index_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
@@ -1116,7 +1136,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
         let timer = start_timer!(|| "h_poly");
-        let fixed_ref = &pk.fixed_polys.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+        let fixed_ref = &fixed_polys.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
         let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
         let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
 

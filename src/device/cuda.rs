@@ -396,7 +396,7 @@ impl Device<CudaDeviceBufRaw> for CudaDevice {
 pub(crate) struct CudaStreamWrapper(cudaStream_t);
 
 impl CudaStreamWrapper {
-    pub fn _new() -> Self {
+    pub fn new() -> Self {
         unsafe {
             let mut stream = std::mem::zeroed();
             let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);

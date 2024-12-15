@@ -33,6 +33,29 @@ pub fn prepare_advice_buffer<C: CurveAffine>(
     advices
 }
 
+pub fn prepare_fixed_buffer<C: CurveAffine>(
+    pk: &ProvingKey<C>,
+) -> [Vec<Vec<C::Scalar, HugePageAllocator>>; 2] {
+    [
+        pk.fixed_values
+            .iter()
+            .map(|x| {
+                let mut buf = Vec::new_in(HugePageAllocator);
+                buf.extend_from_slice(&x[..]);
+                buf
+            })
+            .collect::<Vec<_>>(),
+        pk.fixed_polys
+            .iter()
+            .map(|x| {
+                let mut buf = Vec::new_in(HugePageAllocator);
+                buf.extend_from_slice(&x[..]);
+                buf
+            })
+            .collect::<Vec<_>>(),
+    ]
+}
+
 pub(crate) fn prepare_lookup_buffer<C: CurveAffine>(
     pk: &ProvingKey<C>,
 ) -> DeviceResult<
