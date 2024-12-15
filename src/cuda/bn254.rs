@@ -2,7 +2,7 @@ use cuda_runtime_sys::cudaStream_t;
 use halo2_proofs::arithmetic::FieldExt;
 
 use super::bn254_c;
-use crate::device::cuda::{to_result, CudaBuffer, CudaDevice, CudaDeviceBufRaw};
+use crate::device::cuda::{to_result, CudaBuffer, CudaDevice, CudaDeviceBufRaw, CudaStreamWrapper};
 use crate::device::Error;
 use crate::device::{Device, DeviceResult};
 
@@ -334,24 +334,21 @@ pub fn buffer_copy_with_shift<F: FieldExt>(
     rot: isize,
     size: usize,
 ) -> Result<(), Error> {
+    let (sw, stream) = CudaStreamWrapper::new_with_inner();
     if rot == 0 {
-        device.copy_from_device_to_device::<F>(&dst, 0, src, 0, size)?;
-        device.synchronize()?;
+        device.copy_from_device_to_device_async::<F>(&dst, 0, src, 0, size, stream)?;
     } else if rot > 0 {
         let rot = rot as usize;
         let len = size - rot as usize;
-        device.copy_from_device_to_device::<F>(&dst, 0, src, rot, len)?;
-        device.synchronize()?;
-        device.copy_from_device_to_device::<F>(&dst, len, src, 0, rot)?;
-        device.synchronize()?;
+        device.copy_from_device_to_device_async::<F>(&dst, 0, src, rot, len, stream)?;
+        device.copy_from_device_to_device_async::<F>(&dst, len, src, 0, rot, stream)?;
     } else {
         let rot = -rot as usize;
         let len = size - rot;
-        device.copy_from_device_to_device::<F>(&dst, 0, src, rot, len)?;
-        device.synchronize()?;
-        device.copy_from_device_to_device::<F>(&dst, len, src, 0, rot)?;
-        device.synchronize()?;
+        device.copy_from_device_to_device_async::<F>(&dst, 0, src, rot, len, stream)?;
+        device.copy_from_device_to_device_async::<F>(&dst, len, src, 0, rot, stream)?;
     }
+    sw.sync();
     Ok(())
 }
 
