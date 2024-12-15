@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::mem::swap;
+use std::collections::HashSet;
 use std::mem::ManuallyDrop;
 
 use ark_std::end_timer;
@@ -105,61 +105,68 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
         advice: &[&[F]],
         instance: &[&[F]],
     ) -> DeviceResult<(CudaDeviceBufRaw, (CudaStreamWrapper, Vec<CudaDeviceBufRaw>))> {
+        let pick_host_buffer = |unit: &'b _| match unit {
+            ProveExpressionUnit::Fixed {
+                column_index,
+                rotation,
+            } => (&fixed[column_index.clone()], rotation),
+            ProveExpressionUnit::Advice {
+                column_index,
+                rotation,
+            } => (&advice[column_index.clone()], rotation),
+            ProveExpressionUnit::Instance {
+                column_index,
+                rotation,
+            } => (&instance[column_index.clone()], rotation),
+        };
+
         let (sw, stream) = CudaStreamWrapper::new_with_inner();
         let res = self.alloc_zeroed(&sw)?;
+        sw.sync();
+        drop((sw, stream));
 
-        let mut last_bufs: HashMap<_, CudaDeviceBufRaw> = HashMap::new();
-        let mut pending_bufs = vec![];
+        let mut prev_stream_and_pending_pending_buffers = None;
+        let mut prev_extended_buffers: HashMap<_, CudaDeviceBufRaw> = HashMap::new();
+
         for expr in exprs.iter() {
+            let mut last_stream_and_tmp = None;
+            let mut curr_extended_buffers = HashMap::new();
+            
+            // sync previous round before reuse extended buffer
+            drop(prev_stream_and_pending_pending_buffers);
+
+            let unit_ids = expr
+                .iter()
+                .flat_map(|(units, _)| units.iter().map(|x| x.0.get_group()))
+                .collect::<HashSet<_>>();
+
+            for unit_id in unit_ids {
+                if let Some(buffer) = prev_extended_buffers.remove(&unit_id) {
+                    curr_extended_buffers.insert(unit_id, buffer);
+                }
+            }
+
+            drop(prev_extended_buffers);
+
+            for (unit, _) in expr.iter().flat_map(|(units, _)| units.iter()) {
+                let unit_id = unit.get_group();
+                if !curr_extended_buffers.contains_key(&unit_id) {
+                    let (src, _) = pick_host_buffer(unit);
+                    let (buf, stream_and_tmp) = self.copy_and_extended_ntt_async(src)?;
+                    curr_extended_buffers.insert(unit_id, buf);
+                    self.extended_ntt_wait_opt(last_stream_and_tmp)?;
+                    last_stream_and_tmp = Some(stream_and_tmp);
+                }
+            }
+
+            let (sw, stream) = CudaStreamWrapper::new_with_inner();
             let coeffs = self.eval_ys(expr.iter().map(|(_, coeff)| coeff));
             let coeffs_buf = self
                 .device
                 .alloc_device_buffer_from_slice_async(&coeffs[..], stream)?;
 
-            let mut bufs = HashMap::new();
             let mut group = vec![];
             let mut rots = vec![];
-
-            for (unit, _) in expr.iter().flat_map(|(units, _)| units.iter()) {
-                let id = unit.get_group();
-                last_bufs.remove(&id).map(|buf| bufs.insert(id, buf));
-            }
-            sw.sync();
-            drop(last_bufs);
-            drop(pending_bufs);
-
-            let pick = |unit: &'b _| match unit {
-                ProveExpressionUnit::Fixed {
-                    column_index,
-                    rotation,
-                } => (&fixed[column_index.clone()], rotation),
-                ProveExpressionUnit::Advice {
-                    column_index,
-                    rotation,
-                } => (&advice[column_index.clone()], rotation),
-                ProveExpressionUnit::Instance {
-                    column_index,
-                    rotation,
-                } => (&instance[column_index.clone()], rotation),
-            };
-
-            let mut stream_and_tmp_queue = vec![];
-            let mut index = 0;
-            for (unit, _) in expr.iter().flat_map(|(units, _)| units.iter()) {
-                let id = unit.get_group();
-                let (src, _) = pick(unit);
-                if !bufs.contains_key(&id) {
-                    let (buf, mut stream_and_tmp) = self.copy_and_extended_ntt_async(src)?;
-                    bufs.insert(id, buf);
-                    if stream_and_tmp_queue.len() >= 2 {
-                        swap(&mut stream_and_tmp, &mut stream_and_tmp_queue[index & 1]);
-                        index += 1;
-                        self.extended_ntt_wait(stream_and_tmp)?;
-                    } else {
-                        stream_and_tmp_queue.push(stream_and_tmp)
-                    }
-                }
-            }
 
             for (i, (units, _)) in expr.iter().enumerate() {
                 group.push(unsafe {
@@ -167,17 +174,14 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
                         .ptr()
                         .offset((i * core::mem::size_of::<F>()) as isize)
                 });
-
                 for (unit, exp) in units {
                     let id = unit.get_group();
-                    let (_, rot) = pick(unit);
-
+                    let (_, rot) = pick_host_buffer(unit);
                     for _ in 0..*exp {
-                        group.push(bufs.get(&id).unwrap().ptr());
+                        group.push(curr_extended_buffers.get(&id).unwrap().ptr());
                         rots.push(rot.0 << (self.extended_k - self.k));
                     }
                 }
-
                 group.push(0usize as _);
             }
 
@@ -188,11 +192,14 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
                 .device
                 .alloc_device_buffer_from_slice_async(&rots[..], stream)?;
 
-            for stream_and_tmp in stream_and_tmp_queue {
-                self.extended_ntt_wait(stream_and_tmp)?;
-            }
-
             sw.sync();
+            drop((sw, stream));
+
+            let (sw, mut pending_queue) = if let Some((sw, tmp)) = last_stream_and_tmp {
+                (sw, vec![tmp])
+            } else {
+                (CudaStreamWrapper::new(), vec![])
+            };
 
             unsafe {
                 let err = field_op_batch_mul_sum(
@@ -201,17 +208,18 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
                     rots_buf.ptr(),
                     group.len() as i32,
                     self.extended_size as i32,
-                    stream,
+                    (&sw).into(),
                 );
 
                 to_result((), err, "fail to run field_op_batch_mul_sum")?;
             }
 
-            last_bufs = bufs;
-            pending_bufs = vec![group_buf, rots_buf];
+            prev_extended_buffers = curr_extended_buffers;
+            pending_queue.append(&mut vec![group_buf, rots_buf, coeffs_buf]);
+            prev_stream_and_pending_pending_buffers = Some((sw, pending_queue));
         }
 
-        Ok((res, (sw, pending_bufs)))
+        Ok((res, prev_stream_and_pending_pending_buffers.unwrap()))
     }
 }
 
@@ -330,6 +338,17 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
         let (stream, tmp_buf) = last;
         stream.sync();
         self.free(tmp_buf);
+        Ok(())
+    }
+
+    fn extended_ntt_wait_opt(
+        &mut self,
+        last: Option<(CudaStreamWrapper, CudaDeviceBufRaw)>,
+    ) -> DeviceResult<()> {
+        if let Some((stream, tmp_buf)) = last {
+            stream.sync();
+            self.free(tmp_buf);
+        }
         Ok(())
     }
 }
@@ -796,7 +815,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
     let timer = start_timer!(|| "evaluate_h lookup");
     let beta_buf = device.alloc_device_buffer_from_slice(&[beta][..])?;
 
-    let mut last_round_stream_and_buffers: Option<(CudaStreamWrapper, _)> = None;
+    let mut prev_stream_and_buffers: Option<(CudaStreamWrapper, _)> = None;
     for (_i, (lookup, (inputs_sets_host, table_host, multiplicity_host, z_set_host))) in pk
         .vk
         .cs
@@ -827,7 +846,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         let (multiplicity_buf, m_stream_and_tmp) =
             ctx.copy_and_extended_ntt_async(multiplicity_host)?;
 
-        last_round_stream_and_buffers.map(|(sw, buffers)| {
+        prev_stream_and_buffers.map(|(sw, buffers)| {
             sw.sync();
             for buffer in buffers {
                 ctx.free(buffer);
@@ -984,7 +1003,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                 }
             }
 
-            last_round_stream_and_buffers = Some((
+            prev_stream_and_buffers = Some((
                 sw,
                 vec![
                     vec![table_buf],
@@ -1000,7 +1019,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
         }
     }
 
-    last_round_stream_and_buffers.map(|(sw, buffers)| {
+    prev_stream_and_buffers.map(|(sw, buffers)| {
         sw.sync();
         for buffer in buffers {
             ctx.free(buffer);

@@ -7,7 +7,6 @@ extern crate lazy_static;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::iter;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;

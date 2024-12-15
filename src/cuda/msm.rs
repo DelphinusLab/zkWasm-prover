@@ -71,25 +71,6 @@ pub(crate) struct InttArgs<'a> {
     pub(crate) selector: &'a dyn Fn(usize) -> bool,
 }
 
-pub(crate) fn batch_msm_and_intt<'a, C: CurveAffine>(
-    device: &CudaDevice,
-    points_dev_buf: &CudaDeviceBufRaw,
-    scalar_buf: Vec<&mut [C::Scalar]>,
-    intt_args: InttArgs<'a>,
-    cache_buffer_selector: &'a dyn Fn(usize) -> bool,
-    len: usize,
-) -> DeviceResult<(Vec<C>, HashMap<usize, CudaDeviceBufRaw>)> {
-    batch_msm_and_intt_ext(
-        device,
-        points_dev_buf,
-        scalar_buf,
-        intt_args,
-        &cache_buffer_selector,
-        &mut || {},
-        len,
-    )
-}
-
 pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
     device: &CudaDevice,
     points_dev_buf: &CudaDeviceBufRaw,
