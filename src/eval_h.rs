@@ -125,15 +125,15 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
         sw.sync();
         drop((sw, stream));
 
-        let mut prev_stream_and_pending_pending_buffers = None;
+        let mut prev_stream_and_pending_pending_buffers: Option<(
+            CudaStreamWrapper,
+            Vec<CudaDeviceBufRaw>,
+        )> = None;
         let mut prev_extended_buffers: HashMap<_, CudaDeviceBufRaw> = HashMap::new();
 
         for expr in exprs.iter() {
             let mut last_stream_and_tmp = None;
             let mut curr_extended_buffers = HashMap::new();
-            
-            // sync previous round before reuse extended buffer
-            drop(prev_stream_and_pending_pending_buffers);
 
             let unit_ids = expr
                 .iter()
@@ -146,7 +146,7 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
                 }
             }
 
-            drop(prev_extended_buffers);
+            let mut sync_prev = true;
 
             for (unit, _) in expr.iter().flat_map(|(units, _)| units.iter()) {
                 let unit_id = unit.get_group();
@@ -156,8 +156,28 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
                     curr_extended_buffers.insert(unit_id, buf);
                     self.extended_ntt_wait_opt(last_stream_and_tmp)?;
                     last_stream_and_tmp = Some(stream_and_tmp);
+
+                    if sync_prev {
+                        // Clear prev_extended_buffers after the first new extended buffer task.
+                        // Sync previous round before reuse extended buffer.
+                        prev_stream_and_pending_pending_buffers
+                            .as_ref()
+                            .map(|x: &(CudaStreamWrapper, _)| x.0.sync());
+                        prev_stream_and_pending_pending_buffers
+                            .as_mut()
+                            .map(|(_, x)| x.clear());
+                        prev_extended_buffers.clear();
+                        sync_prev = false;
+                    }
                 }
             }
+
+            // sync previous round before reuse extended buffer
+            prev_stream_and_pending_pending_buffers
+                .as_ref()
+                .map(|x: &(CudaStreamWrapper, _)| x.0.sync());
+            prev_extended_buffers.clear();
+            drop(prev_stream_and_pending_pending_buffers);
 
             let (sw, stream) = CudaStreamWrapper::new_with_inner();
             let coeffs = self.eval_ys(expr.iter().map(|(_, coeff)| coeff));
@@ -218,6 +238,10 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
             pending_queue.append(&mut vec![group_buf, rots_buf, coeffs_buf]);
             prev_stream_and_pending_pending_buffers = Some((sw, pending_queue));
         }
+
+        prev_stream_and_pending_pending_buffers.as_mut().map(|x| {
+            x.1.append(&mut prev_extended_buffers.into_values().collect())
+        });
 
         Ok((res, prev_stream_and_pending_pending_buffers.unwrap()))
     }
@@ -628,7 +652,11 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
 
     let timer = start_timer!(|| "evaluate_h gates");
     let exprs = analyze_expr_tree(&pk.ev.gpu_gates_expr[0], k);
-    let (h_buf, _) = ctx.evaluate_prove_expr_with_async_ntt(&exprs, fixed, advice, instance)?;
+    let (h_buf, (sw, buf)) =
+        ctx.evaluate_prove_expr_with_async_ntt(&exprs, fixed, advice, instance)?;
+    sw.sync();
+    drop(sw);
+    drop(buf);
     end_timer!(timer);
 
     let timer = start_timer!(|| "evaluate_h prepare buffers for constants");
@@ -881,6 +909,8 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                 last_waiting = stream_and_tmp;
                 zs_bufs.push(z_buf);
 
+                pendings_product.0.sync();
+                pendings_sum.0.sync();
                 drop([pendings_product, pendings_sum]);
             } else {
                 let (sw, stream) = CudaStreamWrapper::new_with_inner();
@@ -931,6 +961,7 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
             let (buf, pendings) =
                 ctx.evaluate_prove_expr_with_async_ntt(&vec![table_expr], fixed, advice, instance)?;
             ctx.extended_ntt_wait(last_waiting)?;
+            pendings.0.sync();
             drop(pendings);
             buf
         } else {
