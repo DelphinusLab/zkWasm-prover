@@ -189,6 +189,7 @@ pub mod shplonk {
     use crate::cuda::field_op::field_op;
     use crate::cuda::msm::batch_msm;
     use crate::cuda::ntt::generate_ntt_buffers;
+    use crate::cuda::ntt::generate_omega_buffers;
     use crate::cuda::ntt::ntt_raw;
     use crate::device::cuda::CudaBuffer;
     use crate::device::cuda::CudaDevice;
@@ -371,12 +372,7 @@ pub mod shplonk {
             generate_ntt_buffers(&device, pk.get_vk().domain.get_omega_inv(), k)?;
         let intt_divisor_buf = device
             .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
-
-        let mut omegas = vec![C::Scalar::one(), pk.get_vk().domain.get_omega()];
-        for i in 2..size {
-            omegas.push(omegas[i - 1] * omegas[1]);
-        }
-        let omegas_buf = device.alloc_device_buffer_from_slice(&omegas[..])?;
+        let omegas_buf = generate_omega_buffers(device, pk.get_vk().domain.get_omega(), k, false)?;
 
         let mut hx_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         let mut poly_buf = device.alloc_device_buffer::<C::Scalar>(size)?;

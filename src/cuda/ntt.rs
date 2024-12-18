@@ -12,13 +12,33 @@ use super::bn254_c;
 
 pub const MAX_DEG: usize = 8;
 
+pub(crate) fn generate_omega_buffers<F: FieldExt>(
+    device: &CudaDevice,
+    omega: F,
+    len_log: usize,
+    may_bit_reversed: bool,
+) -> DeviceResult<CudaDeviceBufRaw> {
+    let omegas = vec![F::one(), omega];
+    let omegas_buf = device.alloc_device_buffer::<F>(1 << len_log)?;
+    device.copy_from_host_to_device(&omegas_buf, &omegas[..])?;
+    unsafe {
+        let err = crate::cuda::bn254_c::expand_omega_buffer(
+            omegas_buf.ptr(),
+            len_log as i32,
+            may_bit_reversed.into(),
+        );
+        to_result((), err, "fail to run expand_omega_buffer")?;
+    }
+
+    Ok(omegas_buf)
+}
+
 pub(crate) fn generate_ntt_buffers<F: FieldExt>(
     device: &CudaDevice,
     omega: F,
     len_log: usize,
 ) -> DeviceResult<(CudaDeviceBufRaw, CudaDeviceBufRaw)> {
     let len = 1 << len_log;
-    let omegas = vec![F::one(), omega];
 
     let max_deg = MAX_DEG.min(len_log);
     let mut pq = vec![F::zero(); 1 << max_deg >> 1];
@@ -31,14 +51,9 @@ pub(crate) fn generate_ntt_buffers<F: FieldExt>(
             pq[i].mul_assign(&twiddle);
         }
     }
-
-    let omegas_buf = device.alloc_device_buffer::<F>(1 << len_log)?;
-    device.copy_from_host_to_device(&omegas_buf, &omegas[..])?;
-    unsafe {
-        let err = crate::cuda::bn254_c::expand_omega_buffer(omegas_buf.ptr(), len_log as i32);
-        to_result((), err, "fail to run expand_omega_buffer")?;
-    }
     let pq_buf = device.alloc_device_buffer_from_slice(&pq[..])?;
+
+    let omegas_buf = generate_omega_buffers(device, omega, len_log, true)?;
 
     Ok((omegas_buf, pq_buf))
 }

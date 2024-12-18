@@ -193,7 +193,7 @@ extern "C" {
         n: i32,
     ) -> cudaError;
 
-    pub fn expand_omega_buffer(buf: *mut c_void, n: i32) -> cudaError;
+    pub fn expand_omega_buffer(buf: *mut c_void, n: i32, may_bit_reversed: i32) -> cudaError;
 
     pub fn field_mul_zip(buf: *mut c_void, coeff: *mut c_void, coeff_n: i32, n: i32) -> cudaError;
 

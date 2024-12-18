@@ -1331,9 +1331,10 @@ extern "C"
 
     cudaError_t expand_omega_buffer(
         Bn254FrField *res,
-        int log_n)
+        int log_n,
+        int may_bit_reversed)
     {
-        if (log_n == 22 || log_n == 24)
+        if (may_bit_reversed && (log_n == 22 || log_n == 24))
         {
             log_n--;
             int n = 1 << log_n;
