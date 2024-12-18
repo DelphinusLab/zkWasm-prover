@@ -1333,7 +1333,7 @@ extern "C"
         Bn254FrField *res,
         int log_n)
     {
-        if (log_n == 24)
+        if (log_n == 22 || log_n == 24)
         {
             log_n--;
             int n = 1 << log_n;
@@ -1363,7 +1363,7 @@ extern "C"
         bool *swap,
         CUstream_st *stream)
     {
-        if (false && log_n == 22)
+        if (log_n == 22)
         {
             merge_ntt_kernel<<<dim3(8192, 1), dim3(8, 32),
                                512 * sizeof(Bn254FrField), stream>>>(

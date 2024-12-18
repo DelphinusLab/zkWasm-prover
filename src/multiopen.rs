@@ -372,6 +372,12 @@ pub mod shplonk {
         let intt_divisor_buf = device
             .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
 
+        let mut omegas = vec![C::Scalar::one(), pk.get_vk().domain.get_omega()];
+        for i in 2..size {
+            omegas.push(omegas[i - 1] * omegas[1]);
+        }
+        let omegas_buf = device.alloc_device_buffer_from_slice(&omegas[..])?;
+
         let mut hx_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         let mut poly_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         let mut tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
@@ -416,7 +422,7 @@ pub mod shplonk {
                     hx_buf.ptr(),
                     v_buf.ptr(),
                     poly_buf.ptr(),
-                    ntt_omegas_buf.ptr(),
+                    omegas_buf.ptr(),
                     point_buf.ptr(),
                     diffs.len() as i32,
                     size as i32,
@@ -430,7 +436,7 @@ pub mod shplonk {
         unsafe {
             let err = crate::cuda::bn254_c::shplonk_h_x_div_points(
                 hx_buf.ptr(),
-                ntt_omegas_buf.ptr(),
+                omegas_buf.ptr(),
                 point_buf.ptr(),
                 super_point_set.len() as i32,
                 size as i32,
