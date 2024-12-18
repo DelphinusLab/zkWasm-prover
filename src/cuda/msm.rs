@@ -8,12 +8,11 @@ use halo2_proofs::pairing::group::Curve;
 
 use crate::cuda::bn254_c::batch_msm_collect;
 use crate::cuda::bn254_c::msm;
+use crate::cuda::ntt::ntt_raw;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::{CudaDevice, CudaDeviceBufRaw, CudaStreamWrapper};
 use crate::device::Device;
 use crate::device::DeviceResult;
-
-use super::bn254::intt_raw_async;
 
 pub(crate) trait ToDevBuffer {
     fn to_dev_buf<'a>(
@@ -187,15 +186,15 @@ pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
 
         if (intt_args.selector)(i) {
             assert!(!(cache_buffer_selector)(i));
-            intt_raw_async(
+            ntt_raw(
                 device,
                 &mut scalar_dev_bufs[idx],
                 &mut intt_tmp_bufs[idx],
                 intt_args.pq_buf,
                 intt_args.omegas_buf,
-                intt_args.divisor_buf,
                 intt_args.len_log,
-                Some(stream.1),
+                Some(intt_args.divisor_buf),
+                Some(&stream.0),
             )?;
 
             let mut buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?;

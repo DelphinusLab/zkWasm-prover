@@ -281,12 +281,148 @@ __device__ Bn254FrField pow_lookup(const Bn254FrField *bases, uint exponent)
     return res;
 }
 
+// porting from GPU-NTT https://github.com/Alisah-Ozcan/GPU-NTT/blob/main/src/lib/ntt_merge/ntt.cu
+__device__ void CooleyTukeyUnit(Bn254FrField &U, Bn254FrField &V, const Bn254FrField &root)
+{
+    Bn254FrField v_ = V * root;
+
+    V = U - v_;
+    U = U + v_;
+}
+
+__global__ void merge_ntt_kernel(const Bn254FrField *polynomial_in,
+                                 Bn254FrField *polynomial_out,
+                                 const Bn254FrField *root_of_unity_table,
+                                 const Bn254FrField *n_inv,
+                                 int shared_index,
+                                 int logm,
+                                 int outer_iteration_count,
+                                 int N_power,
+                                 bool not_last_kernel)
+{
+    const int idx_x = threadIdx.x;
+    const int idx_y = threadIdx.y;
+    const int block_x = blockIdx.x;
+    const int block_y = blockIdx.y;
+
+    extern __shared__ Bn254FrField shared_memory[];
+
+    int t_2 = N_power - logm - 1;
+    unsigned offset = 1 << (N_power - logm - 1);
+    int t_ = shared_index;
+    unsigned m = (unsigned)1 << logm;
+
+    unsigned global_addresss =
+        idx_x +
+        (unsigned)(idx_y * (offset / (1 << (outer_iteration_count - 1)))) +
+        (unsigned)(blockDim.x * block_x) +
+        (unsigned)(2 * block_y * offset);
+
+    unsigned omega_addresss =
+        idx_x +
+        (unsigned)(idx_y * (offset / (1 << (outer_iteration_count - 1)))) +
+        (unsigned)(blockDim.x * block_x) + (unsigned)(block_y * offset);
+
+    unsigned shared_addresss = (idx_x + (idx_y * blockDim.x));
+
+    // Load data from global & store to shared
+    shared_memory[shared_addresss] = polynomial_in[global_addresss];
+    shared_memory[shared_addresss + (blockDim.x * blockDim.y)] =
+        polynomial_in[global_addresss + offset];
+
+    int t = 1 << t_;
+    int in_shared_address = ((shared_addresss >> t_) << t_) + shared_addresss;
+    unsigned current_root_index;
+    if (not_last_kernel)
+    {
+#pragma unroll
+        for (int lp = 0; lp < outer_iteration_count; lp++)
+        {
+            __syncthreads();
+            current_root_index = (omega_addresss >> t_2);
+
+            CooleyTukeyUnit(shared_memory[in_shared_address],
+                            shared_memory[in_shared_address + t],
+                            root_of_unity_table[current_root_index]);
+
+            t = t >> 1;
+            t_2 -= 1;
+            t_ -= 1;
+            m <<= 1;
+
+            in_shared_address =
+                ((shared_addresss >> t_) << t_) + shared_addresss;
+        }
+        __syncthreads();
+    }
+    else
+    {
+#pragma unroll
+        for (int lp = 0; lp < (shared_index - 5); lp++) // 4 for 512 thread
+        {
+            __syncthreads();
+            current_root_index = (omega_addresss >> t_2);
+
+            CooleyTukeyUnit(shared_memory[in_shared_address],
+                            shared_memory[in_shared_address + t],
+                            root_of_unity_table[current_root_index]);
+
+            t = t >> 1;
+            t_2 -= 1;
+            t_ -= 1;
+            m <<= 1;
+
+            in_shared_address =
+                ((shared_addresss >> t_) << t_) + shared_addresss;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int lp = 0; lp < 6; lp++)
+        {
+            current_root_index = (omega_addresss >> t_2);
+            CooleyTukeyUnit(shared_memory[in_shared_address],
+                            shared_memory[in_shared_address + t],
+                            root_of_unity_table[current_root_index]);
+
+            t = t >> 1;
+            t_2 -= 1;
+            t_ -= 1;
+            m <<= 1;
+
+            in_shared_address =
+                ((shared_addresss >> t_) << t_) + shared_addresss;
+            __syncthreads();
+        }
+    }
+
+    if (not_last_kernel)
+    {
+        polynomial_out[global_addresss] = shared_memory[shared_addresss];
+        polynomial_out[global_addresss + offset] =
+            shared_memory[shared_addresss + (blockDim.x * blockDim.y)];
+    }
+    else if (!n_inv)
+    {
+        polynomial_out[bit_reverse(global_addresss, N_power)] = shared_memory[shared_addresss];
+        polynomial_out[bit_reverse(global_addresss + offset, N_power)] =
+            shared_memory[shared_addresss + (blockDim.x * blockDim.y)];
+    }
+    else
+    {
+        polynomial_out[bit_reverse(global_addresss, N_power)] = shared_memory[shared_addresss] * *n_inv;
+        polynomial_out[bit_reverse(global_addresss + offset, N_power)] =
+            shared_memory[shared_addresss + (blockDim.x * blockDim.y)] * *n_inv;
+    }
+}
+
 // Learn from ec-gpu
 __global__ void _ntt_core(
     const Bn254FrField *_x,
     Bn254FrField *_y,
     const Bn254FrField *pq,
     const Bn254FrField *omegas,
+    const Bn254FrField *n_inv,
     uint n,     // Number of elements
     uint log_p, // Log2 of `p` (Read more in the link above)
     uint deg,   // 1=>radix2, 2=>radix4, 3=>radix8, ...
@@ -342,8 +478,16 @@ __global__ void _ntt_core(
 
         for (uint i = counts >> 1; i < counte >> 1; i++)
         {
-            y[i * p] = u[bit_reverse(i, deg)];
-            y[(i + counth) * p] = u[bit_reverse(i + counth, deg)];
+            if (n >> log_p >> deg == 1 && n_inv)
+            {
+                y[i * p] = u[bit_reverse(i, deg)] * *n_inv;
+                y[(i + counth) * p] = u[bit_reverse(i + counth, deg)] * *n_inv;
+            }
+            else
+            {
+                y[i * p] = u[bit_reverse(i, deg)];
+                y[(i + counth) * p] = u[bit_reverse(i + counth, deg)];
+            }
         }
     }
 }
@@ -948,6 +1092,31 @@ __global__ void _expand_omega_buffer(
     }
 }
 
+__global__ void _bitreverse_expand_omega_buffer(
+    Bn254FrField *buf,
+    int log_n,
+    int n)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int workers = gridDim.x * blockDim.x;
+    int tasks = n / workers;
+    int start = gid * tasks;
+    int end = start + tasks;
+    end = end > n ? n : end;
+
+    for (int i = start; i < end; i++)
+    {
+        // bit reverse
+        int bit_reversed_i = bit_reverse(i, log_n);
+        if (bit_reversed_i < i)
+        {
+            Bn254FrField x = buf[i];
+            buf[i] = buf[bit_reversed_i];
+            buf[bit_reversed_i] = x;
+        }
+    }
+}
+
 __global__ void _field_mul_zip(
     Bn254FrField *buf,
     Bn254FrField *coeff,
@@ -1160,39 +1329,98 @@ extern "C"
         return cudaGetLastError();
     }
 
+    cudaError_t expand_omega_buffer(
+        Bn254FrField *res,
+        int log_n)
+    {
+        if (log_n == 24)
+        {
+            log_n--;
+            int n = 1 << log_n;
+            int threads = n >= 64 ? 64 : 1;
+            int blocks = n / threads;
+            _expand_omega_buffer<<<blocks, threads>>>(res, n);
+            _bitreverse_expand_omega_buffer<<<blocks, threads>>>(res, log_n, n);
+        }
+        else
+        {
+            int n = 1 << log_n;
+            int threads = n >= 64 ? 64 : 1;
+            int blocks = n / threads;
+            _expand_omega_buffer<<<blocks, threads>>>(res, n);
+        }
+        return cudaGetLastError();
+    }
+
     cudaError_t ntt(
         Bn254FrField *buf,
         Bn254FrField *tmp,
         const Bn254FrField *pq,
         const Bn254FrField *omegas,
+        const Bn254FrField *n_inv,
         int log_n,
         int max_deg,
         bool *swap,
         CUstream_st *stream)
     {
-        int p = 0;
-
-        Bn254FrField *src = buf;
-        Bn254FrField *dst = tmp;
-        int len = 1 << log_n;
-        int total = 1 << (log_n - 1);
-        while (p < log_n)
+        if (false && log_n == 22)
         {
-            int res = log_n - p;
-            int round = (res + max_deg - 1) / max_deg;
-            int deg = (res + round - 1) / round;
+            merge_ntt_kernel<<<dim3(8192, 1), dim3(8, 32),
+                               512 * sizeof(Bn254FrField), stream>>>(
+                buf, buf, omegas, n_inv, 8,
+                0, 6, log_n, true);
+            merge_ntt_kernel<<<dim3(128, 64), dim3(4, 64),
+                               512 * sizeof(Bn254FrField), stream>>>(
+                buf, buf, omegas, n_inv, 8,
+                6, 7, log_n, true);
+            merge_ntt_kernel<<<dim3(1, 8192), dim3(256, 1),
+                               512 * sizeof(Bn254FrField), stream>>>(
+                buf, tmp, omegas, n_inv, 8,
+                13, 9, log_n, false);
+            *swap = true;
+        }
+        else if (log_n == 24)
+        {
+            merge_ntt_kernel<<<dim3(16384, 1), dim3(8, 64),
+                               1024 * sizeof(Bn254FrField), stream>>>(
+                buf, buf, omegas, n_inv, 9,
+                0, 7, log_n, true);
+            merge_ntt_kernel<<<dim3(128, 128), dim3(8, 64),
+                               1024 * sizeof(Bn254FrField), stream>>>(
+                buf, buf, omegas, n_inv, 9,
+                7, 7, log_n, true);
+            merge_ntt_kernel<<<dim3(1, 16384), dim3(512, 1),
+                               1024 * sizeof(Bn254FrField), stream>>>(
+                buf, tmp, omegas, n_inv, 9,
+                14, 10, log_n, false);
+            *swap = true;
+        }
+        else
+        {
+            int p = 0;
 
-            int threads = 1 << (deg - 1);
-            int blocks = total >> (deg - 1);
-            blocks = blocks > 65536 ? 65536 : blocks;
-            int grids = (total / blocks) >> (deg - 1);
-            _ntt_core<<<blocks, threads, 512 * sizeof(Bn254FrField), stream>>>(src, dst, pq, omegas, len, p, deg, max_deg, grids);
+            Bn254FrField *src = buf;
+            Bn254FrField *dst = tmp;
+            int len = 1 << log_n;
+            int total = 1 << (log_n - 1);
+            while (p < log_n)
+            {
+                int res = log_n - p;
+                int round = (res + max_deg - 1) / max_deg;
+                int deg = (res + round - 1) / round;
 
-            Bn254FrField *t = src;
-            src = dst;
-            dst = t;
-            p += deg;
-            *swap = !*swap;
+                int threads = 1 << (deg - 1);
+                int blocks = total >> (deg - 1);
+                blocks = blocks > 65536 ? 65536 : blocks;
+                int grids = (total / blocks) >> (deg - 1);
+                _ntt_core<<<blocks, threads, 512 * sizeof(Bn254FrField), stream>>>(src, dst, pq, omegas, n_inv, len, p, deg, max_deg, grids);
+
+                Bn254FrField *t = src;
+                src = dst;
+                dst = t;
+                p += deg;
+                *swap = !*swap;
+            }
         }
         return cudaGetLastError();
     }
@@ -1332,16 +1560,6 @@ extern "C"
             z,
             l0, l_last, l_active_row,
             y, rot, n);
-        return cudaGetLastError();
-    }
-
-    cudaError_t expand_omega_buffer(
-        Bn254FrField *res,
-        int n)
-    {
-        int threads = n >= 64 ? 64 : 1;
-        int blocks = n / threads;
-        _expand_omega_buffer<<<blocks, threads>>>(res, n);
         return cudaGetLastError();
     }
 

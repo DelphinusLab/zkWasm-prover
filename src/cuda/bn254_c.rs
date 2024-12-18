@@ -8,6 +8,7 @@ extern "C" {
         tmp: *mut c_void,
         pq: *mut c_void,
         omega: *mut c_void,
+        n_inv: *mut c_void,
         array_log: i32,
         max_deg: i32,
         swap: *mut c_void,

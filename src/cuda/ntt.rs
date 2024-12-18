@@ -1,7 +1,6 @@
 use halo2_proofs::arithmetic::FieldExt;
 
 use crate::cuda::bn254::FieldOp;
-use crate::cuda::bn254_c;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
@@ -9,6 +8,8 @@ use crate::device::cuda::CudaDeviceBufRaw;
 use crate::device::cuda::CudaStreamWrapper;
 use crate::device::Device;
 use crate::device::DeviceResult;
+
+use super::bn254_c;
 
 pub const MAX_DEG: usize = 8;
 
@@ -35,8 +36,7 @@ pub(crate) fn generate_ntt_buffers<F: FieldExt>(
     let omegas_buf = device.alloc_device_buffer::<F>(1 << len_log)?;
     device.copy_from_host_to_device(&omegas_buf, &omegas[..])?;
     unsafe {
-        let err =
-            crate::cuda::bn254_c::expand_omega_buffer(omegas_buf.ptr(), (1 << len_log) as i32);
+        let err = crate::cuda::bn254_c::expand_omega_buffer(omegas_buf.ptr(), len_log as i32);
         to_result((), err, "fail to run expand_omega_buffer")?;
     }
     let pq_buf = device.alloc_device_buffer_from_slice(&pq[..])?;
@@ -63,6 +63,7 @@ pub(crate) fn ntt_raw(
             tmp_buf.ptr(),
             pq_buf.ptr(),
             omegas_buf.ptr(),
+            intt_divisor.map(|x| x.ptr()).unwrap_or(0 as _),
             len_log as i32,
             MAX_DEG as i32,
             &mut swap as *mut _ as _,
@@ -74,24 +75,22 @@ pub(crate) fn ntt_raw(
     if swap {
         std::mem::swap(s_buf, tmp_buf);
     }
+    Ok(())
+}
 
-    if let Some(divisor) = intt_divisor {
-        unsafe {
-            let err = bn254_c::field_op(
-                s_buf.ptr(),
-                s_buf.ptr(),
-                0,
-                0usize as *mut _,
-                0usize as *mut _,
-                0,
-                divisor.ptr(),
-                (1 << len_log) as i32,
-                FieldOp::Mul as i32,
-                stream.map(|s| s.into()).unwrap_or(0usize as _),
-            );
-            to_result((), err, "fail to run field_op in intt_raw")?;
-        }
-    }
+pub fn ntt_sync<F: FieldExt>(
+    device: &CudaDevice,
+    s_buf: &mut CudaDeviceBufRaw,
+    tmp_buf: &mut CudaDeviceBufRaw,
+    pq_buf: &CudaDeviceBufRaw,
+    omegas_buf: &CudaDeviceBufRaw,
+    result: &mut [F],
+    len_log: usize,
+) -> DeviceResult<()> {
+    ntt_raw(
+        device, s_buf, tmp_buf, pq_buf, omegas_buf, len_log, None, None,
+    )?;
+    device.copy_from_device_to_host(result, s_buf)?;
     Ok(())
 }
 
@@ -119,40 +118,4 @@ pub(crate) fn extended_prepare(
         to_result((), err, "fail to run extended_prepare")?;
         Ok(())
     }
-}
-
-pub(crate) fn _batch_ntt_raw<F: FieldExt>(
-    device: &CudaDevice,
-    value: Vec<(&mut [F], CudaDeviceBufRaw)>,
-    pq_buf: &CudaDeviceBufRaw,
-    omegas_buf: &CudaDeviceBufRaw,
-    len_log: usize,
-    divisor: Option<&CudaDeviceBufRaw>,
-) -> DeviceResult<()> {
-    const MAX_CONCURRENCY: usize = 3;
-
-    let size = 1 << len_log;
-    let streams = [0; MAX_CONCURRENCY].map(|_| CudaStreamWrapper::new());
-    let mut t_buf =
-        [0; MAX_CONCURRENCY].map(|_| device.alloc_device_buffer_non_zeroed::<F>(size).unwrap());
-
-    for (i, (col, mut s_buf)) in value.into_iter().enumerate() {
-        let idx = i % MAX_CONCURRENCY;
-        let t_buf = &mut t_buf[idx];
-
-        ntt_raw(
-            &device,
-            &mut s_buf,
-            t_buf,
-            &pq_buf,
-            &omegas_buf,
-            len_log,
-            divisor,
-            Some(&streams[idx]),
-        )?;
-        device.copy_from_device_to_host_async(&mut col[..], &s_buf, (&streams[idx]).into())?;
-    }
-
-    drop(streams);
-    Ok(())
 }

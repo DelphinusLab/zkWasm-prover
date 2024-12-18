@@ -18,9 +18,9 @@ use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
 use async_copy_queue::AsyncCopyQueue;
 use buffer::prepare_lookup_buffer;
-use cuda::bn254::intt_raw_async;
-use cuda::bn254::ntt;
 use cuda::msm::InttArgs;
+use cuda::ntt::ntt_raw;
+use cuda::ntt::ntt_sync;
 use cuda_runtime_sys::cudaError;
 use device::cuda::CudaStreamWrapper;
 use eval_poly::batch_poly_eval;
@@ -43,8 +43,8 @@ use shuffle::generate_shuffle_product;
 
 use crate::buffer::*;
 use crate::cuda::bn254::logup_sum_input_inv;
-use crate::cuda::bn254::ntt_prepare;
 use crate::cuda::bn254_c::{eval_logup_z, eval_logup_z_pure};
+use crate::cuda::ntt::generate_ntt_buffers;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
@@ -344,7 +344,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let device = CudaDevice::get_device(0).unwrap();
 
         let (intt_omegas_buf, intt_pq_buf) =
-            ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
+            generate_ntt_buffers(&device, pk.get_vk().domain.get_omega_inv(), k)?;
         let intt_divisor_buf = device
             .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
 
@@ -777,15 +777,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     };
 
                     for (s_buf, col, copy) in intt_tasks {
-                        intt_raw_async(
+                        ntt_raw(
                             &device,
                             s_buf,
                             &mut t_buf,
                             &intt_pq_buf,
                             &intt_omegas_buf,
-                            &intt_divisor_buf,
                             k,
-                            Some(calc_stream),
+                            Some(&intt_divisor_buf),
+                            Some(&calc_sw),
                         )?;
                         calc_sw.sync();
                         if copy {
@@ -801,7 +801,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
             if false {
                 let (ntt_omegas_buf, ntt_pq_buf) =
-                    ntt_prepare(&device, pk.get_vk().domain.get_omega(), k)?;
+                    generate_ntt_buffers(&device, pk.get_vk().domain.get_omega(), k)?;
                 // While in Lagrange basis, check that grand sum is correctly constructed
                 /*
                      φ_i(X) = f_i(X) + α
@@ -821,7 +821,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
                     let mut m_lagrange = table.clone();
                     device.copy_from_host_to_device(&mut s_buf, m_coeff)?;
-                    ntt(
+                    ntt_sync(
                         &device,
                         &mut s_buf,
                         &mut tmp_buf,
@@ -836,7 +836,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         .collect::<Vec<_>>();
                     for (z, z_lagrange) in zs_coeff.iter().zip(zs_lagrange.iter_mut()) {
                         device.copy_from_host_to_device(&mut s_buf, z)?;
-                        ntt(
+                        ntt_sync(
                             &device,
                             &mut s_buf,
                             &mut tmp_buf,
@@ -916,15 +916,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .collect();
 
             for s_buf in s_bufs.iter_mut() {
-                intt_raw_async(
+                ntt_raw(
                     &device,
                     s_buf,
                     &mut t_buf,
                     &intt_pq_buf,
                     &intt_omegas_buf,
-                    &intt_divisor_buf,
                     k,
-                    Some(stream),
+                    Some(&intt_divisor_buf),
+                    Some(&sw),
                 )
                 .unwrap();
             }
@@ -994,15 +994,15 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .alloc_device_buffer_non_zeroed::<C::Scalar>(size)
                 .unwrap();
             for s_buf in s_bufs.iter_mut() {
-                intt_raw_async(
+                ntt_raw(
                     &device,
                     s_buf,
                     &mut t_buf,
                     &intt_pq_buf,
                     &intt_omegas_buf,
-                    &intt_divisor_buf,
                     k,
-                    Some(stream),
+                    Some(&intt_divisor_buf),
+                    Some(&sw),
                 )?;
             }
             sw.sync();
@@ -1093,14 +1093,14 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 &mut || {
                     let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
                     for s_buf in s_bufs.iter_mut() {
-                        intt_raw_async(
+                        ntt_raw(
                             &device,
                             s_buf,
                             &mut t_buf,
                             &intt_pq_buf,
                             &intt_omegas_buf,
-                            &intt_divisor_buf,
                             k,
+                            Some(&intt_divisor_buf),
                             None,
                         )
                         .unwrap();
