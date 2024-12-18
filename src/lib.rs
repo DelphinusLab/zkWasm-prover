@@ -980,7 +980,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "permutation z msm and intt & advice intt");
-        let (sw, stream) = CudaStreamWrapper::new_with_inner();
+        let sw = CudaStreamWrapper::new();
         let mut s_bufs: Vec<_> = (0..advices_len)
             .into_iter()
             .filter(|i| uninvolved_units_after_permutation.contains(i))

@@ -2,7 +2,6 @@ use cuda_runtime_sys::cudaStream_t;
 use halo2_proofs::arithmetic::FieldExt;
 
 use super::bn254_c;
-use super::ntt::MAX_DEG;
 use crate::device::cuda::{to_result, CudaBuffer, CudaDevice, CudaDeviceBufRaw, CudaStreamWrapper};
 use crate::device::Error;
 use crate::device::Device;

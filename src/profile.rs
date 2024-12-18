@@ -164,7 +164,106 @@ fn bench_logup_sum_input_inv() {
             .collect::<Vec<Fr>>();
 
         device.copy_from_device_to_host(&mut sum, &sum_buf).unwrap();
-        device.copy_from_device_to_host(&mut scalars0, &input_buf).unwrap();
+        device
+            .copy_from_device_to_host(&mut scalars0, &input_buf)
+            .unwrap();
         assert!(expect_out[0..check_len] == sum[0..check_len]);
+    }
+}
+
+#[test]
+fn test_bn254_ntt() {
+    use crate::device::cuda::CudaDevice;
+    use crate::device::Device;
+    use crate::generate_ntt_buffers;
+    use crate::ntt_raw;
+    use crate::CUDA_BUFFER_ALLOCATOR;
+    use ark_std::{end_timer, start_timer};
+    use halo2_proofs::arithmetic::{best_fft_cpu, BaseExt, Field as _, FieldExt};
+    use halo2_proofs::pairing::bn256::Fr;
+    use halo2_proofs::pairing::group::ff::PrimeField as _;
+
+    let device = CudaDevice::get_device(0).unwrap();
+    let len_log = 22;
+    let len = 1 << len_log;
+
+    {
+        let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
+        allocator.reset((1 << len_log) * core::mem::size_of::<Fr>(), 16);
+    }
+
+    let mut omega = Fr::ROOT_OF_UNITY_INV.invert().unwrap();
+    for _ in len_log..Fr::S {
+        omega = omega.square();
+    }
+
+    let (omegas_buf, pq_buf) = generate_ntt_buffers(&device, omega, len_log as usize).unwrap();
+    let (intt_omegas_buf, intt_pq_buf) =
+        generate_ntt_buffers(&device, omega.invert().unwrap(), len_log as usize).unwrap();
+    let divisor = Fr::from(1 << len_log).invert().unwrap();
+    let divisor_buf = device
+        .alloc_device_buffer_from_slice(&vec![divisor][..])
+        .unwrap();
+
+    for i in 0..128 {
+        println!("test round {}", i);
+
+        let mut s_vec = {
+            let mut s_vec = vec![];
+            s_vec.push(Fr::rand());
+            for i in 1..len {
+                s_vec.push(s_vec[i - 1] + Fr::from(i as u64));
+            }
+            s_vec
+        };
+
+        let mut expected_ntt_s = s_vec.clone();
+        best_fft_cpu(&mut expected_ntt_s[..], omega, len_log);
+
+        let s_origin = s_vec.clone();
+        let s = &mut s_vec[..];
+        device.pin_memory(s).unwrap();
+
+        let mut a_buf = device.alloc_device_buffer_from_slice(s).unwrap();
+        let mut b_buf = device.alloc_device_buffer_from_slice(s).unwrap();
+        device.synchronize().unwrap();
+
+        let timer = start_timer!(|| format!("NTT gpu costs for k {}, s[0] {:?}", len_log, &s_origin[0]));
+        ntt_raw(
+            &device,
+            &mut a_buf,
+            &mut b_buf,
+            &pq_buf,
+            &omegas_buf,
+            len_log as usize,
+            None,
+            None,
+        )
+        .unwrap();
+        device.synchronize().unwrap();
+        end_timer!(timer);
+
+        device.copy_from_device_to_host(s, &a_buf).unwrap();
+        assert!(s == expected_ntt_s);
+
+        device.unpin_memory(s).unwrap();
+
+        let timer = start_timer!(|| format!("INTT gpu costs for k {}", len_log));
+        ntt_raw(
+            &device,
+            &mut a_buf,
+            &mut b_buf,
+            &intt_pq_buf,
+            &intt_omegas_buf,
+            len_log as usize,
+            Some(&divisor_buf),
+            None,
+        )
+        .unwrap();
+        device.synchronize().unwrap();
+        end_timer!(timer);
+
+        device.copy_from_device_to_host(s, &a_buf).unwrap();
+        assert!(s == s_origin);
     }
 }

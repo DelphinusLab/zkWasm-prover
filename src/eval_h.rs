@@ -21,7 +21,6 @@ use crate::cuda::bn254::buffer_copy_with_shift;
 use crate::cuda::bn254::permutation_eval_h_l;
 use crate::cuda::bn254::permutation_eval_h_p1;
 use crate::cuda::bn254::permutation_eval_h_p2;
-use crate::cuda::bn254::pick_from_buf;
 use crate::cuda::bn254::FieldOp;
 use crate::cuda::bn254::{logup_eval_h_inputs_product_sum, logup_eval_h_z_set};
 use crate::cuda::bn254_c;

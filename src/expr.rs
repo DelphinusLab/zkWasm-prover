@@ -188,28 +188,6 @@ pub(crate) fn flatten_shuffle_expression<F: FieldExt>(
     [expr_input, expr_table]
 }
 
-fn pick_prove_unit_slice<'a, F: FieldExt>(
-    unit: &ProveExpressionUnit,
-    fixed: &'a [&'a [F]],
-    advice: &'a [&'a [F]],
-    instance: &'a [&'a [F]],
-) -> (&'a [F], i32) {
-    match unit {
-        ProveExpressionUnit::Fixed {
-            column_index,
-            rotation,
-        } => (&fixed[*column_index], rotation.0),
-        ProveExpressionUnit::Advice {
-            column_index,
-            rotation,
-        } => (&advice[*column_index], rotation.0),
-        ProveExpressionUnit::Instance {
-            column_index,
-            rotation,
-        } => (&instance[*column_index], rotation.0),
-    }
-}
-
 /// Simple evaluation of an expression
 pub(crate) fn evaluate_exprs<F: FieldExt>(
     expressions: &[Expression<F>],

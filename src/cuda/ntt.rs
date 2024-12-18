@@ -1,6 +1,5 @@
 use halo2_proofs::arithmetic::FieldExt;
 
-use crate::cuda::bn254::FieldOp;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
