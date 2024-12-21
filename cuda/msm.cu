@@ -159,11 +159,6 @@ __global__ void msm_core(
 
     for (unsigned i = start; i < end; i++)
     {
-        // if (i < n - 1)
-        // {
-        //     assert(buckets_indices[i] <= buckets_indices[i + 1]);
-        // }
-
         unsigned next_idx = buckets_indices[i];
         if (next_idx != idx)
         {
@@ -254,35 +249,77 @@ __global__ void batch_collect_bucktes(
     unsigned window_bits)
 {
     unsigned msm_id = blockIdx.x;
-    unsigned window_id = threadIdx.x;
+
+    Bn254G1 acc = buckets[msm_id][(windows - 1) << window_bits];
+    for (int i = windows - 2; i >= 0; i--)
+    {
+        for (int j = 0; j < window_bits; j++)
+        {
+            acc = acc.ec_double();
+        }
+        acc = acc + buckets[msm_id][i << window_bits];
+    }
+    buckets[msm_id][0] = acc;
+}
+
+__global__ void batch_reduce_buckets(
+    Bn254G1 **buckets,
+    unsigned windows,
+    unsigned window_bits)
+{
+    unsigned msm_id = blockIdx.x;
+    unsigned window_id = blockIdx.y;
+    unsigned id = threadIdx.x;
+    unsigned workers = blockDim.x;
 
     Bn254G1 *buckets_start = &buckets[msm_id][window_id << window_bits];
 
-    Bn254G1 acc = buckets_start[(1 << window_bits) - 1];
-    Bn254G1 total = acc;
+    extern __shared__ Bn254G1 cache[];
 
-    for (int i = (1 << window_bits) - 2; i > 0; i--)
+    unsigned len = 1 << window_bits;
+
+    if (id == 0)
     {
-        acc = acc + buckets_start[i];
-        total = total + acc;
+        buckets_start[0] = Bn254G1::identity();
     }
-
-    buckets_start[0] = total;
-
     __syncthreads();
 
-    if (window_id == 0)
+    while (len > 2)
     {
-        acc = buckets[msm_id][(windows - 1) << window_bits];
-        for (int i = windows - 2; i >= 0; i--)
+        len >>= 1;
         {
-            for (int j = 0; j < window_bits; j++)
+            unsigned size = len;
+            unsigned tasks_per_worker = (size + workers - 1) / workers;
+            unsigned start = tasks_per_worker * id;
+            unsigned end = start + tasks_per_worker > size ? size : start + tasks_per_worker;
+            for (unsigned i = start; i < end; i++)
             {
-                acc = acc.ec_double();
+                buckets_start[i] = buckets_start[i] + buckets_start[i + len];
             }
-            acc = acc + buckets[msm_id][i << window_bits];
         }
-        buckets[msm_id][0] = acc;
+
+        __syncthreads();
+
+        {
+            unsigned size = len >> 1;
+            unsigned tasks_per_worker = (size + workers - 1) / workers;
+            unsigned start = tasks_per_worker * id;
+            unsigned end = start + tasks_per_worker > size ? size : start + tasks_per_worker;
+
+            for (unsigned i = start; i < end; i++)
+            {
+                cache[id] = buckets_start[i + len] + buckets_start[i + len + size];
+                buckets_start[1 + i] = buckets_start[1 + i] + cache[id];
+                buckets_start[len - 1 - i] = buckets_start[len - 1 - i] + cache[id];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (id == 0)
+    {
+        buckets_start[0] = buckets_start[1];
     }
 }
 
@@ -301,15 +338,14 @@ __global__ void init_bucktes(
 
 extern "C"
 {
-#define CHECK_RETURN(x)     \
-{                           \
-    cudaError_t err = x;    \
-    if (err != cudaSuccess) \
-    {                       \
-        return err;         \
-    }                       \
-}
-
+#define CHECK_RETURN(x)         \
+    {                           \
+        cudaError_t err = x;    \
+        if (err != cudaSuccess) \
+        {                       \
+            return err;         \
+        }                       \
+    }
 
     cudaError_t msm(
         Bn254G1 *res,
@@ -420,7 +456,8 @@ extern "C"
                 window_bits, windows, workers);
         }
 
-        batch_collect_bucktes<<<batch_size, windows, 0, stream>>>(buckets, windows, window_bits);
+        batch_reduce_buckets<<<dim3(batch_size, windows), 128, 128 * sizeof(Bn254G1), stream>>>(buckets, windows, window_bits);
+        batch_collect_bucktes<<<batch_size, 1, 0, stream>>>(buckets, windows, window_bits);
 
         return cudaGetLastError();
     }

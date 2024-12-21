@@ -1677,7 +1677,6 @@ __global__ void find_matched_table_index_kernel(
     unsigned k,
     unsigned unusable_rows_start)
 {
-    unsigned block_id = blockIdx.x;
     unsigned gid = (blockIdx.x * blockDim.x) + threadIdx.x;
 
     if (gid < unusable_rows_start)
