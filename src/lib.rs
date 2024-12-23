@@ -1243,7 +1243,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         }
 
         let timer = start_timer!(|| "eval poly");
-        let cache_count = (gpu_reserve_chuncks - 8) >> (k.max(22) - 22);
+        let cache_count = 160 >> (k.max(22) - 22);
         let (poly_buf_cache, eval_map, evals) = batch_poly_eval(&device, inputs, k, cache_count)?;
 
         for (_i, eval) in evals.into_iter().skip(1).enumerate() {

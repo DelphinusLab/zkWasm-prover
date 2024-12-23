@@ -210,7 +210,11 @@ impl CudaDevice {
                 )
             } else {
                 let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
-                let ptr = allocator.alloc(size);
+                let ptr = allocator.alloc(size).unwrap_or_else(|| {
+                    let mut ptr = 0 as *mut c_void;
+                    cuda_runtime_sys::cudaMalloc(&mut ptr, size);
+                    ptr
+                });
                 if zero {
                     cuda_runtime_sys::cudaMemsetAsync(ptr, 0, size, stream.unwrap_or(0usize as _));
                 }

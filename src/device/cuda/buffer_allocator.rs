@@ -1,3 +1,5 @@
+use cuda_runtime_sys::cudaFree;
+
 use crate::device::cuda::c_void;
 use crate::to_result;
 
@@ -46,7 +48,7 @@ impl CudaBufferAllocator {
         self.bit_map = vec![false; count]
     }
 
-    pub(crate) fn alloc(&mut self, size: usize) -> *mut c_void {
+    pub(crate) fn alloc(&mut self, size: usize) -> Option<*mut c_void> {
         let count = (size + self.chunk_size - 1) / self.chunk_size;
 
         let mut end = 0;
@@ -67,8 +69,10 @@ impl CudaBufferAllocator {
                 self.bit_map[i] = true;
             }
             let res = (self.ptr_base + (end - picked) * self.chunk_size) as _;
-            return res;
+            return Some(res);
         } else {
+            return None;
+            /*
             let mut sum = 0;
             for used in self.bit_map.iter() {
                 if *used {
@@ -81,6 +85,7 @@ impl CudaBufferAllocator {
             );
             println!("chunck status: {:?}", self.bit_map);
             panic!("Cuda Device OOM");
+            */
         }
     }
 
@@ -90,12 +95,16 @@ impl CudaBufferAllocator {
 
     pub(crate) fn free(&mut self, ptr: *mut c_void, size: usize) {
         let offset = ptr as usize - self.ptr_base;
-        assert!(offset < self.total_size);
-        assert!(offset % self.chunk_size == 0);
-
-        let offset = offset as usize / self.chunk_size;
-        for i in 0..(size + self.chunk_size - 1) / self.chunk_size {
-            self.bit_map[i + offset] = false;
+        if offset < self.total_size {
+            assert!(offset % self.chunk_size == 0);
+            let offset = offset as usize / self.chunk_size;
+            for i in 0..(size + self.chunk_size - 1) / self.chunk_size {
+                self.bit_map[i + offset] = false;
+            }
+        } else {
+            unsafe {
+                cudaFree(ptr);
+            }
         }
     }
 }
