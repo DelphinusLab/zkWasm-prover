@@ -36,14 +36,17 @@ use halo2_proofs::poly::commitment::Params;
 use halo2_proofs::poly::Rotation;
 use halo2_proofs::transcript::EncodedChallenge;
 use halo2_proofs::transcript::TranscriptWrite;
-use log::{debug, error, info};
+use log::debug;
+use log::error;
+use log::info;
 use permutation::generate_permutation_product;
 use rayon::prelude::*;
 use shuffle::generate_shuffle_product;
 
 use crate::buffer::*;
 use crate::cuda::bn254::logup_sum_input_inv;
-use crate::cuda::bn254_c::{eval_logup_z, eval_logup_z_pure};
+use crate::cuda::bn254_c::eval_logup_z;
+use crate::cuda::bn254_c::eval_logup_z_pure;
 use crate::cuda::ntt::generate_ntt_buffers;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
@@ -450,6 +453,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         }
                     },
                     size,
+                    true,
                 )?;
             for commitment in commitments.iter().skip(advices.len()) {
                 transcript.common_point(*commitment).unwrap();
@@ -595,6 +599,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .collect(),
             &mut || {},
             size,
+            true,
         )?;
         end_timer!(timer);
 
@@ -904,8 +909,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let (lookup_z_commitments, random_commitment) = {
             let (sw, stream) = CudaStreamWrapper::new_with_inner();
 
-            let timer = start_timer!(|| "INTT on lookup involved advices");
-            let mut t_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
             let mut s_bufs: Vec<_> = (0..advices_len)
                 .into_iter()
                 .filter(|i| {
@@ -914,6 +917,10 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 })
                 .map(|i| advice_and_instance_device_buffers.remove(&i).unwrap())
                 .collect();
+
+            let timer =
+                start_timer!(|| format!("INTT on lookup involved advices {}", s_bufs.len()));
+            let mut t_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
 
             for s_buf in s_bufs.iter_mut() {
                 ntt_raw(
@@ -945,6 +952,12 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     .collect::<Vec<_>>()
             };
 
+            for (dev_buf, host_buf) in s_bufs.iter().zip(buffers.iter_mut()) {
+                device
+                    .copy_from_device_to_host_async(host_buf, dev_buf, stream)
+                    .unwrap();
+            }
+
             let mut lookup_z_and_random_commitments = crate::cuda::msm::batch_msm_ext::<C, _>(
                 &device,
                 &g_buf,
@@ -953,14 +966,9 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     .map(|x| &x.0)
                     .chain(vec![random_buffer].iter())
                     .collect::<Vec<_>>(),
-                &mut || {
-                    for (dev_buf, host_buf) in s_bufs.iter().zip(buffers.iter_mut()) {
-                        device
-                            .copy_from_device_to_host_async(host_buf, dev_buf, stream)
-                            .unwrap();
-                    }
-                },
+                &mut || {},
                 size,
+                false,
             )?;
 
             for (z, lookup_i, set_i) in z_buffers {
@@ -1041,6 +1049,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 }
             },
             size,
+            false,
         )?;
 
         drop(sw);
@@ -1112,6 +1121,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     }
                 },
                 size,
+                false,
             )?;
             drop(g_lagrange_buf);
             end_timer!(timer);

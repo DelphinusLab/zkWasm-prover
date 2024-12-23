@@ -274,6 +274,7 @@ extern "C" {
         threads: i32,
         workers: i32,
         prepared_sort_indices_temp_storage_bytes: i32,
+        skip_zero: i32,
         stream: *mut CUstream_st,
     ) -> cudaError;
 

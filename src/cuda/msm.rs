@@ -78,6 +78,7 @@ pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
     cache_buffer_selector: &'a dyn Fn(usize) -> bool,
     before_final_round: &'a mut dyn FnMut() -> (),
     len: usize,
+    skip_zero: bool,
 ) -> DeviceResult<(Vec<C>, HashMap<usize, CudaDeviceBufRaw>)> {
     if scalar_buf.len() == 0 {
         before_final_round();
@@ -112,8 +113,8 @@ pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
     };
 
     let streams = [
-        CudaStreamWrapper::new_with_inner(),
-        CudaStreamWrapper::new_with_inner(),
+        CudaStreamWrapper::new_with_inner_and_priority(1),
+        CudaStreamWrapper::new_with_inner_and_priority(1),
     ];
 
     let mut scalar_dev_bufs = [
@@ -179,6 +180,7 @@ pub(crate) fn batch_msm_and_intt_ext<'a, C: CurveAffine>(
                 threads as i32,
                 worker as i32,
                 (sort_temp_storage_size * mem::size_of::<u32>()) as i32,
+                skip_zero.into(),
                 stream.1,
             );
             assert_eq!(err, cudaError::cudaSuccess);
@@ -239,8 +241,16 @@ pub(crate) fn batch_msm<C: CurveAffine, B: ToDevBuffer>(
     points_dev_buf: &CudaDeviceBufRaw,
     scalar_buf: Vec<B>,
     len: usize,
+    skip_zero: bool,
 ) -> DeviceResult<Vec<C>> {
-    batch_msm_ext(device, points_dev_buf, scalar_buf, &mut || {}, len)
+    batch_msm_ext(
+        device,
+        points_dev_buf,
+        scalar_buf,
+        &mut || {},
+        len,
+        skip_zero,
+    )
 }
 
 pub(crate) fn batch_msm_ext<C: CurveAffine, B: ToDevBuffer>(
@@ -249,6 +259,7 @@ pub(crate) fn batch_msm_ext<C: CurveAffine, B: ToDevBuffer>(
     scalar_buf: Vec<B>,
     before_final_round: &mut dyn FnMut() -> (),
     len: usize,
+    skip_zero: bool,
 ) -> DeviceResult<Vec<C>> {
     if scalar_buf.len() == 0 {
         before_final_round();
@@ -272,13 +283,13 @@ pub(crate) fn batch_msm_ext<C: CurveAffine, B: ToDevBuffer>(
     };
 
     let streams = [
-        CudaStreamWrapper::new_with_inner(),
-        CudaStreamWrapper::new_with_inner(),
+        CudaStreamWrapper::new_with_inner_and_priority(1),
+        CudaStreamWrapper::new_with_inner_and_priority(1),
     ];
 
     let scalar_dev_bufs = [
-        device.alloc_device_buffer::<C::Scalar>(len)?,
-        device.alloc_device_buffer::<C::Scalar>(len)?,
+        device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?,
+        device.alloc_device_buffer_non_zeroed::<C::Scalar>(len)?,
     ];
 
     // About 30MB per MSM
@@ -331,6 +342,7 @@ pub(crate) fn batch_msm_ext<C: CurveAffine, B: ToDevBuffer>(
                 threads as i32,
                 worker as i32,
                 (sort_temp_storage_size * mem::size_of::<u32>()) as i32,
+                skip_zero.into(),
                 stream.1,
             );
             assert_eq!(err, cudaError::cudaSuccess);
@@ -512,6 +524,7 @@ fn test_msm() {
                     &p_buf,
                     vec![&scalars; 1 << msm_count_deg],
                     len,
+                    round & 1 == 1,
                 )
                 .unwrap();
                 end_timer!(timer);

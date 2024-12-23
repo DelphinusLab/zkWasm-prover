@@ -483,6 +483,7 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
                 .map(|x| &x as &CudaDeviceBufRaw)
                 .collect::<Vec<_>>(),
             size,
+            false,
         )?;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();

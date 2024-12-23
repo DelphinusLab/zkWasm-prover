@@ -404,10 +404,18 @@ impl CudaStreamWrapper {
         }
     }
 
+    pub fn new_with_inner_and_priority(prio: i32) -> (Self, *mut CUstream_st) {
+        unsafe {
+            let mut stream = std::mem::zeroed();
+            let _ = cuda_runtime_sys::cudaStreamCreateWithPriority(&mut stream, 0, prio);
+            (Self(stream), stream)
+        }
+    }
+
     pub fn new_with_inner() -> (Self, *mut CUstream_st) {
         unsafe {
             let mut stream = std::mem::zeroed();
-            let _ = cuda_runtime_sys::cudaStreamCreate(&mut stream);
+            let _ = cuda_runtime_sys::cudaStreamCreateWithPriority(&mut stream, 0, 0);
             (Self(stream), stream)
         }
     }

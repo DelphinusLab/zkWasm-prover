@@ -160,8 +160,13 @@ pub(crate) mod gwc {
 
         let timer = start_timer!(|| "msm");
 
-        let commitments =
-            batch_msm::<C, _>(&device, &g_buf, ws.iter().map(|x| &x[..]).collect(), size)?;
+        let commitments = batch_msm::<C, _>(
+            &device,
+            &g_buf,
+            ws.iter().map(|x| &x[..]).collect(),
+            size,
+            false,
+        )?;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }
@@ -452,7 +457,7 @@ pub mod shplonk {
             None,
         )?;
 
-        let commitment = batch_msm(&device, &g_buf, vec![&hx_buf], size)?;
+        let commitment = batch_msm(&device, &g_buf, vec![&hx_buf], size, false)?;
         transcript.write_point(commitment[0]).unwrap();
 
         let u: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
@@ -548,7 +553,7 @@ pub mod shplonk {
             lx[0] = tmp;
         }
 
-        let commitments = batch_msm::<C, _>(&device, &g_buf, vec![&lx[..]], size)?;
+        let commitments = batch_msm::<C, _>(&device, &g_buf, vec![&lx[..]], size, false)?;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }

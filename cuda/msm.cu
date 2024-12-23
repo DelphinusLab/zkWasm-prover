@@ -108,7 +108,7 @@ __global__ void fill_buckte_indices(
     unsigned start = tpw * gid > tasks ? tasks : tpw * gid;
     unsigned end = start + tpw > tasks ? tasks : start + tpw;
 
-    unsigned offset = gid == 0 ? 0 : non_zero_count[gid - 1];
+    unsigned offset = non_zero_count ? (gid == 0 ? 0 : non_zero_count[gid - 1]) : start * windows;
     unsigned *point_indices = &total_point_indices[offset];
     unsigned *bucket_indices = &total_bucket_indices[offset];
     unsigned indices_idx = 0;
@@ -125,10 +125,10 @@ __global__ void fill_buckte_indices(
             unsigned bits = remain_bits < window_bits ? remain_bits : window_bits;
 
             unsigned idx = s.get_nbits(start_bit, bits);
-            if (idx > 0)
+            if (!non_zero_count || idx > 0)
             {
                 point_indices[indices_idx] = i;
-                bucket_indices[indices_idx] = (widx << window_bits) | idx;
+                bucket_indices[indices_idx] = ((widx << window_bits) * !!idx) | idx;
                 indices_idx++;
             }
         }
@@ -363,26 +363,30 @@ extern "C"
         int threads,
         int workers,
         int prepared_sort_indices_temp_storage_bytes,
+        int skip_zero,
         cudaStream_t stream)
     {
         assert(workers % threads == 0);
         unsigned blocks = workers / threads;
 
-        unsigned *non_zero_buckets = acc_indices_buf + workers;
-        CHECK_RETURN(cudaMemsetAsync(non_zero_buckets, 0, workers * sizeof(unsigned), stream));
-        count_nonzero_buckets<<<blocks, threads, 0, stream>>>(
-            non_zero_buckets,
-            bucket_indices, point_indices, scalars, windows, window_bits, n);
+        unsigned non_zero_count = n * windows;
+        unsigned *non_zero_buckets = NULL;
 
-        acc_nonzero_buckets<<<1, 64, 64 * sizeof(unsigned), stream>>>(
-            non_zero_buckets, workers);
+        if (skip_zero)
+        {
+            non_zero_buckets = acc_indices_buf + workers;
+            CHECK_RETURN(cudaMemsetAsync(non_zero_buckets, 0, workers * sizeof(unsigned), stream));
+            count_nonzero_buckets<<<blocks, threads, 0, stream>>>(
+                non_zero_buckets,
+                bucket_indices, point_indices, scalars, windows, window_bits, n);
+            acc_nonzero_buckets<<<1, 64, 64 * sizeof(unsigned), stream>>>(
+                non_zero_buckets, workers);
+            CHECK_RETURN(cudaMemcpyAsync(&non_zero_count, &non_zero_buckets[workers - 1], sizeof(unsigned), cudaMemcpyDeviceToHost, stream));
+        }
 
         fill_buckte_indices<<<blocks, threads, 0, stream>>>(
             non_zero_buckets,
             bucket_indices, point_indices, scalars, windows, window_bits, n);
-
-        unsigned non_zero_count = 0;
-        cudaMemcpyAsync(&non_zero_count, &non_zero_buckets[workers - 1], sizeof(unsigned), cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
 
         unsigned *sort_indices_temp_storage{};
