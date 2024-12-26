@@ -488,8 +488,7 @@ pub mod shplonk {
                 let z_i = diffs
                     .iter()
                     .map(|root| u - root)
-                    .reduce(|a, b| a * b)
-                    .unwrap();
+                    .fold(C::Scalar::one(), |a, b| a * b);
                 Ok((poly, z_i))
             })
             .collect::<DeviceResult<Vec<_>>>()?;
