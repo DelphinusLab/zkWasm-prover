@@ -23,6 +23,8 @@ pub(crate) fn generate_permutation_product<C: CurveAffine>(
     size: usize,
     unusable_rows_start: usize,
 ) -> Vec<Vec<<C as CurveAffine>::ScalarExt, HugePageAllocator>> {
+    let chunk_size = size >> 8;
+
     let chunk_len = &pk.vk.cs.degree() - 2;
     let omega = pk.get_vk().domain.get_omega();
 
@@ -41,14 +43,12 @@ pub(crate) fn generate_permutation_product<C: CurveAffine>(
         .cs
         .permutation
         .columns
-        .par_chunks(chunk_len)
-        .zip((&pk).permutation.permutations.par_chunks(chunk_len))
+        .chunks(chunk_len)
+        .zip((&pk).permutation.permutations.chunks(chunk_len))
         .zip(permutations)
         .enumerate()
         .map(|(i, ((columns, permutations), mut modified_values))| {
             let mut delta_omega = C::Scalar::DELTA.pow_vartime([i as u64 * chunk_len as u64]);
-
-            let chunk_size = size >> 3;
             // Iterate over each column of the permutation
             for (j, (&column, permuted_column_values)) in
                 columns.iter().zip(permutations.iter()).enumerate()
@@ -99,13 +99,33 @@ pub(crate) fn generate_permutation_product<C: CurveAffine>(
         .collect::<Vec<_>>();
 
     let mut tails: Vec<_> = p_z
-        .par_iter_mut()
+        .iter_mut()
         .map(|z| {
-            let mut tmp = C::Scalar::one();
-            for i in 0..size {
-                std::mem::swap(&mut tmp, &mut z[i]);
-                tmp = tmp * z[i];
+            let mut tails = z
+                .par_chunks_mut(chunk_size)
+                .map(|z| {
+                    let mut tmp = C::Scalar::one();
+                    for v in z {
+                        std::mem::swap(&mut tmp, v);
+                        tmp = tmp * *v;
+                    }
+                    tmp
+                })
+                .collect::<Vec<_>>();
+
+            for i in 1..tails.len() {
+                tails[i] = tails[i] * tails[i - 1];
             }
+
+            z.par_chunks_mut(chunk_size)
+                .skip(1)
+                .zip(tails.par_iter())
+                .map(|(z, tail)| {
+                    for v in z {
+                        *v = *v * tail;
+                    }
+                })
+                .collect::<Vec<_>>();
 
             fill_random(&mut z[unusable_rows_start + 1..]);
             z[unusable_rows_start]
@@ -116,10 +136,14 @@ pub(crate) fn generate_permutation_product<C: CurveAffine>(
         tails[i] = tails[i] * tails[i - 1];
     }
 
-    p_z.par_iter_mut().skip(1).enumerate().for_each(|(i, z)| {
-        for row in 0..=unusable_rows_start {
-            z[row] = z[row] * tails[i];
-        }
+    p_z.iter_mut().skip(1).enumerate().for_each(|(i, z)| {
+        z[0..=unusable_rows_start]
+            .par_chunks_mut(chunk_size)
+            .for_each(|z| {
+                for row in z {
+                    *row = *row * tails[i];
+                }
+            });
     });
 
     p_z

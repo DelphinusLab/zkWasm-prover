@@ -142,6 +142,56 @@ lazy_static! {
     static ref PINNED_BUFFER_CACHE: Mutex<SimpleAllocator> = Mutex::new(SimpleAllocator::new());
 }
 
+pub fn reserve_pinned_buffer(size: usize) {
+    // Default value is 210 for zkWasm
+    let size = if size == 0 { 210 } else { size };
+    let mut pinned_buffer_cache = PINNED_BUFFER_CACHE.lock().unwrap();
+    let extend_size = size
+        .checked_sub(pinned_buffer_cache.buffers.len())
+        .unwrap_or(0);
+
+    if extend_size > 0 {
+        let buffers = (0..extend_size)
+            .into_iter()
+            .map(|_| {
+                let p = unsafe {
+                    mmap(
+                        std::ptr::null_mut(),
+                        ALLOC_SIZE,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+                        -1,
+                        0,
+                    )
+                };
+
+                let p = if p != MAP_FAILED {
+                    let device = CudaDevice::get_device(0).unwrap();
+                    device
+                        .pin_memory(unsafe { slice::from_raw_parts_mut(p as *mut _, ALLOC_SIZE) })
+                        .unwrap();
+                    p
+                } else {
+                    let mut p: *mut c_void = unsafe { std::mem::zeroed() };
+                    let res = unsafe { cuda_runtime_sys::cudaMallocHost(&mut p, ALLOC_SIZE) };
+                    assert_eq!(res, cudaError::cudaSuccess);
+                    p
+                };
+
+                p as usize
+            })
+            .collect::<Vec<_>>();
+
+        for p in buffers {
+            let idx = pinned_buffer_cache.buffers.len();
+            pinned_buffer_cache.full_free_buffers.push(idx);
+            pinned_buffer_cache
+                .buffers
+                .push((p as usize, [false; CHUNCKS], 0));
+        }
+    }
+}
+
 pub fn print_pinned_cache_info() {
     let pinned_buffer_cache = PINNED_BUFFER_CACHE.lock().unwrap();
     info!(

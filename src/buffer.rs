@@ -38,7 +38,7 @@ pub fn prepare_fixed_buffer<C: CurveAffine>(
 ) -> [Vec<Vec<C::Scalar, HugePageAllocator>>; 2] {
     [
         pk.fixed_values
-            .iter()
+            .par_iter()
             .map(|x| {
                 let mut buf = Vec::new_in(HugePageAllocator);
                 buf.extend_from_slice(&x[..]);
@@ -46,7 +46,7 @@ pub fn prepare_fixed_buffer<C: CurveAffine>(
             })
             .collect::<Vec<_>>(),
         pk.fixed_polys
-            .iter()
+            .par_iter()
             .map(|x| {
                 let mut buf = Vec::new_in(HugePageAllocator);
                 buf.extend_from_slice(&x[..]);

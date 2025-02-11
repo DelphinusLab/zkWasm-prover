@@ -68,13 +68,13 @@ use crate::multiopen::ProverQuery;
 pub mod buffer;
 pub mod cuda;
 pub mod device;
+pub mod hugetlb;
 
 mod analyze;
 mod async_copy_queue;
 mod eval_h;
 mod eval_poly;
 mod expr;
-mod hugetlb;
 mod multiopen;
 mod permutation;
 mod profile;
@@ -1352,4 +1352,27 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
 
         Ok(())
     })
+}
+
+pub fn warm_up_buffers<C: CurveAffine>(pk: &ProvingKey<C>) {
+    let timer = start_timer!(|| "warm_up_buffers");
+    let gpu_reserve_chuncks = std::env::var("ZKWASM_PROVER_GPU_RESERVE_CHUNCKS")
+        .ok()
+        .and_then(|s| usize::from_str_radix(&s, 10).ok())
+        .unwrap_or(144);
+
+    {
+        let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
+        allocator.reset(
+            (1 << 22) * core::mem::size_of::<C::Scalar>(),
+            gpu_reserve_chuncks,
+        );
+    }
+
+    let size = 1 << pk.get_vk().domain.k();
+    prepare_lookup_buffer(pk).unwrap();
+    prepare_permutation_buffers(pk).unwrap();
+    prepare_shuffle_buffers(pk).unwrap();
+    generate_random_poly::<C::Scalar>(size);
+    end_timer!(timer);
 }
