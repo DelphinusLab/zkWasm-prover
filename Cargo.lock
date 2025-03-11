@@ -498,7 +498,7 @@ dependencies = [
 [[package]]
 name = "halo2_proofs"
 version = "0.1.0-beta.1"
-source = "git+https://github.com/DelphinusLab/halo2-gpu-specific?branch=moore/logup_extent#4446607ad99dbbf9d105ed65529d54fade9ca467"
+source = "git+https://github.com/DelphinusLab/halo2-gpu-specific?tag=stable-logup-shuffle-v1.0.0#acd882cf292953fab4ea4a282ef3d436348c05b1"
 dependencies = [
  "ark-std",
  "blake2b_simd",

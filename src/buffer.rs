@@ -160,15 +160,12 @@ pub(crate) fn prepare_shuffle_buffers<C: CurveAffine>(
     pk: &ProvingKey<C>,
 ) -> DeviceResult<Vec<Vec<C::Scalar, HugePageAllocator>>> {
     let size = 1 << pk.get_vk().domain.k();
-    let timer = start_timer!(|| format!(
-        "prepare shuffle buffer, count {}",
-        pk.vk.cs.shuffles.group(pk.vk.cs.degree()).len()
-    ));
+    let timer =
+        start_timer!(|| format!("prepare shuffle buffer, count {}", pk.vk.cs.shuffles.len()));
     let buffers = pk
         .vk
         .cs
         .shuffles
-        .group(pk.vk.cs.degree())
         .par_iter()
         .map(|_| {
             let mut z = Vec::new_in(HugePageAllocator);

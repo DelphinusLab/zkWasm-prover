@@ -336,6 +336,55 @@ impl<'a, F: FieldExt> EvalHContext<'a, F> {
         Ok(res)
     }
 
+    // ntt for value and then extend ntt
+    fn ntt_and_extend_ntt_async(
+        &mut self,
+        values: &[F],
+        beta_buf: &CudaDeviceBufRaw,
+        pq_buf: &CudaDeviceBufRaw,
+        omegas_buf: &CudaDeviceBufRaw,
+        divisor: &CudaDeviceBufRaw,
+    ) -> DeviceResult<(CudaDeviceBufRaw, (CudaStreamWrapper, CudaDeviceBufRaw))> {
+        let (sw, stream) = CudaStreamWrapper::new_with_inner();
+        let mut buf = self.alloc()?;
+        self.device
+            .copy_from_host_to_device_async(&buf, values, stream)?;
+
+        let mut tmp_buf = self.alloc()?;
+        field_op::<F>(
+            &self.device,
+            &buf,
+            &buf,
+            ((), beta_buf),
+            self.size,
+            FieldOp::Add,
+            Some(stream),
+        )?;
+        ntt_raw(
+            &self.device,
+            &mut buf,
+            &mut tmp_buf,
+            &pq_buf,
+            &omegas_buf,
+            self.k,
+            Some(divisor),
+            Some(&sw),
+        )?;
+        self.extended_ntt_prepare(&mut buf, Some(&sw))?;
+        ntt_raw(
+            &self.device,
+            &mut buf,
+            &mut tmp_buf,
+            &self.extended_ntt_pq_buf,
+            &self.extended_ntt_omegas_buf,
+            self.extended_k,
+            None,
+            Some(&sw),
+        )?;
+
+        Ok((buf, (sw, tmp_buf)))
+    }
+
     fn extended_ntt_wait(
         &mut self,
         last: (CudaStreamWrapper, CudaDeviceBufRaw),
@@ -534,54 +583,6 @@ pub(crate) fn evaluate_h_gates_and_vanishing_construct<
     }
 
     Ok((x, xn, h_pieces))
-}
-
-fn logup_transform_extend_coset_async<F: FieldExt>(
-    device: &CudaDevice,
-    values: &[F],
-    beta_buf: &CudaDeviceBufRaw,
-    pq_buf: &CudaDeviceBufRaw,
-    omegas_buf: &CudaDeviceBufRaw,
-    divisor: &CudaDeviceBufRaw,
-    ctx: &mut EvalHContext<F>,
-) -> DeviceResult<(CudaDeviceBufRaw, (CudaStreamWrapper, CudaDeviceBufRaw))> {
-    let (sw, stream) = CudaStreamWrapper::new_with_inner();
-    let mut buf = ctx.alloc()?;
-    device.copy_from_host_to_device_async(&buf, values, stream)?;
-
-    let mut tmp_buf = ctx.alloc()?;
-    field_op::<F>(
-        device,
-        &buf,
-        &buf,
-        ((), beta_buf),
-        ctx.size,
-        FieldOp::Add,
-        Some(stream),
-    )?;
-    ntt_raw(
-        &device,
-        &mut buf,
-        &mut tmp_buf,
-        &pq_buf,
-        &omegas_buf,
-        ctx.k,
-        Some(divisor),
-        Some(&sw),
-    )?;
-    ctx.extended_ntt_prepare(&mut buf, Some(&sw))?;
-    ntt_raw(
-        device,
-        &mut buf,
-        &mut tmp_buf,
-        &ctx.extended_ntt_pq_buf,
-        &ctx.extended_ntt_omegas_buf,
-        ctx.extended_k,
-        None,
-        Some(&sw),
-    )?;
-
-    Ok((buf, (sw, tmp_buf)))
 }
 
 fn evaluate_h_gates_core<'a, C: CurveAffine>(
@@ -921,14 +922,12 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
                 let mut inputs_beta_sets = vec![];
 
                 for input in inputs_sets_host[i].iter() {
-                    let (buf, stream_and_tmp) = logup_transform_extend_coset_async(
-                        device,
-                        &input,
+                    let (buf, stream_and_tmp) = ctx.ntt_and_extend_ntt_async(
+                        input,
                         &beta_buf,
                         &intt_pq_buf,
                         &intt_omegas_buf,
                         &intt_divisor_buf,
-                        &mut ctx,
                     )?;
                     inputs_beta_sets.push(buf);
 
@@ -966,14 +965,12 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
             drop(pendings);
             buf
         } else {
-            let (buf, (sw, tmp_buf)) = logup_transform_extend_coset_async(
-                device,
+            let (buf, (sw, tmp_buf)) = ctx.ntt_and_extend_ntt_async(
                 &table_host[..],
                 &beta_buf,
                 &intt_pq_buf,
                 &intt_omegas_buf,
                 &intt_divisor_buf,
-                &mut ctx,
             )?;
             ctx.extended_ntt_wait(last_waiting)?;
             ctx.extended_ntt_wait((sw, tmp_buf))?;
@@ -1088,8 +1085,10 @@ fn evaluate_h_gates_core<'a, C: CurveAffine>(
     }
     let betas_buf = device.alloc_device_buffer_from_slice(&betas[..])?;
 
-    let shuffle_group = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
-    for (_i, (shuffle, z)) in shuffle_group
+    for (_i, (shuffle, z)) in pk
+        .vk
+        .cs
+        .shuffles
         .iter()
         .zip(shuffle_products.iter())
         .enumerate()

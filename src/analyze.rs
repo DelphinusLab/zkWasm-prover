@@ -58,97 +58,6 @@ pub(crate) fn analyze_expr_tree<F: FieldExt>(
     expr_groups
 }
 
-// pub(crate) fn lookup_classify<'a, 'b, C: CurveAffine, T>(
-//     pk: &'b ProvingKey<C>,
-//     lookups_buf: Vec<T>,
-// ) -> [Vec<(usize, T)>; 3] {
-//     let mut single_unit_lookups = vec![];
-//     let mut single_comp_lookups = vec![];
-//     let mut tuple_lookups = vec![];
-//
-//     pk.vk
-//         .cs
-//         .lookups
-//         .iter()
-//         .zip(lookups_buf.into_iter())
-//         .enumerate()
-//         .for_each(|(i, (lookup, buf))| {
-//             let is_single =
-//                 lookup.input_expressions.len() == 1 && lookup.table_expressions.len() == 1;
-//
-//             if is_single {
-//                 let is_unit = is_expression_pure_unit(&lookup.input_expressions[0])
-//                     && is_expression_pure_unit(&lookup.table_expressions[0]);
-//                 if is_unit {
-//                     single_unit_lookups.push((i, buf));
-//                 } else {
-//                     single_comp_lookups.push((i, buf));
-//                 }
-//             } else {
-//                 tuple_lookups.push((i, buf))
-//             }
-//         });
-//
-//     return [single_unit_lookups, single_comp_lookups, tuple_lookups];
-// }
-
-/*
-pub(crate) fn lookup_classify<'a, 'b, C: CurveAffine, T>(
-    pk: &'b ProvingKey<C>,
-    lookups_buf: Vec<T>,
-) -> [Vec<(usize, T)>; 2] {
-    let mut single_lookups = vec![];
-    let mut tuple_lookups = vec![];
-
-    pk.vk
-        .cs
-        .lookups
-        .iter()
-        .zip(lookups_buf.into_iter())
-        .enumerate()
-        .for_each(|(i, (lookup, buf))| {
-            //any input expressions which belongs to same table has the same len with table
-            let is_single = lookup.table_expressions.len() == 1;
-            if is_single {
-                single_lookups.push((i, buf))
-            } else {
-                tuple_lookups.push((i, buf))
-            }
-        });
-
-    return [single_lookups, tuple_lookups];
-}
-*/
-
-// pub(crate) fn lookup_single_classify<'a, 'b, C: CurveAffine, T,U>(
-//     pk: &'b ProvingKey<C>,
-//     single_lookups: &mut Vec<(usize,T)>,
-// ) -> [Vec<(Expression<C::Scalar>, T)>; 2] {
-//     let mut single_unit_buff = vec![];
-//     let mut single_comp_buff = vec![];
-//     for (i, bufs) in single_lookups.iter_mut() {
-//         let lookup = &pk.vk.cs.lookups[*i];
-//         if is_expression_pure_unit(&lookup.table_expressions[0]) {
-//             single_unit_buff.push((&lookup.table_expressions[0], &mut bufs.1[..]))
-//         } else {
-//             single_comp_buff.push((&lookup.table_expressions[0], &mut bufs.1[..]))
-//         }
-//
-//         for (set, inputs) in lookup.input_expressions_sets.iter().zip(bufs.0.iter_mut()) {
-//             for (input_expressions, buf) in set.0.iter().zip(inputs.iter_mut()) {
-//                 assert_eq!(input_expressions.len(), 1);
-//                 if is_expression_pure_unit(&input_expressions[0]) {
-//                     single_unit_buff.push((&input_expressions[0], &mut buf[..]));
-//                 } else {
-//                     single_comp_buff.push((&input_expressions[0], &mut buf[..]));
-//                 }
-//             }
-//         }
-//     }
-//
-//     return [single_unit_buff, single_comp_buff];
-// }
-
 fn collect_involved_advices<F: FieldExt>(exprs: &[Expression<F>], units: &mut HashSet<usize>) {
     for expr in exprs {
         for (k, _) in ProveExpression::from_expr(expr).flatten() {
@@ -223,15 +132,17 @@ pub(crate) fn analyze_involved_advices<C: CurveAffine>(
         }
     }
 
-    for shuffle in &pk.vk.cs.shuffles.0 {
-        collect_involved_advices(
-            &shuffle.input_expressions[..],
-            &mut uninvolved_units_after_shuffle,
-        );
-        collect_involved_advices(
-            &shuffle.shuffle_expressions[..],
-            &mut uninvolved_units_after_shuffle,
-        );
+    for shuffle_group in &pk.vk.cs.shuffles {
+        for shuffle in shuffle_group.0.iter() {
+            collect_involved_advices(
+                &shuffle.input_expressions[..],
+                &mut uninvolved_units_after_shuffle,
+            );
+            collect_involved_advices(
+                &shuffle.shuffle_expressions[..],
+                &mut uninvolved_units_after_shuffle,
+            );
+        }
     }
 
     for i in uninvolved_units_after_shuffle.iter() {
