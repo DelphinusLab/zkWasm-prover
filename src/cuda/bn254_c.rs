@@ -223,7 +223,7 @@ extern "C" {
         n: i32,
     ) -> cudaError;
 
-    pub fn eval_logup_z(
+    pub fn eval_logup_z_compose(
         z: *mut c_void,
         input: *mut c_void,
         table: *mut c_void,

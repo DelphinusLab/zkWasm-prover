@@ -23,3 +23,4 @@ cc = "1.0.83"
 [features]
 default = ["halo2_proofs/cuda"]
 profile = ["ark-std/print-trace", "halo2_proofs/profile"]
+sanity-checks = []

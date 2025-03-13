@@ -109,6 +109,7 @@ pub(crate) fn lookup_compute_multiplicity<F: FieldExt>(
     fill_random(&mut multiplicity[unusable_rows_start..]);
 }
 
+#[allow(dead_code)]
 pub fn lookup_z_verifiy<C: CurveAffine>(
     device: &CudaDevice,
     pk: &ProvingKey<C>,
@@ -127,12 +128,13 @@ pub fn lookup_z_verifiy<C: CurveAffine>(
         generate_ntt_buffers(&device, pk.get_vk().domain.get_omega(), k)?;
     // While in Lagrange basis, check that grand sum is correctly constructed
     /*
+         sets[0] includes inputs, m and table
          φ_i(X) = f_i(X) + α
          τ(X) = t(X) + α
          LHS = τ(X) * Π(φ_i(X)) * (ϕ(gX) - ϕ(X))
          RHS = τ(X) * Π(φ_i(X)) * (∑ 1/(φ_i(X)) - m(X) / τ(X))))
 
-         extend inputs:
+         extended sets include only inputs, without m and table :
          φ_i(X) = f_i(X) + α
          LHS = Π(φ_i(X)) * (ϕ(gX) - ϕ(X))
          RHS = Π(φ_i(X)) * (∑ 1/(φ_i(X)))
@@ -190,14 +192,26 @@ pub fn lookup_z_verifiy<C: CurveAffine>(
             })
             .collect::<Vec<_>>();
 
-        for ((input, table), m) in input_set_sums[0]
-            .iter_mut()
-            .zip(table.iter())
-            .zip(m_lagrange.iter())
-        {
-            *input = *input - *m * &(*table + beta).invert().unwrap();
-        }
+        input_set_sums[0]
+            .par_iter_mut()
+            .zip(table.par_iter())
+            .zip(m_lagrange.par_iter())
+            .for_each(|((input, table), m)| {
+                *input = *input - *m * &(*table + beta).invert().unwrap();
+            });
 
+        //verify m correct
+        let sum = (0..u)
+            .into_par_iter()
+            .map(|i| {
+                input_set_sums
+                    .iter()
+                    .fold(C::Scalar::zero(), |acc, set| acc + set[i])
+            })
+            .reduce(|| C::Scalar::zero(), |acc, v| acc + v);
+        assert_eq!(sum, C::Scalar::zero());
+
+        //verify z correct
         for (zi, (input_set_sum, z_lag)) in
             input_set_sums.iter().zip(zs_lagrange.iter()).enumerate()
         {

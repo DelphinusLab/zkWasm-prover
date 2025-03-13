@@ -1965,7 +1965,7 @@ extern "C"
         return cudaGetLastError();
     }
 
-    cudaError_t eval_logup_z(
+    cudaError_t eval_logup_z_compose(
         Bn254FrField *z,
         Bn254FrField *input,
         Bn254FrField *table,

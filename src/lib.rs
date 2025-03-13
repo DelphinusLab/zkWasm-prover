@@ -37,6 +37,7 @@ use halo2_proofs::transcript::TranscriptWrite;
 use log::debug;
 use log::error;
 use log::info;
+#[cfg(feature = "sanity-checks")]
 use lookup::lookup_z_verifiy;
 use permutation::generate_permutation_product;
 use rayon::prelude::*;
@@ -44,7 +45,7 @@ use shuffle::generate_shuffle_product;
 
 use crate::buffer::*;
 use crate::cuda::bn254::logup_sum_input_inv;
-use crate::cuda::bn254_c::eval_logup_z;
+use crate::cuda::bn254_c::eval_logup_z_compose;
 use crate::cuda::bn254_c::eval_logup_z_pure;
 use crate::cuda::ntt::generate_ntt_buffers;
 use crate::device::cuda::to_result;
@@ -589,7 +590,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let timer = start_timer!(|| "generate lookup z");
         {
             let beta_buf = device.alloc_device_buffer_from_slice(&[beta])?;
-
+            // one lookup may include multiple z poly set. pre_z.tail == next_z.first
+            // last_z_buf just remember the previous z's tail value
             let last_z_buf = device.alloc_device_buffer::<C::Scalar>(pk.vk.cs.lookups.len())?;
             let tmp_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
             let mut z_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
@@ -637,6 +639,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         }
 
                         //let timer = start_timer!(|| "logup_sum_input_inv");
+                        // sum  1/(input_i+beta)
                         logup_sum_input_inv(
                             &device,
                             &sum_buf,
@@ -655,7 +658,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     let intt_tasks = if set_i == 0 {
                         //let timer = start_timer!(|| "eval_logup_z");
                         unsafe {
-                            let err = eval_logup_z(
+                            // calc z with inputs,table and m
+                            let err = eval_logup_z_compose(
                                 z_buf.ptr(),
                                 sum_buf.ptr(),
                                 table_buf.ptr(),
@@ -682,6 +686,7 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                         //let timer = start_timer!(|| "eval_logup_z_pure");
                         unsafe {
                             core::mem::swap(&mut z_buf, &mut sum_buf);
+                            // calc z only with inputs
                             let err = eval_logup_z_pure(
                                 z_buf.ptr(),
                                 sum_buf.ptr(),
@@ -713,6 +718,12 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                             Some(&calc_sw),
                         )?;
                         calc_sw.sync();
+                        #[cfg(feature = "sanity-checks")]
+                        {
+                            copy_queue
+                                .push_with_copy_buffer::<C::Scalar>(&device, s_buf, col, size)?;
+                        }
+                        #[cfg(not(feature = "sanity-checks"))]
                         if copy {
                             copy_queue
                                 .push_with_new_buffer::<C::Scalar>(&device, s_buf, col, size)?;
@@ -725,7 +736,8 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
             }
 
             // verify z for debug
-            if false {
+            #[cfg(feature = "sanity-checks")]
+            {
                 lookup_z_verifiy(&device, &pk, &lookups, &beta, unusable_rows_start)?;
             }
         }
