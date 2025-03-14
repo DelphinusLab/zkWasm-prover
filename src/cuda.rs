@@ -1,5 +1,5 @@
 pub mod bn254;
 pub mod bn254_c;
-
-#[cfg(test)]
-mod test;
+pub mod field_op;
+pub mod msm;
+pub mod ntt;

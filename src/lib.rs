@@ -4,51 +4,60 @@
 #[macro_use]
 extern crate lazy_static;
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::iter;
-use std::mem::ManuallyDrop;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::thread;
 
+use analyze::analyze_involved_advices;
 use ark_std::end_timer;
 use ark_std::rand::rngs::OsRng;
 use ark_std::start_timer;
-use cuda::bn254::batch_msm_v2;
-use cuda::bn254::intt_raw_async;
+use async_copy_queue::AsyncCopyQueue;
+use buffer::prepare_lookup_buffer;
+use cuda::msm::InttArgs;
+use cuda::ntt::ntt_raw;
+use cuda_runtime_sys::cudaError;
+use device::cuda::CudaStreamWrapper;
+use eval_poly::batch_poly_eval;
+use expr::evaluate_exprs;
+use expr::evaluate_exprs_in_gpu_pure;
+use expr::get_expr_degree;
+use expr::load_fixed_buffer_into_gpu_async;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::FieldExt;
-use halo2_proofs::pairing::group::ff::BatchInvert as _;
-use halo2_proofs::plonk::Any;
-use halo2_proofs::plonk::Expression;
 use halo2_proofs::plonk::ProvingKey;
 use halo2_proofs::poly::commitment::Params;
 use halo2_proofs::poly::Rotation;
 use halo2_proofs::transcript::EncodedChallenge;
 use halo2_proofs::transcript::TranscriptWrite;
-use rayon::iter::IndexedParallelIterator as _;
-use rayon::iter::IntoParallelIterator as _;
-use rayon::iter::IntoParallelRefIterator as _;
-use rayon::iter::IntoParallelRefMutIterator as _;
-use rayon::iter::ParallelIterator as _;
-use rayon::prelude::ParallelSliceMut as _;
-use rayon::slice::ParallelSlice as _;
+use log::debug;
+use log::error;
+use log::info;
+#[cfg(feature = "sanity-checks")]
+use lookup::lookup_z_verifiy;
+use permutation::generate_permutation_product;
+use rayon::prelude::*;
+use shuffle::generate_shuffle_product;
 
-use crate::cuda::bn254::batch_intt_raw;
-use crate::cuda::bn254::intt_raw;
-use crate::cuda::bn254::ntt_prepare;
-use crate::cuda::bn254_c::eval_lookup_z;
+use crate::buffer::*;
+use crate::cuda::bn254::logup_sum_input_inv;
+use crate::cuda::bn254_c::eval_logup_z_compose;
+use crate::cuda::bn254_c::eval_logup_z_pure;
+use crate::cuda::ntt::generate_ntt_buffers;
 use crate::device::cuda::to_result;
 use crate::device::cuda::CudaBuffer;
 use crate::device::cuda::CudaDevice;
 use crate::device::cuda::CudaDeviceBufRaw;
+use crate::device::cuda::CUDA_BUFFER_ALLOCATOR;
 use crate::device::Device as _;
 use crate::eval_h::evaluate_h_gates_and_vanishing_construct;
+use crate::expr::is_expression_pure_unit;
+use crate::hugetlb::print_pinned_cache_info;
 use crate::hugetlb::HugePageAllocator;
-use crate::hugetlb::UnpinnedHugePageAllocator;
 use crate::multiopen::gwc;
 use crate::multiopen::lookup_open;
 use crate::multiopen::permutation_product_open;
@@ -56,60 +65,31 @@ use crate::multiopen::shplonk;
 use crate::multiopen::shuffle_open;
 use crate::multiopen::ProverQuery;
 
+pub mod buffer;
 pub mod cuda;
 pub mod device;
+pub mod hugetlb;
 
+mod analyze;
+mod async_copy_queue;
 mod eval_h;
-mod hugetlb;
+mod eval_poly;
+mod expr;
+mod lookup;
 mod multiopen;
+mod permutation;
+mod profile;
+mod shuffle;
 
 const ADD_RANDOM: bool = true;
 
-pub fn prepare_advice_buffer<C: CurveAffine>(
-    pk: &ProvingKey<C>,
-    _pin_memory: bool,
-) -> Vec<Vec<C::Scalar, HugePageAllocator>> {
-    let rows = 1 << pk.get_vk().domain.k();
-    let columns = pk.get_vk().cs.num_advice_columns;
-    let zero = C::Scalar::zero();
-    let advices = (0..columns)
-        .into_par_iter()
-        .map(|_| {
-            let mut buf = Vec::new_in(HugePageAllocator);
-            buf.resize(rows, zero);
-            buf
-        })
-        .collect::<Vec<_>>();
-
-    let device = CudaDevice::get_device(0).unwrap();
-    if false {
-        for x in advices.iter() {
-            device.pin_memory(&x[..]).unwrap();
+pub(crate) fn fill_random<F: FieldExt>(data: &mut [F]) {
+    for cell in data {
+        if ADD_RANDOM {
+            *cell = F::random(&mut OsRng);
+        } else {
+            *cell = F::zero();
         }
-        for x in pk.fixed_values.iter() {
-            device.pin_memory(&x[..]).unwrap();
-        }
-        for x in pk.permutation.polys.iter() {
-            device.pin_memory(&x[..]).unwrap();
-        }
-    }
-
-    advices
-}
-
-pub fn unpin_advice_buffer<C: CurveAffine>(
-    pk: &ProvingKey<C>,
-    advices: &mut Vec<Vec<C::Scalar, HugePageAllocator>>,
-) {
-    let device = CudaDevice::get_device(0).unwrap();
-    for x in advices.iter() {
-        device.unpin_memory(&x[..]).unwrap();
-    }
-    for x in pk.fixed_values.iter() {
-        device.unpin_memory(&x[..]).unwrap();
-    }
-    for x in pk.permutation.polys.iter() {
-        device.unpin_memory(&x[..]).unwrap();
     }
 }
 
@@ -124,231 +104,11 @@ impl From<device::Error> for Error {
     }
 }
 
-fn is_expression_pure_unit<F: FieldExt>(x: &Expression<F>) -> bool {
-    x.is_constant().is_some()
-        || x.is_pure_fixed().is_some()
-        || x.is_pure_advice().is_some()
-        || x.is_pure_instance().is_some()
-}
-
-fn lookup_classify<'a, 'b, C: CurveAffine, T>(
-    pk: &'b ProvingKey<C>,
-    lookups_buf: Vec<T>,
-) -> [Vec<(usize, T)>; 3] {
-    let mut single_unit_lookups = vec![];
-    let mut single_comp_lookups = vec![];
-    let mut tuple_lookups = vec![];
-
-    pk.vk
-        .cs
-        .lookups
-        .iter()
-        .zip(lookups_buf.into_iter())
-        .enumerate()
-        .for_each(|(i, (lookup, buf))| {
-            let is_single =
-                lookup.input_expressions.len() == 1 && lookup.table_expressions.len() == 1;
-
-            if is_single {
-                let is_unit = is_expression_pure_unit(&lookup.input_expressions[0])
-                    && is_expression_pure_unit(&lookup.table_expressions[0]);
-                if is_unit {
-                    single_unit_lookups.push((i, buf));
-                } else {
-                    single_comp_lookups.push((i, buf));
-                }
-            } else {
-                tuple_lookups.push((i, buf))
-            }
-        });
-
-    return [single_unit_lookups, single_comp_lookups, tuple_lookups];
-}
-
-fn handle_lookup_pair<F: FieldExt>(
-    input: &mut Vec<F, HugePageAllocator>,
-    table: &mut Vec<F, HugePageAllocator>,
-    mut permuted_input: Vec<F, HugePageAllocator>,
-    mut permuted_table: Vec<F, HugePageAllocator>,
-    unusable_rows_start: usize,
-) -> (Vec<F, HugePageAllocator>, Vec<F, HugePageAllocator>) {
-    let compare = |a: &_, b: &_| unsafe {
-        let a: &[u64; 4] = std::mem::transmute(a);
-        let b: &[u64; 4] = std::mem::transmute(b);
-        a.cmp(b)
-    };
-
-    permuted_input[..].clone_from_slice(&input[..]);
-    let mut sorted_table = table.clone();
-
-    permuted_input[0..unusable_rows_start].sort_unstable_by(compare);
-    sorted_table[0..unusable_rows_start].sort_unstable_by(compare);
-
-    let mut permuted_table_state = Vec::new_in(UnpinnedHugePageAllocator);
-    permuted_table_state.resize(input.len(), false);
-
-    permuted_input
-        .iter()
-        .take(unusable_rows_start)
-        .zip(permuted_table_state.iter_mut().take(unusable_rows_start))
-        .zip(permuted_table.iter_mut().take(unusable_rows_start))
-        .enumerate()
-        .for_each(|(row, ((input_value, table_state), table_value))| {
-            // If this is the first occurrence of `input_value` in the input expression
-            if row == 0 || *input_value != permuted_input[row - 1] {
-                *table_state = true;
-                *table_value = *input_value;
-            }
-        });
-
-    let to_next_unique = |i: &mut usize| {
-        while *i < unusable_rows_start && !permuted_table_state[*i] {
-            *i += 1;
-        }
-    };
-
-    let mut i_unique_input_idx = 0;
-    let mut i_sorted_table_idx = 0;
-    for i in 0..unusable_rows_start {
-        to_next_unique(&mut i_unique_input_idx);
-        while i_unique_input_idx < unusable_rows_start
-            && permuted_table[i_unique_input_idx] == sorted_table[i_sorted_table_idx]
-        {
-            i_unique_input_idx += 1;
-            i_sorted_table_idx += 1;
-            to_next_unique(&mut i_unique_input_idx);
-        }
-        if !permuted_table_state[i] {
-            permuted_table[i] = sorted_table[i_sorted_table_idx];
-            i_sorted_table_idx += 1;
-        }
-    }
-
-    if ADD_RANDOM {
-        for cell in &mut permuted_input[unusable_rows_start..] {
-            *cell = F::random(&mut OsRng);
-        }
-        for cell in &mut permuted_table[unusable_rows_start..] {
-            *cell = F::random(&mut OsRng);
-        }
-    } else {
-        for cell in &mut permuted_input[unusable_rows_start..] {
-            *cell = F::zero();
-        }
-        for cell in &mut permuted_table[unusable_rows_start..] {
-            *cell = F::zero();
-        }
-    }
-
-    (permuted_input, permuted_table)
-}
-
-/// Simple evaluation of an expression
-pub fn evaluate_expr<F: FieldExt>(
-    expression: &Expression<F>,
-    size: usize,
-    rot_scale: i32,
-    fixed: &[&[F]],
-    advice: &[&[F]],
-    instance: &[&[F]],
-    res: &mut [F],
-) {
-    let isize = size as i32;
-
-    let get_rotation_idx = |idx: usize, rot: i32, rot_scale: i32, isize: i32| -> usize {
-        (((idx as i32) + (rot * rot_scale)).rem_euclid(isize)) as usize
-    };
-
-    for (idx, value) in res.iter_mut().enumerate() {
-        *value = expression.evaluate(
-            &|scalar| scalar,
-            &|_| panic!("virtual selectors are removed during optimization"),
-            &|_, column_index, rotation| {
-                fixed[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-            },
-            &|_, column_index, rotation| {
-                advice[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-            },
-            &|_, column_index, rotation| {
-                instance[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-            },
-            &|a| -a,
-            &|a, b| a + &b,
-            &|a, b| {
-                let a = a();
-
-                if a == F::zero() {
-                    a
-                } else {
-                    a * b()
-                }
-            },
-            &|a, scalar| a * scalar,
-        );
-    }
-}
-
-/// Simple evaluation of an expression
-pub fn evaluate_exprs<F: FieldExt>(
-    expressions: &[Expression<F>],
-    size: usize,
-    rot_scale: i32,
-    fixed: &[&[F]],
-    advice: &[&[F]],
-    instance: &[&[F]],
-    theta: F,
-    res: &mut [F],
-) {
-    let isize = size as i32;
-    let get_rotation_idx = |idx: usize, rot: i32, rot_scale: i32, isize: i32| -> usize {
-        (((idx as i32) + (rot * rot_scale)).rem_euclid(isize)) as usize
-    };
-
-    let chunks = 8;
-    let chunk_size = size / chunks;
-
-    res.par_chunks_mut(chunk_size)
-        .enumerate()
-        .for_each(|(chunk_idx, res_chunck)| {
-            for (i, value) in res_chunck.into_iter().enumerate() {
-                let idx = chunk_idx * chunk_size + i;
-                for (i, expression) in expressions.iter().enumerate() {
-                    let v = expression.evaluate(
-                        &|scalar| scalar,
-                        &|_| panic!("virtual selectors are removed during optimization"),
-                        &|_, column_index, rotation| {
-                            fixed[column_index][get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                        },
-                        &|_, column_index, rotation| {
-                            advice[column_index]
-                                [get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                        },
-                        &|_, column_index, rotation| {
-                            instance[column_index]
-                                [get_rotation_idx(idx, rotation.0, rot_scale, isize)]
-                        },
-                        &|a| -a,
-                        &|a, b| a + &b,
-                        &|a, b| {
-                            let a = a();
-                            if a == F::zero() {
-                                a
-                            } else {
-                                a * b()
-                            }
-                        },
-                        &|a, scalar| a * scalar,
-                    );
-
-                    if i > 0 && *value != F::zero() {
-                        *value = *value * theta;
-                        *value += v;
-                    } else {
-                        *value = v;
-                    }
-                }
-            }
-        });
+pub fn prepare_advice_buffer<C: CurveAffine>(
+    pk: &ProvingKey<C>,
+    _pin_memory: bool,
+) -> Vec<Vec<C::Scalar, HugePageAllocator>> {
+    crate::buffer::prepare_advice_buffer(pk)
 }
 
 pub fn create_proof_from_advices<
@@ -393,110 +153,53 @@ pub fn create_proof_from_advices_with_shplonk<
     _create_proof_from_advices(params, pk, instances, advices, transcript, false)
 }
 
-pub fn prepare_lookup_buffer<C: CurveAffine>(
-    pk: &ProvingKey<C>,
-) -> Result<
-    Vec<(
-        Vec<C::Scalar, HugePageAllocator>,
-        Vec<C::Scalar, HugePageAllocator>,
-        Vec<C::Scalar, HugePageAllocator>,
-        Vec<C::Scalar, HugePageAllocator>,
-        Vec<C::Scalar, HugePageAllocator>,
-    )>,
-    Error,
-> {
-    let size = 1 << pk.get_vk().domain.k();
-    let timer = start_timer!(|| format!("prepare lookup buffer, count {}", pk.vk.cs.lookups.len()));
-    let lookups = pk
+fn print_prove_info<C: CurveAffine>(pk: &ProvingKey<C>) -> Result<(), Error> {
+    info!(
+        "permutation groups is {}",
+        (&pk)
+            .vk
+            .cs
+            .permutation
+            .columns
+            .chunks(&pk.vk.cs.degree() - 2)
+            .len()
+    );
+
+    let _lookup_sets = pk
         .vk
         .cs
         .lookups
-        .par_iter()
-        .map(|_| {
-            let mut input = Vec::new_in(HugePageAllocator);
-            input.resize(size, C::Scalar::zero());
-            let mut table = Vec::new_in(HugePageAllocator);
-            table.resize(size, C::Scalar::zero());
-            let mut permuted_input = Vec::new_in(HugePageAllocator);
-            permuted_input.resize(size, C::Scalar::zero());
-            let mut permuted_table = Vec::new_in(HugePageAllocator);
-            permuted_table.resize(size, C::Scalar::zero());
-            let mut z = Vec::new_in(HugePageAllocator);
-            z.resize(size, C::Scalar::zero());
-
-            if false {
-                let device = CudaDevice::get_device(0).unwrap();
-                device.pin_memory(&permuted_input[..]).unwrap();
-                device.pin_memory(&permuted_table[..]).unwrap();
-                device.pin_memory(&z[..]).unwrap();
-            }
-
-            (input, table, permuted_input, permuted_table, z)
-        })
+        .iter()
+        .map(|lookup| lookup.input_expressions_sets.len())
         .collect::<Vec<_>>();
-    end_timer!(timer);
-    Ok(lookups)
-}
+    info!(
+        "lookups len={}, sets={:?}",
+        pk.vk.cs.lookups.len(),
+        _lookup_sets
+    );
 
-pub fn prepare_permutation_buffers<C: CurveAffine>(
-    pk: &ProvingKey<C>,
-) -> Result<Vec<Vec<C::Scalar, HugePageAllocator>>, Error> {
-    let size = 1 << pk.get_vk().domain.k();
-    let chunk_len = &pk.vk.cs.degree() - 2;
-    let timer = start_timer!(|| format!(
-        "prepare permutation buffer, count {}",
-        pk.vk.cs.permutation.columns.par_chunks(chunk_len).len()
-    ));
-    let buffers = pk
-        .vk
-        .cs
-        .permutation
-        .columns
-        .par_chunks(chunk_len)
-        .map(|_| {
-            let mut z = Vec::new_in(HugePageAllocator);
-            z.resize(size, C::Scalar::one());
-
-            if false {
-                let device = CudaDevice::get_device(0).unwrap();
-                device.pin_memory(&z[..]).unwrap();
-            }
-
-            z
-        })
-        .collect::<Vec<_>>();
-    end_timer!(timer);
-    Ok(buffers)
-}
-
-pub fn prepare_shuffle_buffers<C: CurveAffine>(
-    pk: &ProvingKey<C>,
-) -> Result<Vec<Vec<C::Scalar, HugePageAllocator>>, Error> {
-    let size = 1 << pk.get_vk().domain.k();
-    let timer = start_timer!(|| format!(
-        "prepare shuffle buffer, count {}",
-        pk.vk.cs.shuffles.group(pk.vk.cs.degree()).len()
-    ));
-    let buffers = pk
+    let _shuffle_group = pk
         .vk
         .cs
         .shuffles
-        .group(pk.vk.cs.degree())
         .iter()
-        .map(|_| {
-            let mut z = Vec::new_in(HugePageAllocator);
-            z.resize(size, C::Scalar::one());
-
-            if false {
-                let device = CudaDevice::get_device(0).unwrap();
-                device.pin_memory(&z[..]).unwrap();
-            }
-
-            z
-        })
+        .map(|x| x.0.len())
         .collect::<Vec<_>>();
-    end_timer!(timer);
-    Ok(buffers)
+    info!(
+        "product shuffles total={}, group={:?}",
+        (&pk).vk.cs.shuffles.len(),
+        _shuffle_group
+    );
+
+    info!("k is {}", pk.get_vk().domain.k());
+
+    print_pinned_cache_info();
+
+    let device = CudaDevice::get_device(0).unwrap();
+    device.synchronize()?;
+    device.print_memory_info()?;
+
+    Ok(())
 }
 
 fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
@@ -508,19 +211,32 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
     use_gwc: bool,
 ) -> Result<(), Error> {
     if pk.ev.gpu_gates_expr.len() != 1 {
-        println!("Multi-GPU detected, please set CUDA_VISIBLE_DEVICES to use one GPU");
+        error!("Multi-GPU detected, please set CUDA_VISIBLE_DEVICES to use one GPU");
         assert!(false);
     }
 
-    println!("k is {}", pk.get_vk().domain.k());
+    let gpu_reserve_chuncks = std::env::var("ZKWASM_PROVER_GPU_RESERVE_CHUNCKS")
+        .ok()
+        .and_then(|s| usize::from_str_radix(&s, 10).ok())
+        .unwrap_or(144);
 
     thread::scope(|s| {
+        {
+            let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
+            allocator.reset(
+                (1 << 22) * core::mem::size_of::<C::Scalar>(),
+                gpu_reserve_chuncks,
+            );
+        }
+
+        let timer = start_timer!(|| "proof prepare");
+
         let k = pk.get_vk().domain.k() as usize;
         let size = 1 << pk.get_vk().domain.k();
+        let advices_len = advices.len();
+        let instances_len = instances.len();
         let meta = &pk.vk.cs;
         let unusable_rows_start = size - (meta.blinding_factors() + 1);
-        let omega = pk.get_vk().domain.get_omega();
-
         let domain = &pk.vk.domain;
 
         pk.vk.hash_into(transcript).unwrap();
@@ -539,448 +255,311 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .collect::<Vec<_>>(),
         );
 
+        let named = &pk.vk.cs.named_advices;
+        unsafe { Arc::get_mut_unchecked(&mut advices) }
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, advice)| {
+                if named.iter().find(|n| n.1 as usize == i).is_none() {
+                    fill_random(&mut advice[unusable_rows_start..]);
+                }
+            });
+
         let device = CudaDevice::get_device(0).unwrap();
 
-        device.synchronize()?;
-        device.print_memory_info()?;
+        let (intt_omegas_buf, intt_pq_buf) =
+            generate_ntt_buffers(&device, pk.get_vk().domain.get_omega_inv(), k)?;
+        let intt_divisor_buf = device
+            .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
 
-        // add random value
-        if ADD_RANDOM {
-            let named = &pk.vk.cs.named_advices;
-            unsafe { Arc::get_mut_unchecked(&mut advices) }
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(i, advice)| {
-                    if named.iter().find(|n| n.1 as usize == i).is_none() {
-                        for cell in &mut advice[unusable_rows_start..] {
-                            *cell = C::Scalar::random(&mut OsRng);
-                        }
-                    }
-                });
-        }
+        let (
+            uninvolved_units,
+            uninvolved_units_after_single_lookup,
+            uninvolved_units_after_tuple_lookup,
+            uninvolved_units_after_permutation,
+            uninvolved_units_after_shuffle,
+        ) = analyze_involved_advices(pk);
+        end_timer!(timer);
+
+        print_prove_info(pk)?;
+
+        let mut fixed_buffer_handler = s.spawn(move || prepare_fixed_buffer(pk));
 
         let timer = start_timer!(|| "copy g_lagrange buffer");
-        let g_lagrange_buf = device
-            .alloc_device_buffer_from_slice(&params.g_lagrange[..])
-            .unwrap();
         let g_buf = device
             .alloc_device_buffer_from_slice(&params.g[..])
             .unwrap();
+        let g_lagrange_buf = device
+            .alloc_device_buffer_from_slice(&params.g_lagrange[..])
+            .unwrap();
         end_timer!(timer);
 
-        // thread for part of lookups
-        let sub_pk = pk.clone();
-        let sub_advices = advices.clone();
-        let sub_instances = instances.clone();
-        let lookup_handler = s.spawn(move || {
+        let buffer_handler = s.spawn(move || {
             let timer = start_timer!(|| "prepare buffers");
             let lookups = prepare_lookup_buffer(pk).unwrap();
             let permutations = prepare_permutation_buffers(pk).unwrap();
             let shuffles = prepare_shuffle_buffers(pk).unwrap();
+            let random_poly = generate_random_poly::<C::Scalar>(size);
             end_timer!(timer);
 
-            let pk = sub_pk;
-            let advices = sub_advices;
-            let instances = sub_instances;
-
-            let [single_unit_lookups, single_comp_lookups, tuple_lookups] =
-                lookup_classify(&pk, lookups);
-
-            //let timer = start_timer!(|| format!("permute lookup unit {}", single_unit_lookups.len()));
-            let single_unit_lookups = single_unit_lookups
-                .into_par_iter()
-                .map(
-                    |(i, (mut input, mut table, permuted_input, permuted_table, z))| {
-                        let f = |expr: &Expression<_>, target: &mut [_]| {
-                            if let Some(v) = expr.is_constant() {
-                                target.fill(v);
-                            } else if let Some(idx) = expr.is_pure_fixed() {
-                                target.clone_from_slice(&pk.fixed_values[idx].values[..]);
-                            } else if let Some(idx) = expr.is_pure_instance() {
-                                target.clone_from_slice(&instances[idx][..]);
-                            } else if let Some(idx) = expr.is_pure_advice() {
-                                target.clone_from_slice(&advices[idx][..]);
-                            } else {
-                                unreachable!()
-                            }
-                        };
-
-                        f(&pk.vk.cs.lookups[i].input_expressions[0], &mut input[..]);
-                        f(&pk.vk.cs.lookups[i].table_expressions[0], &mut table[..]);
-                        let (permuted_input, permuted_table) = handle_lookup_pair(
-                            &mut input,
-                            &mut table,
-                            permuted_input,
-                            permuted_table,
-                            unusable_rows_start,
-                        );
-                        (i, (permuted_input, permuted_table, input, table, z))
-                    },
-                )
-                .collect::<Vec<_>>();
-            //end_timer!(timer);
-
-            let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-
-            let timer =
-                start_timer!(|| format!("permute lookup comp {}", single_comp_lookups.len()));
-            let single_comp_lookups = single_comp_lookups
-                .into_par_iter()
-                .map(
-                    |(i, (mut input, mut table, permuted_input, permuted_table, z))| {
-                        let f = |expr: &Expression<_>, target: &mut [_]| {
-                            evaluate_expr(
-                                expr,
-                                size,
-                                1,
-                                fixed_ref,
-                                advice_ref,
-                                instance_ref,
-                                target,
-                            )
-                        };
-
-                        f(&pk.vk.cs.lookups[i].input_expressions[0], &mut input[..]);
-                        f(&pk.vk.cs.lookups[i].table_expressions[0], &mut table[..]);
-                        let (permuted_input, permuted_table) = handle_lookup_pair(
-                            &mut input,
-                            &mut table,
-                            permuted_input,
-                            permuted_table,
-                            unusable_rows_start,
-                        );
-                        (i, (permuted_input, permuted_table, input, table, z))
-                    },
-                )
-                .collect::<Vec<_>>();
-            end_timer!(timer);
-
-            (
-                single_unit_lookups,
-                single_comp_lookups,
-                tuple_lookups,
-                permutations,
-                shuffles,
-            )
+            (lookups, permutations, shuffles, random_poly)
         });
 
-        let s_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-        let t_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+        // GPU Task: MSM & INTT of advices & instances, load fixed values into GPU
+        let mut fixed_buffers = std::collections::HashMap::new();
+        let mut fixed_values = vec![];
+        let mut fixed_polys = vec![];
+        let mut advice_and_instance_device_buffers = {
+            let timer = start_timer!(|| format!(
+                "instances and advices msm {}",
+                instances.len() + advices.len()
+            ));
 
-        // Advice MSM
-        let timer = start_timer!(|| format!(
-            "instances and advices msm {}",
-            instances.len() + advices.len()
-        ));
-        let commitments = crate::cuda::bn254::batch_msm::<C>(
-            &g_lagrange_buf,
-            [&s_buf, &t_buf],
-            instances
-                .iter()
-                .chain(advices.iter())
-                .map(|x| &x[..])
-                .collect(),
-            size,
-        )?;
-        for commitment in commitments.iter().take(instances.len()) {
-            transcript.common_point(*commitment).unwrap();
-        }
-        for commitment in commitments.into_iter().skip(instances.len()) {
-            transcript.write_point(commitment).unwrap();
-        }
-        end_timer!(timer);
+            let copy_sw = CudaStreamWrapper::new();
+
+            let (commitments, advice_and_instance_device_buffers) =
+                crate::cuda::msm::batch_msm_and_intt_ext::<C>(
+                    &device,
+                    &g_lagrange_buf,
+                    unsafe {
+                        Arc::get_mut_unchecked(&mut advices)
+                            .iter_mut()
+                            .chain(Arc::get_mut_unchecked(&mut instances).iter_mut())
+                            .map(|x| &mut x[..])
+                            .collect()
+                    },
+                    InttArgs {
+                        pq_buf: &intt_pq_buf,
+                        omegas_buf: &intt_omegas_buf,
+                        divisor_buf: &intt_divisor_buf,
+                        len_log: k,
+                        selector: &|x| uninvolved_units.contains(&x),
+                    },
+                    &|x| !uninvolved_units.contains(&x),
+                    &mut || {
+                        let mut s = s.spawn(move || [vec![], vec![]]);
+                        core::mem::swap(&mut s, &mut fixed_buffer_handler);
+
+                        let timer = start_timer!(|| "wait fixed buffers");
+                        let mut buffers = s.join().unwrap();
+                        end_timer!(timer);
+                        core::mem::swap(&mut buffers[0], &mut fixed_values);
+                        core::mem::swap(&mut buffers[1], &mut fixed_polys);
+
+                        let fixed_ref =
+                            &fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+                        for (_, lookup) in pk.vk.cs.lookups.iter().enumerate() {
+                            load_fixed_buffer_into_gpu_async(
+                                &device,
+                                &mut fixed_buffers,
+                                &lookup.table_expressions[..],
+                                fixed_ref,
+                                &copy_sw,
+                            )
+                            .unwrap();
+
+                            for (_, input_sets) in lookup.input_expressions_sets.iter().enumerate()
+                            {
+                                for (_, input) in input_sets.0.iter().enumerate() {
+                                    load_fixed_buffer_into_gpu_async(
+                                        &device,
+                                        &mut fixed_buffers,
+                                        &input[..],
+                                        fixed_ref,
+                                        &copy_sw,
+                                    )
+                                    .unwrap();
+                                }
+                            }
+                        }
+                    },
+                    size,
+                    true,
+                )?;
+            for commitment in commitments.iter().skip(advices.len()) {
+                transcript.common_point(*commitment).unwrap();
+            }
+            for commitment in commitments.into_iter().take(advices.len()) {
+                transcript.write_point(commitment).unwrap();
+            }
+            copy_sw.sync();
+            end_timer!(timer);
+            advice_and_instance_device_buffers
+        };
+
+        info!(
+            "advice_and_instance_device_buffers size is {}",
+            advice_and_instance_device_buffers.len()
+        );
 
         let theta: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
-        let timer = start_timer!(|| "wait single lookups");
-        let (
-            mut single_unit_lookups,
-            mut single_comp_lookups,
-            mut tuple_lookups,
-            permutations,
-            shuffles,
-        ) = lookup_handler.join().unwrap();
+        let timer = start_timer!(|| "wait prepare buffers");
+        let (mut lookups, permutations, shuffles, random_poly) = buffer_handler.join().unwrap();
+        let random_buffer = device.alloc_device_buffer_from_slice(&random_poly[..])?;
         end_timer!(timer);
 
-        // After theta
-        let sub_pk = pk.clone();
-        let sub_advices = advices.clone();
-        let sub_instance = instances.clone();
-        let tuple_lookup_handler = s.spawn(move || {
-            let pk = sub_pk;
-            let advices = sub_advices;
-            let instances = sub_instance;
-            let timer = start_timer!(|| format!("permute lookup tuple {}", tuple_lookups.len()));
+        info!("fixed_buffers size is {}", fixed_buffers.len());
 
-            let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-            let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+        let timer = start_timer!(|| "calc lookup Mi(x)");
+        let mut lookup_device_buffers = HashMap::new();
+        let fixed_ref = &fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+        {
+            let index_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let sorted_index_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let start_offset_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let candidate_sort_temp_storage_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
 
-            let mut buffers = vec![];
-            for (i, (input, table, _, _, _)) in tuple_lookups.iter_mut() {
-                buffers.push((&pk.vk.cs.lookups[*i].input_expressions[..], &mut input[..]));
-                buffers.push((&pk.vk.cs.lookups[*i].table_expressions[..], &mut table[..]));
-            }
+            let tmp_buf0 = device.alloc_device_buffer::<C::Scalar>(size)?;
+            let tmp_buf1 = device.alloc_device_buffer::<C::Scalar>(size)?;
 
-            buffers.into_par_iter().for_each(|(expr, buffer)| {
-                evaluate_exprs(
-                    expr,
-                    size,
-                    1,
+            let (calc_sw, calc_stream) = CudaStreamWrapper::new_with_inner();
+
+            for (i, lookup) in pk.vk.cs.lookups.iter().enumerate() {
+                let m_device_buffer = device.alloc_device_buffer::<C::Scalar>(size)?;
+
+                // let timer = start_timer!(|| "eval table");
+                let table_device_buffer = evaluate_exprs_in_gpu_pure(
+                    &device,
+                    &advice_and_instance_device_buffers,
+                    &mut fixed_buffers,
+                    &lookup.table_expressions[..],
                     fixed_ref,
-                    advice_ref,
-                    instance_ref,
                     theta,
-                    buffer,
-                )
-            });
+                    advices_len,
+                    size,
+                )?;
+                // end_timer!(timer);
 
-            let tuple_lookups = tuple_lookups
-                .into_par_iter()
-                .map(
-                    |(i, (mut input, mut table, permuted_input, permuted_table, z))| {
-                        let (permuted_input, permuted_table) = handle_lookup_pair(
-                            &mut input,
-                            &mut table,
-                            permuted_input,
-                            permuted_table,
-                            unusable_rows_start,
-                        );
-                        (i, (permuted_input, permuted_table, input, table, z))
-                    },
-                )
-                .collect::<Vec<_>>();
-            end_timer!(timer);
+                // let timer = start_timer!(|| "prepare_table_lookup");
+                unsafe {
+                    let res = crate::cuda::bn254_c::prepare_table_lookup(
+                        table_device_buffer.ptr(),
+                        tmp_buf0.ptr(),
+                        tmp_buf1.ptr(),
+                        index_buf.ptr(),
+                        sorted_index_buf.ptr(),
+                        start_offset_buf.ptr(),
+                        candidate_sort_temp_storage_buf.ptr(),
+                        (std::mem::size_of::<C::Scalar>() * size) as u32,
+                        k as u32,
+                        unusable_rows_start as u32,
+                        calc_stream,
+                    );
 
-            tuple_lookups
-        });
+                    assert!(res == cudaError::cudaSuccess);
+                }
+                calc_sw.sync();
+                // end_timer!(timer);
 
-        let mut lookup_permuted_commitments = vec![C::identity(); pk.vk.cs.lookups.len() * 2];
+                for (_, input_sets) in lookup.input_expressions_sets.iter().enumerate() {
+                    for (_, input) in input_sets.0.iter().enumerate() {
+                        // calc about 20us for k22 in RTX4090
 
-        let timer = start_timer!(|| format!(
-            "single lookup msm {} {}",
-            single_unit_lookups.len(),
-            single_comp_lookups.len()
-        ));
+                        // let timer = start_timer!(|| "eval input");
+                        let input_device_buffer = evaluate_exprs_in_gpu_pure(
+                            &device,
+                            &advice_and_instance_device_buffers,
+                            &mut fixed_buffers,
+                            &input[..],
+                            fixed_ref,
+                            theta,
+                            advices_len,
+                            size,
+                        )?;
+                        // end_timer!(timer);
 
-        {
-            let mut lookup_scalars = vec![];
-            for (_, (permuted_input, permuted_table, _, _, _)) in single_unit_lookups.iter() {
-                lookup_scalars.push(&permuted_input[..]);
-                lookup_scalars.push(&permuted_table[..])
+                        // calc about 1ms for k22 in RTX4090
+
+                        // let timer = start_timer!(|| "calc_m");
+                        unsafe {
+                            let res = crate::cuda::bn254_c::calc_m(
+                                m_device_buffer.ptr(),
+                                table_device_buffer.ptr(),
+                                input_device_buffer.ptr(),
+                                sorted_index_buf.ptr(),
+                                start_offset_buf.ptr(),
+                                tmp_buf0.ptr(),
+                                tmp_buf1.ptr(),
+                                candidate_sort_temp_storage_buf.ptr(),
+                                (std::mem::size_of::<C::Scalar>() * size) as u32,
+                                k as u32,
+                                unusable_rows_start as u32,
+                                calc_stream,
+                            );
+
+                            assert!(res == cudaError::cudaSuccess);
+                        }
+                        calc_sw.sync();
+                        // end_timer!(timer);
+                    }
+                }
+
+                lookup_device_buffers.insert((i, 1), table_device_buffer);
+                lookup_device_buffers.insert((i, 2), m_device_buffer);
             }
-            for (_, (permuted_input, permuted_table, _, _, _)) in single_comp_lookups.iter() {
-                lookup_scalars.push(&permuted_input[..]);
-                lookup_scalars.push(&permuted_table[..])
-            }
-            let commitments = crate::cuda::bn254::batch_msm::<C>(
-                &g_lagrange_buf,
-                [&s_buf, &t_buf],
-                lookup_scalars,
-                size,
-            )?;
-            let mut tidx = 0;
-            for (i, _) in single_unit_lookups.iter() {
-                lookup_permuted_commitments[i * 2] = commitments[tidx];
-                lookup_permuted_commitments[i * 2 + 1] = commitments[tidx + 1];
-                tidx += 2;
-            }
-            for (i, _) in single_comp_lookups.iter() {
-                lookup_permuted_commitments[i * 2] = commitments[tidx];
-                lookup_permuted_commitments[i * 2 + 1] = commitments[tidx + 1];
-                tidx += 2;
-            }
-        }
+        };
         end_timer!(timer);
 
-        let timer = start_timer!(|| "wait tuple lookup");
-        let mut tuple_lookups = tuple_lookup_handler.join().unwrap();
+        drop(fixed_values);
+
+        let permutation_polys_handler = s.spawn(|| prepare_permutation_poly_buffer(pk));
+
+        debug!(
+            "lookup_device_buffers size is {}",
+            lookup_device_buffers.len()
+        );
+
+        // MSM on Mi(x)
+        let timer = start_timer!(|| "lookup Mi(x) msm");
+        let lookup_multiplicity_commitments = crate::cuda::msm::batch_msm_ext::<C, _>(
+            &device,
+            &g_lagrange_buf,
+            (0..pk.vk.cs.lookups.len())
+                .map(|i| lookup_device_buffers.get(&(i, 2)).unwrap())
+                .collect(),
+            &mut || {},
+            size,
+            true,
+        )?;
         end_timer!(timer);
 
-        let timer = start_timer!(|| format!("tuple lookup msm {}", tuple_lookups.len()));
-        {
-            let mut lookup_scalars = vec![];
-            for (_, (permuted_input, permuted_table, _, _, _)) in tuple_lookups.iter() {
-                lookup_scalars.push(&permuted_input[..]);
-                lookup_scalars.push(&permuted_table[..])
-            }
-            let commitments = crate::cuda::bn254::batch_msm::<C>(
-                &g_lagrange_buf,
-                [&s_buf, &t_buf],
-                lookup_scalars,
-                size,
-            )?;
-            let mut tidx = 0;
-            for (i, _) in tuple_lookups.iter() {
-                lookup_permuted_commitments[i * 2] = commitments[tidx];
-                lookup_permuted_commitments[i * 2 + 1] = commitments[tidx + 1];
-                tidx += 2;
-            }
-        }
-        end_timer!(timer);
-
-        for commitment in lookup_permuted_commitments.into_iter() {
+        for commitment in lookup_multiplicity_commitments.into_iter() {
             transcript.write_point(commitment).unwrap();
         }
 
         let beta: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
         let gamma: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
 
-        let mut lookups = vec![];
-        lookups.append(&mut single_unit_lookups);
-        lookups.append(&mut single_comp_lookups);
-        lookups.append(&mut tuple_lookups);
-        lookups.sort_by(|l, r| usize::cmp(&l.0, &r.0));
-
-        let chunk_len = &pk.vk.cs.degree() - 2;
-
+        // CPU Task: Generate Permutation product and Shuffle product
         let waker = Arc::new((Mutex::new(false), Condvar::new()));
         let waiter = Arc::clone(&waker);
         let permutation_products_handler = {
-            let timer = start_timer!(|| format!(
-                "product permutation {}",
-                (&pk).vk.cs.permutation.columns.chunks(chunk_len).len()
-            ));
-
-            let sub_pk = pk.clone();
             let sub_advices = advices.clone();
             let sub_instance = instances.clone();
             let permutation_products_handler = s.spawn(move || {
-                let pk = sub_pk;
-                let advices = sub_advices;
-                let instances = sub_instance;
-
-                let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-                let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-                let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-                let mut p_z = pk
-                    .vk
-                    .cs
-                    .permutation
-                    .columns
-                    .par_chunks(chunk_len)
-                    .zip((&pk).permutation.permutations.par_chunks(chunk_len))
-                    .zip(permutations)
-                    .enumerate()
-                    .map(|(i, ((columns, permutations), mut modified_values))| {
-                        let mut delta_omega =
-                            C::Scalar::DELTA.pow_vartime([i as u64 * chunk_len as u64]);
-
-                        let chunk_size = size >> 2;
-                        // Iterate over each column of the permutation
-                        for (j, (&column, permuted_column_values)) in
-                            columns.iter().zip(permutations.iter()).enumerate()
-                        {
-                            let values = match column.column_type() {
-                                Any::Advice => advice_ref,
-                                Any::Fixed => fixed_ref,
-                                Any::Instance => instance_ref,
-                            };
-                            modified_values
-                                .par_chunks_mut(chunk_size)
-                                .zip(permuted_column_values.par_chunks(chunk_size))
-                                .zip(values[column.index()].par_chunks(chunk_size))
-                                .for_each(|((res, p), v)| {
-                                    for i in 0..chunk_size {
-                                        if j == 0 {
-                                            res[i] = beta * p[i] + &gamma + v[i];
-                                        } else {
-                                            res[i] *= &(beta * p[i] + &gamma + v[i]);
-                                        }
-                                    }
-                                });
-                        }
-
-                        // Invert to obtain the denominator for the permutation product polynomial
-                        modified_values.par_chunks_mut(chunk_size).for_each(|x| {
-                            x.iter_mut().batch_invert();
-                        });
-
-                        // Iterate over each column again, this time finishing the computation
-                        // of the entire fraction by computing the numerators
-                        for &column in columns.iter() {
-                            let values = match column.column_type() {
-                                Any::Advice => advice_ref,
-                                Any::Fixed => fixed_ref,
-                                Any::Instance => instance_ref,
-                            };
-
-                            modified_values
-                                .par_chunks_mut(chunk_size)
-                                .zip(values[column.index()].par_chunks(chunk_size))
-                                .enumerate()
-                                .for_each(|(idx, (res, v))| {
-                                    let mut delta_omega = delta_omega
-                                        * omega.pow_vartime([(idx * chunk_size) as u64])
-                                        * &beta;
-                                    for i in 0..chunk_size {
-                                        res[i] *= &(delta_omega + &gamma + v[i]);
-                                        delta_omega *= &omega;
-                                    }
-                                });
-
-                            delta_omega *= &C::Scalar::DELTA;
-                        }
-
-                        modified_values
-                    })
-                    .collect::<Vec<_>>();
+                let z = generate_permutation_product(
+                    pk,
+                    sub_instance,
+                    sub_advices,
+                    permutations,
+                    beta,
+                    gamma,
+                    size,
+                    unusable_rows_start,
+                );
 
                 let (lock, cvar) = &*waker;
                 let mut started = lock.lock().unwrap();
                 *started = true;
                 cvar.notify_one();
 
-                let mut tails: Vec<_> = p_z
-                    .par_iter_mut()
-                    .map(|z| {
-                        let mut tmp = C::Scalar::one();
-                        for i in 0..size {
-                            std::mem::swap(&mut tmp, &mut z[i]);
-                            tmp = tmp * z[i];
-                        }
-
-                        if ADD_RANDOM {
-                            for v in z[unusable_rows_start + 1..].iter_mut() {
-                                *v = C::Scalar::random(&mut OsRng);
-                            }
-                        } else {
-                            for v in z[unusable_rows_start + 1..].iter_mut() {
-                                *v = C::Scalar::zero();
-                            }
-                        }
-
-                        z[unusable_rows_start]
-                    })
-                    .collect();
-
-                for i in 1..tails.len() {
-                    tails[i] = tails[i] * tails[i - 1];
-                }
-
-                p_z.par_iter_mut().skip(1).enumerate().for_each(|(i, z)| {
-                    for row in 0..=unusable_rows_start {
-                        z[row] = z[row] * tails[i];
-                    }
-                });
-
-                p_z
+                z
             });
-            end_timer!(timer);
             permutation_products_handler
         };
 
         let shuffle_products_handler = {
-            let shuffle_groups = pk.vk.cs.shuffles.group(pk.vk.cs.degree());
-            let timer = start_timer!(|| format!(
-                "product shuffles total={}, group={}",
-                (&pk).vk.cs.shuffles.0.len(),
-                shuffle_groups.len()
-            ));
-
-            let sub_pk = pk.clone();
             let sub_advices = advices.clone();
             let sub_instance = instances.clone();
             let shuffle_products_handler = s.spawn(move || {
@@ -990,339 +569,331 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                     started = cvar.wait(started).unwrap();
                 }
 
-                let pk = sub_pk;
-                let advices = sub_advices;
-                let instances = sub_instance;
-
-                let fixed_ref = &pk.fixed_values.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-                let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-                let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
-
-                let mut more_buffer_groups = shuffle_groups
-                    .par_iter()
-                    .map(|group| {
-                        group
-                            .0
-                            .iter()
-                            .map(|elements| {
-                                let input_buffer = if elements.input_expressions.len() == 1
-                                    && is_expression_pure_unit(&elements.input_expressions[0])
-                                {
-                                    None
-                                } else {
-                                    let mut buffer = Vec::new_in(UnpinnedHugePageAllocator);
-                                    buffer.resize(size, C::Scalar::zero());
-                                    Some(buffer)
-                                };
-
-                                let shuffle_buffer = if elements.shuffle_expressions.len() == 1
-                                    && is_expression_pure_unit(&elements.input_expressions[0])
-                                {
-                                    None
-                                } else {
-                                    let mut buffer = Vec::new_in(UnpinnedHugePageAllocator);
-                                    buffer.resize(size, C::Scalar::zero());
-                                    Some(buffer)
-                                };
-                                (input_buffer, shuffle_buffer)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-
-                let f = |expr: &Expression<_>| {
-                    if let Some(_) = expr.is_constant() {
-                        unreachable!()
-                    } else if let Some(idx) = expr.is_pure_fixed() {
-                        &fixed_ref[idx][..]
-                    } else if let Some(idx) = expr.is_pure_instance() {
-                        &instance_ref[idx][..]
-                    } else if let Some(idx) = expr.is_pure_advice() {
-                        &advice_ref[idx][..]
-                    } else {
-                        unreachable!()
-                    }
-                };
-
-                let buffer_groups = shuffle_groups
-                    .par_iter()
-                    .zip(more_buffer_groups.par_iter_mut())
-                    .map(|(group, buffers)| {
-                        group
-                            .0
-                            .par_iter()
-                            .zip(buffers.par_iter_mut())
-                            .map(|(elements, buffer)| {
-                                let mut tuple_expres = vec![];
-                                if !(elements.input_expressions.len() == 1
-                                    && is_expression_pure_unit(&elements.input_expressions[0]))
-                                {
-                                    tuple_expres.push((
-                                        &elements.input_expressions[..],
-                                        buffer.0.as_mut().unwrap(),
-                                    ));
-                                }
-                                if !(elements.shuffle_expressions.len() == 1
-                                    && is_expression_pure_unit(&elements.shuffle_expressions[0]))
-                                {
-                                    tuple_expres.push((
-                                        &elements.shuffle_expressions[..],
-                                        buffer.1.as_mut().unwrap(),
-                                    ))
-                                }
-                                tuple_expres.into_par_iter().for_each(|(expr, buffer)| {
-                                    evaluate_exprs(
-                                        expr,
-                                        size,
-                                        1,
-                                        fixed_ref,
-                                        advice_ref,
-                                        instance_ref,
-                                        theta,
-                                        buffer,
-                                    )
-                                });
-
-                                let input_buffer_ref = if elements.input_expressions.len() == 1
-                                    && is_expression_pure_unit(&elements.input_expressions[0])
-                                {
-                                    f(&elements.input_expressions[0])
-                                } else {
-                                    buffer.0.as_ref().unwrap()
-                                };
-                                let shuffle_buffer_ref = if elements.shuffle_expressions.len() == 1
-                                    && is_expression_pure_unit(&elements.shuffle_expressions[0])
-                                {
-                                    f(&elements.shuffle_expressions[0])
-                                } else {
-                                    buffer.1.as_ref().unwrap()
-                                };
-                                (input_buffer_ref, shuffle_buffer_ref)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-
-                let mut p_z = buffer_groups
-                    .par_iter()
-                    .zip(shuffles.into_par_iter())
-                    .map(|(group, mut modified_values)| {
-                        let beta_pows: Vec<C::Scalar> = (0..group.len())
-                            .map(|i| beta.pow_vartime([1 + i as u64, 0, 0, 0]))
-                            .collect();
-
-                        let chunk_size = size >> 2;
-                        group.iter().zip(beta_pows.iter()).enumerate().for_each(
-                            |(j, (e, beta_pow_i))| {
-                                modified_values
-                                    .par_chunks_mut(chunk_size)
-                                    .zip(e.1.par_chunks(chunk_size))
-                                    .for_each(|(values, shuffles)| {
-                                        for i in 0..chunk_size {
-                                            if j == 0 {
-                                                values[i] = shuffles[i] + beta_pow_i;
-                                            } else {
-                                                values[i] *= &(shuffles[i] + beta_pow_i);
-                                            }
-                                        }
-                                    })
-                            },
-                        );
-                        modified_values.par_chunks_mut(chunk_size).for_each(|x| {
-                            x.iter_mut().batch_invert();
-                        });
-                        group
-                            .iter()
-                            .zip(beta_pows.iter())
-                            .for_each(|(e, beta_pow_i)| {
-                                modified_values
-                                    .par_chunks_mut(chunk_size)
-                                    .zip(e.0.par_chunks(chunk_size))
-                                    .for_each(|(values, inputs)| {
-                                        for i in 0..chunk_size {
-                                            values[i] *= &(inputs[i] + beta_pow_i);
-                                        }
-                                    })
-                            });
-                        modified_values
-                    })
-                    .collect::<Vec<_>>();
-
-                p_z.par_iter_mut().for_each(|z| {
-                    let chunks = 4;
-                    let chunk_size = (size + chunks - 1) / chunks;
-
-                    let mut tails = z
-                        .par_chunks_mut(chunk_size)
-                        .map(|z| {
-                            let mut tmp = C::Scalar::one();
-                            for i in 0..z.len() {
-                                std::mem::swap(&mut tmp, &mut z[i]);
-                                tmp = tmp * z[i];
-                            }
-                            tmp
-                        })
-                        .collect::<Vec<_>>();
-
-                    for i in 1..tails.len() {
-                        tails[i] = tails[i] * tails[i - 1];
-                    }
-
-                    z.par_chunks_mut(chunk_size)
-                        .skip(1)
-                        .zip(tails.into_par_iter())
-                        .for_each(|(z, tail)| {
-                            for x in z.iter_mut() {
-                                *x = *x * tail;
-                            }
-                        });
-
-                    if ADD_RANDOM {
-                        for v in z[unusable_rows_start + 1..].iter_mut() {
-                            *v = C::Scalar::random(&mut OsRng);
-                        }
-                    } else {
-                        for v in z[unusable_rows_start + 1..].iter_mut() {
-                            *v = C::Scalar::zero();
-                        }
-                    }
-                });
-                p_z
+                generate_shuffle_product(
+                    pk,
+                    sub_instance,
+                    sub_advices,
+                    shuffles,
+                    beta,
+                    theta,
+                    size,
+                    unusable_rows_start,
+                )
             });
-            end_timer!(timer);
             shuffle_products_handler
         };
 
-        let timer = start_timer!(|| "prepare ntt");
-        let (intt_omegas_buf, intt_pq_buf) =
-            ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
-        let intt_divisor_buf = device
-            .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
-        end_timer!(timer);
+        let mut copy_queue = AsyncCopyQueue::new(28);
 
+        // GPU Task: Generate Lookup product
+        let mut z_buffers = vec![];
         let timer = start_timer!(|| "generate lookup z");
         {
-            const MAX_CONCURRENCY: usize = 3;
-            let mut streams = [None; MAX_CONCURRENCY];
-            let mut buffers = [0; MAX_CONCURRENCY].map(|_| {
-                Rc::new([0; 5].map(|_| (device.alloc_device_buffer::<C::Scalar>(size).unwrap())))
-            });
+            let beta_buf = device.alloc_device_buffer_from_slice(&[beta])?;
+            // one lookup may include multiple z poly set. pre_z.tail == next_z.first
+            // last_z_buf just remember the previous z's tail value
+            let last_z_buf = device.alloc_device_buffer::<C::Scalar>(pk.vk.cs.lookups.len())?;
+            let tmp_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
+            let mut z_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
+            let mut t_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
+            let mut sum_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
 
-            let beta_gamma_buf = device.alloc_device_buffer_from_slice(&[beta, gamma])?;
-            for (i, (permuted_input, permuted_table, input, table, z)) in lookups.iter_mut() {
-                unsafe {
-                    let idx = *i % MAX_CONCURRENCY;
-                    let [z_buf, input_buf, table_buf, permuted_input_buf, permuted_table_buf] =
-                        Rc::get_mut(&mut buffers[idx]).unwrap();
+            let (calc_sw, calc_stream) = CudaStreamWrapper::new_with_inner();
 
-                    if let Some(last_stream) = streams[idx] {
-                        cuda_runtime_sys::cudaStreamSynchronize(last_stream);
-                        cuda_runtime_sys::cudaStreamDestroy(last_stream);
+            for ((lookup_i, lookup), (input, table, multiplicity, z_set)) in
+                pk.vk.cs.lookups.iter().enumerate().zip(lookups.iter_mut())
+            {
+                let mut multiplicity_buf = lookup_device_buffers.remove(&(lookup_i, 2)).unwrap();
+                let table_buf = lookup_device_buffers.remove(&(lookup_i, 1)).unwrap();
+
+                //let timer = start_timer!(|| "copy table");
+                if get_expr_degree(&lookup.table_expressions) == 1 {
+                    copy_queue.push_with_copy_buffer(&device, &table_buf, &mut table[..], size)?;
+                }
+                //end_timer!(timer);
+
+                for (set_i, input_sets) in lookup.input_expressions_sets.iter().enumerate() {
+                    for (set_inner_i, input_expr) in input_sets.0.iter().enumerate() {
+                        //let timer = start_timer!(|| "eval input");
+                        let input_buf = evaluate_exprs_in_gpu_pure(
+                            &device,
+                            &advice_and_instance_device_buffers,
+                            &mut fixed_buffers,
+                            &input_expr[..],
+                            &[],
+                            theta,
+                            advices_len,
+                            size,
+                        )?;
+                        //end_timer!(timer);
+
+                        if get_expr_degree(input_expr) == 1 {
+                            //let timer = start_timer!(|| "copy input");
+                            copy_queue.push_with_copy_buffer(
+                                &device,
+                                &input_buf,
+                                &mut input[set_i][set_inner_i][..],
+                                size,
+                            )?;
+                            //end_timer!(timer);
+                        }
+
+                        //let timer = start_timer!(|| "logup_sum_input_inv");
+                        // sum  1/(input_i+beta)
+                        logup_sum_input_inv(
+                            &device,
+                            &sum_buf,
+                            &input_buf,
+                            &tmp_buf,
+                            &beta_buf,
+                            set_inner_i,
+                            size,
+                            Some(calc_stream),
+                        )?;
+
+                        calc_sw.sync();
+                        //end_timer!(timer);
                     }
 
-                    let mut stream = std::mem::zeroed();
-                    let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-                    crate::device::cuda::to_result((), err, "fail to run cudaStreamCreate")?;
+                    let intt_tasks = if set_i == 0 {
+                        //let timer = start_timer!(|| "eval_logup_z");
+                        unsafe {
+                            // calc z with inputs,table and m
+                            let err = eval_logup_z_compose(
+                                z_buf.ptr(),
+                                sum_buf.ptr(),
+                                table_buf.ptr(),
+                                multiplicity_buf.ptr(),
+                                beta_buf.ptr(),
+                                last_z_buf
+                                    .ptr()
+                                    .add(lookup_i * core::mem::size_of::<C::Scalar>()),
+                                unusable_rows_start as i32,
+                                size as i32,
+                                calc_stream,
+                            );
 
-                    for (d_buf, h_buf) in [
-                        (&*input_buf, &mut input[..]),
-                        (&*table_buf, &mut table[..]),
-                        (&*permuted_input_buf, &mut permuted_input[..]),
-                        (&*permuted_table_buf, &mut permuted_table[..]),
-                    ] {
-                        device.copy_from_host_to_device_async(d_buf, h_buf, stream)?;
-                    }
+                            to_result((), err, "failed to run eval_logup_z")?;
+                        }
+                        calc_sw.sync();
+                        //end_timer!(timer);
 
-                    let err = eval_lookup_z(
-                        z_buf.ptr(),
-                        input_buf.ptr(),
-                        table_buf.ptr(),
-                        permuted_input_buf.ptr(),
-                        permuted_table_buf.ptr(),
-                        beta_gamma_buf.ptr(),
-                        size as i32,
-                        stream,
-                    );
+                        vec![
+                            (&mut multiplicity_buf, &mut multiplicity[..], true),
+                            (&mut z_buf, &mut z_set[set_i][..], false),
+                        ]
+                    } else {
+                        //let timer = start_timer!(|| "eval_logup_z_pure");
+                        unsafe {
+                            core::mem::swap(&mut z_buf, &mut sum_buf);
+                            // calc z only with inputs
+                            let err = eval_logup_z_pure(
+                                z_buf.ptr(),
+                                sum_buf.ptr(),
+                                table_buf.ptr(),
+                                last_z_buf
+                                    .ptr()
+                                    .add(lookup_i * core::mem::size_of::<C::Scalar>()),
+                                unusable_rows_start as i32,
+                                size as i32,
+                                calc_stream,
+                            );
 
-                    to_result((), err, "failed to run eval_lookup_z")?;
+                            to_result((), err, "failed to run eval_logup_z")?;
+                        }
+                        //end_timer!(timer);
 
-                    for s_buf in [
-                        &mut *permuted_input_buf,
-                        &mut *permuted_table_buf,
-                        &mut *z_buf,
-                    ] {
-                        intt_raw_async(
+                        vec![(&mut z_buf, &mut z_set[set_i][..], false)]
+                    };
+
+                    for (s_buf, col, copy) in intt_tasks {
+                        ntt_raw(
                             &device,
                             s_buf,
-                            &mut *input_buf,
+                            &mut t_buf,
                             &intt_pq_buf,
                             &intt_omegas_buf,
-                            &intt_divisor_buf,
                             k,
-                            Some(stream),
+                            Some(&intt_divisor_buf),
+                            Some(&calc_sw),
                         )?;
+                        calc_sw.sync();
+                        #[cfg(feature = "sanity-checks")]
+                        {
+                            copy_queue
+                                .push_with_copy_buffer::<C::Scalar>(&device, s_buf, col, size)?;
+                        }
+                        #[cfg(not(feature = "sanity-checks"))]
+                        if copy {
+                            copy_queue
+                                .push_with_new_buffer::<C::Scalar>(&device, s_buf, col, size)?;
+                        }
                     }
 
-                    for (col, s_buf) in [
-                        (&mut permuted_input[..], permuted_input_buf),
-                        (&mut permuted_table[..], permuted_table_buf),
-                        (&mut z[..], z_buf),
-                    ] {
-                        device.copy_from_device_to_host_async(col, &s_buf, stream)?;
-                    }
-
-                    streams[idx] = Some(stream);
+                    z_buffers.push((z_buf, lookup_i, set_i));
+                    z_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
                 }
             }
 
-            unsafe {
-                for last_stream in streams {
-                    if let Some(last_stream) = last_stream {
-                        cuda_runtime_sys::cudaStreamSynchronize(last_stream);
-                        cuda_runtime_sys::cudaStreamDestroy(last_stream);
-                    }
-                }
+            // verify z for debug
+            #[cfg(feature = "sanity-checks")]
+            {
+                lookup_z_verifiy(&device, &pk, &lookups, &beta, unusable_rows_start)?;
             }
         }
-
-        let mut lookups = lookups.into_iter().map(|(_, b)| b).collect::<Vec<_>>();
         end_timer!(timer);
 
-        let timer = start_timer!(|| format!("lookup z msm {}", lookups.len()));
-        let lookup_z_commitments = crate::cuda::bn254::batch_msm::<C>(
-            &g_buf,
-            [&s_buf, &t_buf],
-            lookups.iter().map(|x| &x.4[..]).collect::<Vec<_>>(),
-            size,
-        )?;
-        end_timer!(timer);
+        drop(fixed_buffers);
+
+        let (lookup_z_commitments, random_commitment) = {
+            let (sw, stream) = CudaStreamWrapper::new_with_inner();
+
+            let mut s_bufs: Vec<_> = (0..advices_len)
+                .into_iter()
+                .filter(|i| {
+                    uninvolved_units_after_single_lookup.contains(i)
+                        || uninvolved_units_after_tuple_lookup.contains(i)
+                })
+                .map(|i| advice_and_instance_device_buffers.remove(&i).unwrap())
+                .collect();
+
+            let timer =
+                start_timer!(|| format!("INTT on lookup involved advices {}", s_bufs.len()));
+            let mut t_buf = device.alloc_device_buffer_non_zeroed::<C::Scalar>(size)?;
+
+            for s_buf in s_bufs.iter_mut() {
+                ntt_raw(
+                    &device,
+                    s_buf,
+                    &mut t_buf,
+                    &intt_pq_buf,
+                    &intt_omegas_buf,
+                    k,
+                    Some(&intt_divisor_buf),
+                    Some(&sw),
+                )
+                .unwrap();
+            }
+            sw.sync();
+            copy_queue.sync_all();
+            end_timer!(timer);
+
+            let timer = start_timer!(|| format!("lookup z msm {}", z_buffers.len() + 1));
+            let mut buffers = unsafe {
+                Arc::get_mut_unchecked(&mut advices)
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(i, _)| {
+                        uninvolved_units_after_single_lookup.contains(i)
+                            || uninvolved_units_after_tuple_lookup.contains(i)
+                    })
+                    .map(|(_, x)| &mut x[..])
+                    .collect::<Vec<_>>()
+            };
+
+            for (dev_buf, host_buf) in s_bufs.iter().zip(buffers.iter_mut()) {
+                device
+                    .copy_from_device_to_host_async(host_buf, dev_buf, stream)
+                    .unwrap();
+            }
+
+            let mut lookup_z_and_random_commitments = crate::cuda::msm::batch_msm_ext::<C, _>(
+                &device,
+                &g_buf,
+                z_buffers
+                    .iter()
+                    .map(|x| &x.0)
+                    .chain(vec![random_buffer].iter())
+                    .collect::<Vec<_>>(),
+                &mut || {},
+                size,
+                false,
+            )?;
+
+            for (z, lookup_i, set_i) in z_buffers {
+                copy_queue.push(&device, z, &mut lookups[lookup_i].3[set_i])?;
+            }
+            drop(sw);
+            drop(buffers);
+            drop(s_bufs);
+            end_timer!(timer);
+
+            let random_commitment = lookup_z_and_random_commitments.pop().unwrap();
+            (lookup_z_and_random_commitments, random_commitment)
+        };
 
         let timer = start_timer!(|| "wait permutation_products");
         let mut permutation_products = permutation_products_handler.join().unwrap();
         end_timer!(timer);
 
-        let timer = start_timer!(|| "permutation z msm and intt");
-        let permutation_commitments = crate::cuda::bn254::batch_msm::<C>(
-            &g_lagrange_buf,
-            [&s_buf, &t_buf],
-            permutation_products
-                .iter()
-                .map(|x| &x[..])
-                .collect::<Vec<_>>(),
-            size,
-        )?;
+        let timer = start_timer!(|| "permutation z msm and intt & advice intt");
+        let sw = CudaStreamWrapper::new();
+        let mut s_bufs: Vec<_> = (0..advices_len)
+            .into_iter()
+            .filter(|i| uninvolved_units_after_permutation.contains(i))
+            .map(|i| advice_and_instance_device_buffers.remove(&i).unwrap())
+            .collect();
 
-        batch_intt_raw(
+        {
+            let timer =
+                start_timer!(|| format!("INTT on permutation involved advices {}", s_bufs.len()));
+            let mut t_buf = device
+                .alloc_device_buffer_non_zeroed::<C::Scalar>(size)
+                .unwrap();
+            for s_buf in s_bufs.iter_mut() {
+                ntt_raw(
+                    &device,
+                    s_buf,
+                    &mut t_buf,
+                    &intt_pq_buf,
+                    &intt_omegas_buf,
+                    k,
+                    Some(&intt_divisor_buf),
+                    Some(&sw),
+                )?;
+            }
+            sw.sync();
+            end_timer!(timer);
+        }
+
+        let mut buffers = unsafe {
+            Arc::get_mut_unchecked(&mut advices)
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| uninvolved_units_after_permutation.contains(i))
+                .map(|(_, x)| &mut x[..])
+                .collect::<Vec<_>>()
+        };
+
+        let (permutation_commitments, _) = crate::cuda::msm::batch_msm_and_intt_ext::<C>(
             &device,
+            &g_lagrange_buf,
             permutation_products
                 .iter_mut()
                 .map(|x| &mut x[..])
                 .collect::<Vec<_>>(),
-            &intt_pq_buf,
-            &intt_omegas_buf,
-            &intt_divisor_buf,
-            k,
+            InttArgs {
+                pq_buf: &intt_pq_buf,
+                omegas_buf: &intt_omegas_buf,
+                divisor_buf: &intt_divisor_buf,
+                len_log: k,
+                selector: &|_| true,
+            },
+            &|_| false,
+            &mut || {
+                for (dev_buf, host_buf) in s_bufs.iter_mut().zip(buffers.iter_mut()) {
+                    copy_queue
+                        .push_with_new_buffer(&device, dev_buf, *host_buf, size)
+                        .unwrap();
+                }
+            },
+            size,
+            false,
         )?;
+
+        drop(sw);
+        drop(s_bufs);
+        drop(buffers);
         end_timer!(timer);
 
         let timer = start_timer!(|| "wait shuffle_products");
@@ -1330,78 +901,98 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         end_timer!(timer);
 
         let timer = start_timer!(|| "shuffle z msm and intt");
-        let shuffle_commitments = crate::cuda::bn254::batch_msm::<C>(
-            &g_lagrange_buf,
-            [&s_buf, &t_buf],
-            shuffle_products.iter().map(|x| &x[..]).collect::<Vec<_>>(),
-            size,
-        )?;
-
-        batch_intt_raw(
-            &device,
-            shuffle_products
-                .iter_mut()
-                .map(|x| &mut x[..])
-                .collect::<Vec<_>>(),
-            &intt_pq_buf,
-            &intt_omegas_buf,
-            &intt_divisor_buf,
-            k,
-        )?;
-        end_timer!(timer);
-
-        for commitment in permutation_commitments {
-            transcript.write_point(commitment).unwrap();
-        }
-
-        for (_i, commitment) in lookup_z_commitments.into_iter().enumerate() {
-            transcript.write_point(commitment).unwrap();
-        }
-
-        for commitment in shuffle_commitments {
-            transcript.write_point(commitment).unwrap();
-        }
-
-        let g_buf = g_lagrange_buf;
-        device.copy_from_host_to_device(&g_buf, &params.g[..])?;
-
-        // TODO: move to sub-thread
-        let timer = start_timer!(|| "random_poly");
-        let random_poly = vanish_commit(&device, &s_buf, &g_buf, size, transcript).unwrap();
-        end_timer!(timer);
-
-        let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
-
-        let timer = start_timer!(|| "h_poly");
         {
-            let timer = start_timer!(|| "instances and advices intt");
-
-            let buffers = unsafe {
-                Arc::get_mut_unchecked(&mut instances)
+            let mut buffers = unsafe {
+                Arc::get_mut_unchecked(&mut advices)
                     .iter_mut()
-                    .map(|x| &mut x[..])
+                    .enumerate()
+                    .filter(|(i, _)| uninvolved_units_after_shuffle.contains(i))
+                    .map(|(_, x)| &mut x[..])
                     .chain(
-                        Arc::get_mut_unchecked(&mut advices)
+                        Arc::get_mut_unchecked(&mut instances)
                             .iter_mut()
                             .map(|x| &mut x[..]),
                     )
                     .collect::<Vec<_>>()
             };
-            batch_intt_raw(
-                &device,
-                buffers,
-                &intt_pq_buf,
-                &intt_omegas_buf,
-                &intt_divisor_buf,
-                k,
-            )?;
 
+            let mut s_bufs: Vec<_> = (0..advices_len + instances_len)
+                .into_iter()
+                .filter_map(|i| advice_and_instance_device_buffers.remove(&i))
+                .collect();
+
+            let (sw, stream) = CudaStreamWrapper::new_with_inner();
+
+            let (shuffle_commitments, _) = crate::cuda::msm::batch_msm_and_intt_ext::<C>(
+                &device,
+                &g_lagrange_buf,
+                shuffle_products
+                    .iter_mut()
+                    .map(|x| &mut x[..])
+                    .collect::<Vec<_>>(),
+                InttArgs {
+                    pq_buf: &intt_pq_buf,
+                    omegas_buf: &intt_omegas_buf,
+                    divisor_buf: &intt_divisor_buf,
+                    len_log: k,
+                    selector: &|_| true,
+                },
+                &|_| false,
+                &mut || {
+                    let mut t_buf = device.alloc_device_buffer::<C::Scalar>(size).unwrap();
+                    for s_buf in s_bufs.iter_mut() {
+                        ntt_raw(
+                            &device,
+                            s_buf,
+                            &mut t_buf,
+                            &intt_pq_buf,
+                            &intt_omegas_buf,
+                            k,
+                            Some(&intt_divisor_buf),
+                            None,
+                        )
+                        .unwrap();
+                    }
+                    for (dev_buf, host_buf) in s_bufs.iter().zip(buffers.iter_mut()) {
+                        device
+                            .copy_from_device_to_host_async(host_buf, dev_buf, stream)
+                            .unwrap();
+                    }
+                },
+                size,
+                false,
+            )?;
+            drop(g_lagrange_buf);
             end_timer!(timer);
+
+            for commitment in permutation_commitments {
+                transcript.write_point(commitment).unwrap();
+            }
+
+            for (_i, commitment) in lookup_z_commitments.into_iter().enumerate() {
+                transcript.write_point(commitment).unwrap();
+            }
+
+            for commitment in shuffle_commitments {
+                transcript.write_point(commitment).unwrap();
+            }
+
+            transcript.write_point(random_commitment).unwrap();
+            sw.sync();
         }
 
-        let fixed_ref = &pk.fixed_polys.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+        let timer = start_timer!(|| "wait copy queue");
+        copy_queue.sync_all();
+        end_timer!(timer);
+
+        let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
+
+        let timer = start_timer!(|| "h_poly");
+        let fixed_ref = &fixed_polys.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
         let advice_ref = &advices.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
         let instance_ref = &instances.iter().map(|x| &x[..]).collect::<Vec<_>>()[..];
+
+        let permutation_polys = permutation_polys_handler.join().unwrap();
 
         let (x, _xn, h_pieces) = evaluate_h_gates_and_vanishing_construct(
             &device,
@@ -1413,18 +1004,11 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 .iter()
                 .map(|x| &x[..])
                 .collect::<Vec<_>>()[..],
+            &permutation_polys.iter().map(|x| &x[..]).collect::<Vec<_>>()[..],
             &mut lookups
                 .iter_mut()
-                .map(|(v0, v1, v2, v3, v4)| {
-                    (
-                        &mut v0[..],
-                        &mut v1[..],
-                        &mut v2[..],
-                        &mut v3[..],
-                        &mut v4[..],
-                    )
-                })
-                .collect::<Vec<_>>()[..],
+                .map(|(v0, v1, v2, v3)| (v0, v1, v2, v3))
+                .collect::<Vec<_>>(),
             &shuffle_products.iter().map(|x| &x[..]).collect::<Vec<_>>()[..],
             y,
             beta,
@@ -1438,198 +1022,72 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         )?;
         end_timer!(timer);
 
-        let mut inputs = vec![(&h_pieces[..], x)];
+        let mut inputs = vec![(&h_pieces[..], 1, x)];
 
         meta.instance_queries.iter().for_each(|&(column, at)| {
-            inputs.push((&instances[column.index()][..], domain.rotate_omega(x, at)))
+            inputs.push((
+                &instances[column.index()][..],
+                1,
+                domain.rotate_omega(x, at),
+            ))
         });
 
         meta.advice_queries.iter().for_each(|&(column, at)| {
-            inputs.push((&advices[column.index()], domain.rotate_omega(x, at)))
+            inputs.push((&advices[column.index()], 1, domain.rotate_omega(x, at)))
         });
 
         meta.fixed_queries.iter().for_each(|&(column, at)| {
-            inputs.push((&pk.fixed_polys[column.index()], domain.rotate_omega(x, at)))
+            inputs.push((
+                &pk.fixed_polys[column.index()],
+                0,
+                domain.rotate_omega(x, at),
+            ))
         });
 
-        inputs.push((&random_poly, x));
+        inputs.push((&random_poly, 1, x));
 
-        for poly in pk.permutation.polys.iter() {
-            inputs.push((&poly, x));
+        for poly in permutation_polys.iter() {
+            inputs.push((&poly, 0, x));
         }
 
         let permutation_products_len = permutation_products.len();
         for (i, poly) in permutation_products.iter().enumerate() {
-            inputs.push((&poly, x));
-            inputs.push((&poly, domain.rotate_omega(x, Rotation::next())));
+            inputs.push((&poly, 1, x));
+            inputs.push((&poly, 1, domain.rotate_omega(x, Rotation::next())));
             if i != permutation_products_len - 1 {
                 inputs.push((
                     &poly,
+                    1,
                     domain.rotate_omega(x, Rotation(-((meta.blinding_factors() + 1) as i32))),
                 ));
             }
         }
 
-        let x_inv = domain.rotate_omega(x, Rotation::prev());
         let x_next = domain.rotate_omega(x, Rotation::next());
+        let x_last = domain.rotate_omega(x, Rotation(-((meta.blinding_factors() + 1) as i32)));
 
-        for (permuted_input, permuted_table, _, _, z) in lookups.iter() {
-            inputs.push((&z, x));
-            inputs.push((&z, x_next));
-            inputs.push((&permuted_input, x));
-            inputs.push((&permuted_input, x_inv));
-            inputs.push((&permuted_table, x));
-        }
-        for z in shuffle_products.iter() {
-            inputs.push((&z, x));
-            inputs.push((&z, x_next));
-        }
-
-        let mut collection = BTreeMap::new();
-        let mut x_sets = vec![];
-        for (idx, (p, x)) in inputs.iter().enumerate() {
-            collection
-                .entry(p.as_ptr() as usize)
-                .and_modify(|arr: &mut (_, Vec<_>)| arr.1.push((idx, x)))
-                .or_insert((p, vec![(idx, x)]));
-            x_sets.push(x);
-        }
-        x_sets.sort_unstable();
-        x_sets.dedup();
-        let mut x_extend_sets = vec![];
-        for x in x_sets.iter() {
-            x_extend_sets.push(**x);
-            for _ in 1..k {
-                x_extend_sets.push(x_extend_sets.last().unwrap().square());
-            }
-        }
-
-        let x_buf = device.alloc_device_buffer_from_slice(&x_extend_sets)?;
-        let mut x_map = BTreeMap::new();
-        for (i, x) in x_sets.into_iter().enumerate() {
-            x_map.insert(
-                x,
-                ManuallyDrop::new(CudaDeviceBufRaw {
-                    ptr: unsafe {
-                        x_buf
-                            .ptr()
-                            .offset((i * k * core::mem::size_of::<C::Scalar>()) as isize)
-                    },
-                    device: device.clone(),
-                    size: core::mem::size_of::<C::Scalar>(),
-                }),
-            );
-        }
-
-        let mut poly_buf_cache = BTreeMap::new();
-        let extended_buffers_count = if k < 23 { 30 } else { 15 };
-        let mut extended_buffers = vec![];
-        let mut cache_buffers = vec![];
-        let extended_k = pk.vk.domain.extended_k() as usize;
-        for _ in 0..extended_buffers_count {
-            let buf = device.alloc_device_buffer::<C::Scalar>(1 << extended_k)?;
-            for i in 0..1 << (extended_k - k) {
-                cache_buffers.push(ManuallyDrop::new(CudaDeviceBufRaw {
-                    ptr: unsafe {
-                        buf.ptr()
-                            .offset(((i << k) * core::mem::size_of::<C::Scalar>()) as isize)
-                    },
-                    device: device.clone(),
-                    size: core::mem::size_of::<C::Scalar>(),
-                }));
-            }
-            extended_buffers.push(buf);
-        }
-
-        let mut evals = vec![C::Scalar::zero(); inputs.len()];
-
-        let timer = start_timer!(|| format!("compute eval {}", collection.len()));
-        let mut eval_map = BTreeMap::new();
-
-        let mut streams = vec![];
-        let mut bufs = vec![];
-        let max = 6;
-        for _ in 0..max {
-            bufs.push((
-                device.alloc_device_buffer::<C::Scalar>(size)?,
-                device.alloc_device_buffer::<C::Scalar>(size)?,
-                device.alloc_device_buffer::<C::Scalar>(size)?,
-            ));
-            unsafe {
-                let mut stream = std::mem::zeroed();
-                let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-                assert_eq!(err, cuda_runtime_sys::cudaError::cudaSuccess);
-                streams.push(stream);
-            }
-        }
-
-        let mut collection = collection.into_iter().collect::<Vec<_>>();
-        collection.sort_by(|a, b| a.1 .1.len().cmp(&b.1 .1.len()));
-
-        let mut l = 0;
-        let mut r = collection.len();
-        let mut inc = false;
-        let mut used_cache_idx = 0;
-        while l < r {
-            let i = if inc { l } else { r - 1 };
-            if inc {
-                l += 1;
-            } else {
-                r -= 1;
-            }
-            inc = !inc;
-            let (p, arr) = &collection[i].1;
-            let p = *p;
-            unsafe {
-                let stream = streams[i % max];
-                let (poly_buf, eval_buf, tmp_buf) = &bufs[i % max];
-                let poly_buf = if used_cache_idx < cache_buffers.len() {
-                    let buf = &cache_buffers[used_cache_idx];
-                    poly_buf_cache.insert((*p).as_ptr() as usize, buf);
-                    used_cache_idx += 1;
-                    buf
-                } else {
-                    poly_buf
-                };
-                device.copy_from_host_to_device_async(poly_buf, p, stream)?;
-                for (idx, x) in arr {
-                    let err = crate::cuda::bn254_c::poly_eval(
-                        poly_buf.ptr(),
-                        eval_buf.ptr(),
-                        tmp_buf.ptr(),
-                        x_map.get(x).unwrap().ptr(),
-                        size as i32,
-                        stream,
-                    );
-                    crate::device::cuda::to_result((), err, "fail to run poly_eval")?;
-                    device.copy_from_device_to_host_async(
-                        &mut evals[*idx..*idx + 1],
-                        eval_buf,
-                        stream,
-                    )?;
-                    eval_map.insert(((*p).as_ptr() as usize, **x), *idx);
+        for (_, _, multiplicity, zs) in lookups.iter() {
+            inputs.push((&multiplicity, 1, x));
+            for (i, z) in zs.iter().enumerate() {
+                inputs.push((z, 1, x));
+                inputs.push((z, 1, x_next));
+                if i != zs.len() - 1 {
+                    inputs.push((z, 1, x_last));
                 }
             }
         }
-
-        for stream in streams {
-            unsafe {
-                cuda_runtime_sys::cudaStreamSynchronize(stream);
-                cuda_runtime_sys::cudaStreamDestroy(stream);
-            }
+        for z in shuffle_products.iter() {
+            inputs.push((&z, 1, x));
+            inputs.push((&z, 1, x_next));
         }
 
-        drop(bufs);
-
-        let eval_map = eval_map
-            .into_iter()
-            .map(|(k, v)| (k, evals[v]))
-            .collect::<BTreeMap<(usize, C::ScalarExt), C::ScalarExt>>();
+        let timer = start_timer!(|| "eval poly");
+        let cache_count = 160 >> (k.max(22) - 22);
+        let (poly_buf_cache, eval_map, evals) = batch_poly_eval(&device, inputs, k, cache_count)?;
 
         for (_i, eval) in evals.into_iter().skip(1).enumerate() {
             transcript.write_scalar(eval).unwrap();
         }
-
         end_timer!(timer);
 
         let timer = start_timer!(|| "multi open");
@@ -1639,95 +1097,84 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
         let lookups_arr = [lookups];
         let shuffles_arr = [shuffle_products];
 
-        let queries = instance_arr
-            .iter()
-            .zip(advices_arr.iter())
-            .zip(permutation_products_arr.iter())
-            .zip(lookups_arr.iter())
-            .zip(shuffles_arr.iter())
-            .flat_map(|((((instance, advice), permutation), lookups), shuffles)| {
-                iter::empty()
-                    .chain(
-                        (&pk)
-                            .vk
-                            .cs
-                            .instance_queries
-                            .iter()
-                            .map(|&(column, at)| ProverQuery {
+        let queries =
+            instance_arr
+                .iter()
+                .zip(advices_arr.iter())
+                .zip(permutation_products_arr.iter())
+                .zip(lookups_arr.iter())
+                .zip(shuffles_arr.iter())
+                .flat_map(|((((instance, advice), permutation), lookups), shuffles)| {
+                    iter::empty()
+                        .chain((&pk).vk.cs.instance_queries.iter().map(|&(column, at)| {
+                            ProverQuery {
                                 point: domain.rotate_omega(x, at),
                                 rotation: at,
                                 poly: &instance[column.index()][..],
-                            }),
-                    )
-                    .chain(
-                        (&pk)
-                            .vk
-                            .cs
-                            .advice_queries
-                            .iter()
-                            .map(|&(column, at)| ProverQuery {
-                                point: domain.rotate_omega(x, at),
-                                rotation: at,
-                                poly: &advice[column.index()],
-                            }),
-                    )
-                    .chain(permutation_product_open(&pk, &permutation[..], x))
-                    .chain(
-                        lookups
-                            .iter()
-                            .flat_map(|lookup| {
-                                lookup_open(&pk, (&lookup.0[..], &lookup.1[..], &lookup.4[..]), x)
-                            })
-                            .into_iter(),
-                    )
-                    .chain(
-                        shuffles
-                            .iter()
-                            .flat_map(|shuffle| shuffle_open(&pk, &shuffle[..], x))
-                            .into_iter(),
-                    )
-            })
-            .chain(
-                (&pk)
-                    .vk
-                    .cs
-                    .fixed_queries
-                    .iter()
-                    .map(|&(column, at)| ProverQuery {
-                        point: domain.rotate_omega(x, at),
-                        rotation: at,
-                        poly: &pk.fixed_polys[column.index()],
-                    }),
-            )
-            .chain((&pk).permutation.polys.iter().map(move |poly| ProverQuery {
-                point: x,
-                rotation: Rotation::cur(),
-                poly: &poly.values[..],
-            }))
-            // We query the h(X) polynomial at x
-            .chain(
-                iter::empty()
-                    .chain(Some(ProverQuery {
-                        point: x,
-                        rotation: Rotation::cur(),
-                        poly: &h_pieces,
-                    }))
-                    .chain(Some(ProverQuery {
-                        point: x,
-                        rotation: Rotation::cur(),
-                        poly: &random_poly,
-                    })),
-            );
+                            }
+                        }))
+                        .chain(
+                            (&pk)
+                                .vk
+                                .cs
+                                .advice_queries
+                                .iter()
+                                .map(|&(column, at)| ProverQuery {
+                                    point: domain.rotate_omega(x, at),
+                                    rotation: at,
+                                    poly: &advice[column.index()],
+                                }),
+                        )
+                        .chain(permutation_product_open(&pk, &permutation[..], x))
+                        .chain(
+                            lookups
+                                .iter()
+                                .flat_map(|lookup| {
+                                    lookup_open(&pk, (&lookup.2[..], &lookup.3[..]), x)
+                                })
+                                .into_iter(),
+                        )
+                        .chain(
+                            shuffles
+                                .iter()
+                                .flat_map(|shuffle| shuffle_open(&pk, &shuffle[..], x))
+                                .into_iter(),
+                        )
+                })
+                .chain(
+                    (&pk)
+                        .vk
+                        .cs
+                        .fixed_queries
+                        .iter()
+                        .map(|&(column, at)| ProverQuery {
+                            point: domain.rotate_omega(x, at),
+                            rotation: at,
+                            poly: &pk.fixed_polys[column.index()],
+                        }),
+                )
+                .chain(permutation_polys.iter().map(move |poly| ProverQuery {
+                    point: x,
+                    rotation: Rotation::cur(),
+                    poly: &poly[..],
+                }))
+                // We query the h(X) polynomial at x
+                .chain(
+                    iter::empty()
+                        .chain(Some(ProverQuery {
+                            point: x,
+                            rotation: Rotation::cur(),
+                            poly: &h_pieces,
+                        }))
+                        .chain(Some(ProverQuery {
+                            point: x,
+                            rotation: Rotation::cur(),
+                            poly: &random_poly,
+                        })),
+                );
+
         if use_gwc {
-            gwc::multiopen(
-                &device,
-                &g_buf,
-                queries,
-                size,
-                [&s_buf, &t_buf],
-                eval_map,
-                transcript,
-            )?;
+            gwc::multiopen(&device, &g_buf, queries, size, eval_map, transcript)?;
         } else {
             shplonk::multiopen(
                 &pk,
@@ -1735,7 +1182,6 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
                 &g_buf,
                 queries,
                 size,
-                [&s_buf, &t_buf],
                 eval_map,
                 poly_buf_cache,
                 transcript,
@@ -1747,37 +1193,25 @@ fn _create_proof_from_advices<C: CurveAffine, E: EncodedChallenge<C>, T: Transcr
     })
 }
 
-fn vanish_commit<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
-    device: &CudaDevice,
-    s_buf: &CudaDeviceBufRaw,
-    g_buf: &CudaDeviceBufRaw,
-    size: usize,
-    transcript: &mut T,
-) -> Result<Vec<C::Scalar, HugePageAllocator>, Error> {
-    use rand::thread_rng;
-    use rand::RngCore;
+pub fn warm_up_buffers<C: CurveAffine>(pk: &ProvingKey<C>) {
+    let timer = start_timer!(|| "warm_up_buffers");
+    let gpu_reserve_chuncks = std::env::var("ZKWASM_PROVER_GPU_RESERVE_CHUNCKS")
+        .ok()
+        .and_then(|s| usize::from_str_radix(&s, 10).ok())
+        .unwrap_or(144);
 
-    let random_nr = 32;
-    let mut random_poly = Vec::new_in(HugePageAllocator);
-    random_poly.resize(size, C::Scalar::zero());
+    {
+        let mut allocator = CUDA_BUFFER_ALLOCATOR.lock().unwrap();
+        allocator.reset(
+            (1 << 22) * core::mem::size_of::<C::Scalar>(),
+            gpu_reserve_chuncks,
+        );
+    }
 
-    let random = vec![0; 32usize]
-        .iter()
-        .map(|_| C::Scalar::random(&mut OsRng))
-        .collect::<Vec<_>>();
-
-    random_poly.par_iter_mut().for_each(|coeff| {
-        if ADD_RANDOM {
-            let mut rng = thread_rng();
-            *coeff = (C::Scalar::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
-                * (C::Scalar::random(&mut rng) + random[rng.next_u64() as usize % random_nr])
-        }
-    });
-
-    // Commit
-    device.copy_from_host_to_device(&s_buf, &random_poly[..])?;
-    let commitment = batch_msm_v2(&g_buf, vec![&s_buf], size)?;
-    transcript.write_point(commitment[0]).unwrap();
-
-    Ok(random_poly)
+    let size = 1 << pk.get_vk().domain.k();
+    prepare_lookup_buffer(pk).unwrap();
+    prepare_permutation_buffers(pk).unwrap();
+    prepare_shuffle_buffers(pk).unwrap();
+    generate_random_poly::<C::Scalar>(size);
+    end_timer!(timer);
 }

@@ -21,6 +21,11 @@ class Curve
 {
 public:
     Point value;
+    __device__ Curve()
+    {
+        FD fd;
+        this->value = Point::point_at_infinity(fd);
+    }
 
     __device__ Curve(Point v) : value(v) {}
 
@@ -43,6 +48,13 @@ public:
         return EC::add(this->value, b.value, fd);
     }
 
+    // operator
+    __device__ void operator+=(const Curve &b)
+    {
+        FD fd;
+        this->value = EC::add(this->value, b.value, fd);
+    }
+
     __device__ Curve operator+(const Affine &b)
     {
         FD fd;
@@ -53,9 +65,9 @@ public:
     __device__ static Curve identity()
     {
         FD fd;
-        Point::point_at_infinity(fd);
+        return Point::point_at_infinity(fd);
     }
 };
 
 typedef CurveAffine<ec<fd_p>, fd_p, ec<fd_p>::point_affine> Bn254G1Affine;
-typedef Curve<ec<fd_p>, fd_p, ec<fd_p>::point_xyzz, Bn254G1Affine> Bn254G1;
+typedef Curve<ec<fd_p>, fd_p, ec<fd_p>::point_jacobian, Bn254G1Affine> Bn254G1;

@@ -29,9 +29,9 @@ pub(crate) mod gwc {
     use rayon::iter::ParallelIterator;
     use std::collections::BTreeMap;
 
-    use crate::cuda::bn254::batch_msm;
     use crate::cuda::bn254::field_op_v3;
     use crate::cuda::bn254::FieldOp;
+    use crate::cuda::msm::batch_msm;
     use crate::device::cuda::CudaDevice;
     use crate::device::cuda::CudaDeviceBufRaw;
     use crate::device::Device as _;
@@ -76,7 +76,6 @@ pub(crate) mod gwc {
         g_buf: &CudaDeviceBufRaw,
         queries: I,
         size: usize,
-        s_buf: [&CudaDeviceBufRaw; 2],
         eval_map: BTreeMap<(usize, C::Scalar), C::Scalar>,
         transcript: &mut T,
     ) -> DeviceResult<()>
@@ -161,7 +160,13 @@ pub(crate) mod gwc {
 
         let timer = start_timer!(|| "msm");
 
-        let commitments = batch_msm::<C>(&g_buf, s_buf, ws.iter().map(|x| &x[..]).collect(), size)?;
+        let commitments = batch_msm::<C, _>(
+            &device,
+            &g_buf,
+            ws.iter().map(|x| &x[..]).collect(),
+            size,
+            false,
+        )?;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }
@@ -174,6 +179,7 @@ pub(crate) mod gwc {
 
 pub mod shplonk {
     use halo2_proofs::arithmetic::eval_polynomial_st;
+    use halo2_proofs::arithmetic::lagrange_interpolate;
     use halo2_proofs::arithmetic::CurveAffine;
     use halo2_proofs::arithmetic::Field;
     use halo2_proofs::arithmetic::FieldExt;
@@ -183,15 +189,17 @@ pub mod shplonk {
     use halo2_proofs::transcript::TranscriptWrite;
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
-    use std::mem::ManuallyDrop;
 
-    use crate::cuda::bn254::batch_msm;
-    use crate::cuda::bn254::batch_msm_v2;
-    use crate::cuda::bn254::field_op_v3;
     use crate::cuda::bn254::FieldOp;
+    use crate::cuda::field_op::field_op;
+    use crate::cuda::msm::batch_msm;
+    use crate::cuda::ntt::generate_ntt_buffers;
+    use crate::cuda::ntt::generate_omega_buffers;
+    use crate::cuda::ntt::ntt_raw;
     use crate::device::cuda::CudaBuffer;
     use crate::device::cuda::CudaDevice;
     use crate::device::cuda::CudaDeviceBufRaw;
+    use crate::device::cuda::CudaStreamWrapper;
     use crate::device::Device as _;
     use crate::device::DeviceResult;
     use crate::hugetlb::HugePageAllocator;
@@ -284,107 +292,92 @@ pub mod shplonk {
         g_buf: &CudaDeviceBufRaw,
         queries: I,
         size: usize,
-        s_buf: [&CudaDeviceBufRaw; 2],
         eval_map: BTreeMap<(usize, C::Scalar), C::Scalar>,
-        poly_cache: BTreeMap<usize, &ManuallyDrop<CudaDeviceBufRaw>>,
+        mut poly_cache: BTreeMap<usize, CudaDeviceBufRaw>,
         transcript: &mut T,
     ) -> DeviceResult<()>
     where
         I: IntoIterator<Item = ProverQuery<'a, C::Scalar>>,
     {
         let y: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
-        let v: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
+        let y_buf = device.alloc_device_buffer_from_slice(&[y][..])?;
 
+        let v: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
         let (rotation_sets, super_point_set) = construct_intermediate_sets(queries, eval_map);
 
+        let mut streams = vec![];
         let rotation_sets: Vec<(_, _, Vec<_>)> = rotation_sets
             .iter()
             .map(|(queries, points)| -> DeviceResult<(_, _, Vec<_>)> {
-                use halo2_proofs::arithmetic::lagrange_interpolate;
-
-                let v_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-
-                if queries.len() == 1 {
-                    if let Some(buf) = poly_cache.get(&(queries[0].0.as_ptr() as usize)) {
-                        device.copy_from_device_to_device::<C::Scalar>(&v_buf, 0, buf, 0, size)?;
-                    } else {
-                        device.copy_from_host_to_device(&v_buf, &queries[0].0[..])?;
-                    }
-                    let evals_acc = lagrange_interpolate(&points[..], &queries[0].1[..]);
-                    Ok((points, v_buf, evals_acc))
+                let v_buf = if let Some(buf) = poly_cache.remove(&(queries[0].0.as_ptr() as usize))
+                {
+                    buf
                 } else {
-                    let mut evals_acc = vec![];
-                    evals_acc.resize(points.len(), C::Scalar::zero());
+                    let (stream_wrapper, stream) = CudaStreamWrapper::new_with_inner();
+                    let buf =
+                        device.alloc_device_buffer_from_slice_async(&queries[0].0[..], stream)?;
+                    streams.push(stream_wrapper);
+                    buf
+                };
 
-                    let mut tmp_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
-                    let y_buf = device.alloc_device_buffer_from_slice(&[y][..])?;
+                let mut evals_acc = lagrange_interpolate(&points[..], &queries[0].1[..]);
 
-                    let mut last_stream = None;
-                    let mut last_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
+                if queries.len() > 1 {
+                    if let Some(stream) = streams.last() {
+                        stream.sync();
+                    }
+                    let mut buf = None;
+                    let calc_streams = CudaStreamWrapper::new_with_inner();
+                    for (poly, evals) in queries.iter().skip(1) {
+                        let poly_buf =
+                            if let Some(buf) = poly_cache.remove(&(poly.as_ptr() as usize)) {
+                                buf
+                            } else {
+                                let (stream_wrapper, stream) = CudaStreamWrapper::new_with_inner();
+                                let buf = device
+                                    .alloc_device_buffer_from_slice_async(&poly[..], stream)?;
+                                drop(stream_wrapper);
+                                buf
+                            };
 
-                    for (poly, evals) in queries.iter() {
-                        unsafe {
-                            let mut stream = std::mem::zeroed();
-                            let err = cuda_runtime_sys::cudaStreamCreate(&mut stream);
-                            crate::device::cuda::to_result(
-                                (),
-                                err,
-                                "fail to run cudaStreamCreate",
-                            )?;
-                            let poly_buf =
-                                if let Some(buf) = poly_cache.get(&(poly.as_ptr() as usize)) {
-                                    *buf
-                                } else {
-                                    device.copy_from_host_to_device_async(
-                                        &tmp_buf,
-                                        &poly[..],
-                                        stream,
-                                    )?;
-                                    &tmp_buf
-                                };
-                            if let Some(last_stream) = last_stream {
-                                cuda_runtime_sys::cudaStreamSynchronize(last_stream);
-                                cuda_runtime_sys::cudaStreamDestroy(last_stream);
-                            }
-                            field_op_v3(
-                                device,
-                                &v_buf,
-                                Some(&v_buf),
-                                Some(&y_buf),
-                                Some(&poly_buf),
-                                None,
-                                size,
-                                FieldOp::Add,
-                                Some(stream),
-                            )?;
-                            last_stream = Some(stream);
-                            std::mem::swap(&mut last_buf, &mut tmp_buf);
-                        }
+                        calc_streams.0.sync();
+
+                        field_op::<C::Scalar>(
+                            device,
+                            &v_buf,
+                            (&v_buf, &y_buf),
+                            &poly_buf,
+                            size,
+                            FieldOp::Add,
+                            Some(calc_streams.1),
+                        )?;
+
+                        // Can't release poly_buf before calc_streams sync.
+                        buf = Some(poly_buf);
 
                         let evals = lagrange_interpolate(&points[..], &evals[..]);
-
                         for i in 0..evals_acc.len() {
                             evals_acc[i] = evals_acc[i] * y + evals[i];
                         }
                     }
-                    unsafe {
-                        if let Some(last_stream) = last_stream {
-                            cuda_runtime_sys::cudaStreamSynchronize(last_stream);
-                            cuda_runtime_sys::cudaStreamDestroy(last_stream);
-                        }
-                    }
-                    Ok((points, v_buf, evals_acc))
+                    drop(calc_streams);
+                    drop(buf);
                 }
+
+                Ok((points, v_buf, evals_acc))
             })
             .collect::<DeviceResult<Vec<_>>>()?;
+        drop(streams);
+        drop(poly_cache);
 
         let k = pk.vk.domain.k as usize;
         let (ntt_omegas_buf, ntt_pq_buf) =
-            crate::ntt_prepare(&device, pk.get_vk().domain.get_omega(), k)?;
+            generate_ntt_buffers(&device, pk.get_vk().domain.get_omega(), k)?;
         let (intt_omegas_buf, intt_pq_buf) =
-            crate::ntt_prepare(&device, pk.get_vk().domain.get_omega_inv(), k)?;
+            generate_ntt_buffers(&device, pk.get_vk().domain.get_omega_inv(), k)?;
         let intt_divisor_buf = device
             .alloc_device_buffer_from_slice::<C::Scalar>(&[pk.get_vk().domain.ifft_divisor])?;
+        let omegas_buf = generate_omega_buffers(device, pk.get_vk().domain.get_omega(), k, false)?;
 
         let mut hx_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
         let mut poly_buf = device.alloc_device_buffer::<C::Scalar>(size)?;
@@ -396,15 +389,14 @@ pub mod shplonk {
             device.copy_from_device_to_device::<C::Scalar>(&poly_buf, 0, poly, 0, size)?;
             device.copy_from_host_to_device(&point_buf, &evals[..])?;
 
-            crate::cuda::bn254::field_op_v2::<C::ScalarExt>(
+            field_op::<C::Scalar>(
                 &device,
                 &poly_buf,
-                Some(&poly),
-                None,
-                Some(&point_buf),
-                None,
+                &poly_buf,
+                &point_buf,
                 evals.len(),
                 FieldOp::Sub,
+                None,
             )?;
 
             let diffs: Vec<C::Scalar> = super_point_set
@@ -413,13 +405,14 @@ pub mod shplonk {
                 .copied()
                 .collect();
 
-            crate::cuda::bn254::ntt_raw(
+            ntt_raw(
                 &device,
                 &mut poly_buf,
                 &mut tmp_buf,
                 &ntt_pq_buf,
                 &ntt_omegas_buf,
                 k,
+                None,
                 None,
             )?;
 
@@ -430,7 +423,7 @@ pub mod shplonk {
                     hx_buf.ptr(),
                     v_buf.ptr(),
                     poly_buf.ptr(),
-                    ntt_omegas_buf.ptr(),
+                    omegas_buf.ptr(),
                     point_buf.ptr(),
                     diffs.len() as i32,
                     size as i32,
@@ -444,7 +437,7 @@ pub mod shplonk {
         unsafe {
             let err = crate::cuda::bn254_c::shplonk_h_x_div_points(
                 hx_buf.ptr(),
-                ntt_omegas_buf.ptr(),
+                omegas_buf.ptr(),
                 point_buf.ptr(),
                 super_point_set.len() as i32,
                 size as i32,
@@ -453,17 +446,18 @@ pub mod shplonk {
             crate::device::cuda::to_result((), err, "failed to run shplonk_h_x_div_points")?;
         }
 
-        crate::intt_raw(
+        ntt_raw(
             &device,
             &mut hx_buf,
             &mut tmp_buf,
             &intt_pq_buf,
             &intt_omegas_buf,
-            &intt_divisor_buf,
             k,
+            Some(&intt_divisor_buf),
+            None,
         )?;
 
-        let commitment = batch_msm_v2::<C>(&g_buf, vec![&hx_buf], size)?;
+        let commitment = batch_msm(&device, &g_buf, vec![&hx_buf], size, false)?;
         transcript.write_point(commitment[0]).unwrap();
 
         let u: C::Scalar = *transcript.squeeze_challenge_scalar::<()>();
@@ -494,8 +488,7 @@ pub mod shplonk {
                 let z_i = diffs
                     .iter()
                     .map(|root| u - root)
-                    .reduce(|a, b| a * b)
-                    .unwrap();
+                    .fold(C::Scalar::one(), |a, b| a * b);
                 Ok((poly, z_i))
             })
             .collect::<DeviceResult<Vec<_>>>()?;
@@ -506,13 +499,11 @@ pub mod shplonk {
         let z_buf = device.alloc_device_buffer::<C::Scalar>(1)?;
         for (_, (poly_buf, z_i)) in lx_parts.into_iter().enumerate() {
             device.copy_from_host_to_device(&z_buf, &[z_i][..])?;
-            field_op_v3(
+            field_op::<C::Scalar>(
                 device,
                 &fz_buf,
-                Some(&fz_buf),
-                Some(&v_buf),
-                Some(&poly_buf),
-                Some(&z_buf),
+                (&fz_buf, &v_buf),
+                (&poly_buf, &z_buf),
                 size,
                 FieldOp::Add,
                 None,
@@ -521,13 +512,11 @@ pub mod shplonk {
 
         let zt_eval_buf = v_buf;
         device.copy_from_host_to_device(&zt_eval_buf, &[zt_eval][..])?;
-        field_op_v3(
+        field_op::<C::Scalar>(
             device,
             &fz_buf,
-            Some(&fz_buf),
-            None,
-            Some(&hx_buf),
-            Some(&zt_eval_buf),
+            &fz_buf,
+            (&hx_buf, &zt_eval_buf),
             size,
             FieldOp::Sub,
             None,
@@ -536,12 +525,10 @@ pub mod shplonk {
 
         let z_diff_0_inv_buf = zt_eval_buf;
         device.copy_from_host_to_device(&z_diff_0_inv_buf, &[z_diff_0_inv][..])?;
-        field_op_v3(
+        field_op::<C::Scalar>(
             device,
             &fz_buf,
-            Some(&fz_buf),
-            Some(&z_diff_0_inv_buf),
-            None,
+            (&fz_buf, &z_diff_0_inv_buf),
             None,
             size,
             FieldOp::UOp,
@@ -565,7 +552,7 @@ pub mod shplonk {
             lx[0] = tmp;
         }
 
-        let commitments = batch_msm::<C>(&g_buf, s_buf, vec![&lx[..]], size)?;
+        let commitments = batch_msm::<C, _>(&device, &g_buf, vec![&lx[..]], size, false)?;
         for commitment in commitments {
             transcript.write_point(commitment).unwrap();
         }
@@ -611,43 +598,41 @@ pub(crate) fn permutation_product_open<'a, C: CurveAffine>(
 
 pub(crate) fn lookup_open<'a, C: CurveAffine>(
     pk: &'a ProvingKey<C>,
-    lookup: (&'a [C::Scalar], &'a [C::Scalar], &'a [C::Scalar]),
+    lookup: (&'a [C::Scalar], &'a [Vec<C::Scalar, HugePageAllocator>]),
     x: C::Scalar,
 ) -> impl Iterator<Item = ProverQuery<'a, C::Scalar>> + Clone {
-    let x_inv = pk.vk.domain.rotate_omega(x, Rotation::prev());
     let x_next = pk.vk.domain.rotate_omega(x, Rotation::next());
+    let blinding_factors = pk.vk.cs.blinding_factors();
+    let x_last = pk
+        .vk
+        .domain
+        .rotate_omega(x, Rotation(-((blinding_factors + 1) as i32)));
 
-    let (permuted_input, permuted_table, z) = lookup;
+    let (multiplicity, zs) = lookup;
 
     iter::empty()
         // Open lookup product commitments at x
         .chain(Some(ProverQuery {
             point: x,
             rotation: Rotation::cur(),
-            poly: z,
+            poly: multiplicity,
         }))
-        // Open lookup input commitments at x
-        .chain(Some(ProverQuery {
-            point: x,
-            rotation: Rotation::cur(),
-            poly: permuted_input,
+        .chain(zs.iter().flat_map(move |z| {
+            iter::empty()
+                .chain(Some(ProverQuery {
+                    point: x,
+                    rotation: Rotation::cur(),
+                    poly: z,
+                }))
+                .chain(Some(ProverQuery {
+                    point: x_next,
+                    rotation: Rotation::next(),
+                    poly: z,
+                }))
         }))
-        // Open lookup table commitments at x
-        .chain(Some(ProverQuery {
-            point: x,
-            rotation: Rotation::cur(),
-            poly: permuted_table,
-        }))
-        // Open lookup input commitments at x_inv
-        .chain(Some(ProverQuery {
-            point: x_inv,
-            rotation: Rotation::prev(),
-            poly: permuted_input,
-        }))
-        // Open lookup product commitments at x_next
-        .chain(Some(ProverQuery {
-            point: x_next,
-            rotation: Rotation::next(),
+        .chain(zs.iter().rev().skip(1).map(move |z| ProverQuery {
+            point: x_last,
+            rotation: Rotation(-((blinding_factors + 1) as i32)),
             poly: z,
         }))
 }

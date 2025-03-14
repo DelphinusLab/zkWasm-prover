@@ -10,16 +10,21 @@ private:
     __device__ __host__ Field(Storage v) : value(v) {}
 
 public:
-    __device__ __host__ Field(uint v)
+    __device__ Field(uint v)
     {
         if (v == 0)
         {
             this->value = {0};
         }
+        else if (v == 1)
+        {
+            this->value = FD::get_one();
+        }
         else
         {
-            assert(v == 1);
-            this->value = FD::get_one();
+            this->value = {0};
+            *(unsigned *)&this->value = v;
+            this->value = FD::to_montgomery(this->value);
         }
     }
 
@@ -28,7 +33,7 @@ public:
         this->value = {0};
     }
 
-    __device__ Field unmont_assign()
+    __device__ void unmont_assign()
     {
         this->value = FD::from_montgomery(this->value);
     }
@@ -51,6 +56,16 @@ public:
     __device__ ulong get_8bits(uint i) const
     {
         return FD::extract_bits(this->value, i * 8, 8);
+    }
+
+    __device__ ulong get_nbits(uint start, uint size) const
+    {
+        return FD::extract_bits(this->value, start, size);
+    }
+
+    __device__ ulong get_32bits(uint i) const
+    {
+        return FD::extract_bits(this->value, i * 32, 32);
     }
 
     __device__ Field sqr() const
